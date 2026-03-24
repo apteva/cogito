@@ -296,8 +296,8 @@ func TestSubThread_KillAll(t *testing.T) {
 func TestConfig_PersistentThreads(t *testing.T) {
 	cfg := &Config{path: "/dev/null"}
 
-	cfg.SaveThread(PersistentThread{ID: "writer", Prompt: "write stuff", Tools: []string{"write_file"}, Thinking: true})
-	cfg.SaveThread(PersistentThread{ID: "reader", Prompt: "read stuff", Tools: []string{"read_file"}, Thinking: true})
+	cfg.SaveThread(PersistentThread{ID: "writer", Directive: "write stuff", Tools: []string{"write_file"}, Thinking: true})
+	cfg.SaveThread(PersistentThread{ID: "reader", Directive: "read stuff", Tools: []string{"read_file"}, Thinking: true})
 
 	threads := cfg.GetThreads()
 	if len(threads) != 2 {
@@ -305,13 +305,13 @@ func TestConfig_PersistentThreads(t *testing.T) {
 	}
 
 	// Update existing
-	cfg.SaveThread(PersistentThread{ID: "writer", Prompt: "updated", Tools: []string{"write_file", "web"}, Thinking: true})
+	cfg.SaveThread(PersistentThread{ID: "writer", Directive: "updated", Tools: []string{"write_file", "web"}, Thinking: true})
 	threads = cfg.GetThreads()
 	if len(threads) != 2 {
 		t.Fatalf("expected still 2 threads after update, got %d", len(threads))
 	}
-	if threads[0].Prompt != "updated" {
-		t.Errorf("expected updated prompt, got %q", threads[0].Prompt)
+	if threads[0].Directive != "updated" {
+		t.Errorf("expected updated directive, got %q", threads[0].Directive)
 	}
 
 	// Remove

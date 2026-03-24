@@ -43,7 +43,7 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 
 type threadJSON struct {
 	ID        string   `json:"id"`
-	Prompt    string   `json:"prompt,omitempty"`
+	Directive string   `json:"directive,omitempty"`
 	Tools     []string `json:"tools,omitempty"`
 	Thinking  bool     `json:"thinking"`
 	Iteration int      `json:"iteration"`
@@ -66,7 +66,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	for _, t := range a.thinker.threads.List() {
 		out = append(out, threadJSON{
 			ID:        t.ID,
-			Prompt:    t.Prompt,
+			Directive: t.Directive,
 			Tools:     t.Tools,
 			Thinking:  t.Thinking,
 			Iteration: t.Iteration,

@@ -317,17 +317,17 @@ function App() {
             </div>
           </div>
           {/* Thread prompt detail */}
-          {activeThreadData && activeThreadData.prompt && (
+          {activeThreadData && activeThreadData.directive && (
             <div className="border-b border-slate-700">
               <button onClick={() => setShowPrompt(!showPrompt)}
                 className="w-full px-3 py-1.5 flex items-center gap-2 text-xs text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
                 <span className="text-slate-600">{showPrompt ? '▼' : '▶'}</span>
-                <span className="font-medium">System Prompt</span>
-                <span className="text-slate-600 truncate flex-1">{!showPrompt && activeThreadData.prompt.substring(0, 80) + '...'}</span>
+                <span className="font-medium">Directive</span>
+                <span className="text-slate-600 truncate flex-1">{!showPrompt && activeThreadData.directive.substring(0, 80) + '...'}</span>
               </button>
               {showPrompt && (
                 <div className="px-4 pb-3 text-xs text-slate-300 whitespace-pre-wrap leading-relaxed bg-slate-900/50 max-h-48 overflow-y-auto">
-                  {activeThreadData.prompt}
+                  {activeThreadData.directive}
                 </div>
               )}
             </div>

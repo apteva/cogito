@@ -10,7 +10,7 @@ const configFile = "config.json"
 
 type PersistentThread struct {
 	ID       string   `json:"id"`
-	Prompt   string   `json:"prompt"`
+	Directive string   `json:"directive"`
 	Tools    []string `json:"tools"`
 	Thinking bool     `json:"thinking"`
 }

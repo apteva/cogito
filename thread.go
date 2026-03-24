@@ -23,7 +23,7 @@ PACING — this is critical:
 
 type ThreadInfo struct {
 	ID        string
-	Prompt    string
+	Directive string
 	Tools     []string
 	Thinking  bool
 	Running   bool
@@ -34,8 +34,8 @@ type ThreadInfo struct {
 }
 
 type Thread struct {
-	ID       string
-	Prompt   string // original prompt before tool docs
+	ID        string
+	Directive string // original directive before tool docs
 	Thinker  *Thinker
 	Parent   *Thinker
 	Tools    map[string]bool
@@ -64,7 +64,7 @@ func NewThreadManager(parent *Thinker) *ThreadManager {
 	}
 }
 
-func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool, initialMessages ...string) error {
+func (tm *ThreadManager) Spawn(id, directive string, tools []string, thinking bool, initialMessages ...string) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -80,14 +80,15 @@ func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool,
 	toolSet["send"] = true
 	toolSet["done"] = true
 	toolSet["pace"] = true
+	toolSet["evolve"] = true
 
-	// Build system prompt: core behavior + user prompt + tool docs
-	threadSystemPrompt := baseThreadPrompt + "\n\n[ROLE]\n" + prompt + "\n\n" + buildThreadToolDocs(toolSet)
+	// Build system prompt: core behavior + directive + tool docs
+	threadSystemPrompt := baseThreadPrompt + "\n\n[DIRECTIVE]\n" + directive + "\n\n" + buildThreadToolDocs(toolSet)
 
 	thread := &Thread{
-		ID:       id,
-		Prompt:   prompt,
-		Parent:   tm.parent,
+		ID:        id,
+		Directive: directive,
+		Parent:    tm.parent,
 		Tools:    toolSet,
 		Thinking: thinking,
 		Started:  time.Now(),
@@ -178,6 +179,18 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
 				}
+			case "evolve":
+				if d := call.Args["directive"]; d != "" {
+					thread.Directive = d
+					// Rebuild system prompt with new directive
+					newSysPrompt := baseThreadPrompt + "\n\n[DIRECTIVE]\n" + d + "\n\n" + buildThreadToolDocs(thread.Tools)
+					t.messages[0] = Message{Role: "system", Content: newSysPrompt}
+					// Persist
+					tm.parent.config.SaveThread(PersistentThread{
+						ID: thread.ID, Directive: d, Tools: toolSetToSlice(thread.Tools), Thinking: thread.Thinking,
+					})
+					t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
+				}
 			case "web", "write_file", "read_file", "list_files":
 				executeTool(t, call)
 				toolNames = append(toolNames, call.Raw)
@@ -260,7 +273,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 	for _, t := range tm.threads {
 		infos = append(infos, ThreadInfo{
 			ID:        t.ID,
-			Prompt:    t.Prompt,
+			Directive: t.Directive,
 			Tools:     toolSetToSlice(t.Tools),
 			Thinking:  t.Thinking,
 			Running:   true,
@@ -316,6 +329,7 @@ func buildThreadToolDocs(tools map[string]bool) string {
 	sb.WriteString("  [[send id=\"thread-name\" message=\"message to send\"]]\n")
 	sb.WriteString("  [[done message=\"Final result, then PERMANENTLY terminate this thread\"]]\n")
 	sb.WriteString("  [[pace rate=\"fast\" model=\"large\"]]\n")
+	sb.WriteString("  [[evolve directive=\"Updated directive for this thread\"]]\n")
 	sb.WriteString("\nRULES:\n")
 	if tools["reply"] {
 		sb.WriteString("- [[reply]] talks to the user. They can only see [[reply]] messages, not your thoughts.\n")
@@ -328,6 +342,7 @@ func buildThreadToolDocs(tools map[string]bool) string {
 	}
 	sb.WriteString("- [[send]] sends a message to any thread by id. Use id=\"main\" for the coordinator.\n")
 	sb.WriteString("- [[done]] PERMANENTLY kills this thread. Only use when your task is truly complete and you will never be needed again. Do NOT use after a single reply in a conversation.\n")
+	sb.WriteString("- [[evolve]] rewrites your own directive. Use this to self-improve based on experience — adjust your approach, add learned rules, refine your role.\n")
 	sb.WriteString(`- [[pace]] controls thinking speed and model. Rates: "fast" (2s), "normal" (10s), "slow" (30s), "sleep" (2min). Models: "large", "small".
   IMPORTANT: When you have nothing to do, pace down gradually: "normal" → "slow" → "sleep". Do NOT keep generating idle thoughts. New events auto-switch you back to fast.
 `)

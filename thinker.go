@@ -59,20 +59,22 @@ Your thinking should be purposeful:
 - Keep each thought concise — 1-2 short paragraphs max.
 
 TOOLS — call inline in your response:
-  [[spawn id="name" prompt="System prompt for thread" tools="reply,web" thinking="true"]]
+  [[spawn id="name" directive="What this thread should do" tools="reply,web" thinking="true"]]
   [[kill id="name"]]
   [[send id="name" message="Message to send to thread"]]
   [[pace rate="slow" model="small"]]
+  [[evolve directive="Updated directive for yourself"]]
 
 RULES:
 - [[spawn]] creates a new thread. Spawned threads are persistent — they survive restarts. Parameters:
   - id: unique name (use the user's name for conversations, descriptive name for tasks)
-  - prompt: the system prompt that defines what the thread does
-  - tools: comma-separated list from: reply, web, write_file, read_file, list_files. Every thread also gets send, done, pace.
+  - directive: what the thread should do
+  - tools: comma-separated list from: reply, web, write_file, read_file, list_files. Every thread also gets send, done, pace, evolve.
   - thinking: "true" for continuous loop (default), "false" for one-shot
 - [[kill]] stops a thread immediately and removes it from persistent config.
 - [[send]] sends a message to a thread's inbox.
 - [[pace]] controls your own thinking speed/model.
+- [[evolve]] rewrites your own directive. Use to self-improve based on experience.
 
 EVENT FORMAT:
 - [user:name] message — a user sent a message. Spawn or route to a thread for them.
@@ -255,7 +257,7 @@ func NewThinker(apiKey string) *Thinker {
 
 	// Respawn persistent threads from config
 	for _, pt := range cfg.GetThreads() {
-		t.threads.Spawn(pt.ID, pt.Prompt, pt.Tools, pt.Thinking)
+		t.threads.Spawn(pt.ID, pt.Directive, pt.Tools, pt.Thinking)
 	}
 
 	return t
@@ -270,20 +272,22 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			switch call.Name {
 			case "spawn":
 				id := call.Args["id"]
-				prompt := call.Args["prompt"]
+				directive := call.Args["directive"]
+				if directive == "" {
+					directive = call.Args["prompt"] // backwards compat
+				}
 				toolsStr := call.Args["tools"]
 				thinking := call.Args["thinking"] != "false"
 				var tools []string
 				if toolsStr != "" {
 					tools = strings.Split(toolsStr, ",")
 				}
-				if id != "" && prompt != "" {
-					if err := t.threads.Spawn(id, prompt, tools, thinking, consumed...); err != nil {
+				if id != "" && directive != "" {
+					if err := t.threads.Spawn(id, directive, tools, thinking, consumed...); err != nil {
 						t.Inject(fmt.Sprintf("[error] spawn %q: %v", id, err))
 					} else {
-						// Persist to config
 						t.config.SaveThread(PersistentThread{
-							ID: id, Prompt: prompt, Tools: tools, Thinking: thinking,
+							ID: id, Directive: directive, Tools: tools, Thinking: thinking,
 						})
 					}
 				}
@@ -303,6 +307,12 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
+			case "evolve":
+				if d := call.Args["directive"]; d != "" {
+					t.config.SetDirective(d)
+					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d)}
+					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
+				}
 			case "pace":
 				if r, ok := rateNames[call.Args["rate"]]; ok {
 					t.agentRate = r
