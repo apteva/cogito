@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // MCP JSON-RPC types
@@ -168,11 +169,18 @@ func (s *MCPServer) call(method string, params any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("write: %w", err)
 	}
 
-	resp := <-ch
-	if resp.Error != nil {
-		return nil, fmt.Errorf("MCP error %d: %s", resp.Error.Code, resp.Error.Message)
+	select {
+	case resp := <-ch:
+		if resp.Error != nil {
+			return nil, fmt.Errorf("MCP error %d: %s", resp.Error.Code, resp.Error.Message)
+		}
+		return resp.Result, nil
+	case <-time.After(30 * time.Second):
+		s.pendMu.Lock()
+		delete(s.pending, id)
+		s.pendMu.Unlock()
+		return nil, fmt.Errorf("MCP call timed out after 30s")
 	}
-	return resp.Result, nil
 }
 
 func (s *MCPServer) notify(method string, params any) {
