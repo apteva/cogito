@@ -9,6 +9,7 @@ import (
 
 type ThreadInfo struct {
 	ID        string
+	Prompt    string
 	Tools     []string
 	Thinking  bool
 	Running   bool
@@ -20,6 +21,7 @@ type ThreadInfo struct {
 
 type Thread struct {
 	ID       string
+	Prompt   string // original prompt before tool docs
 	Thinker  *Thinker
 	Parent   *Thinker
 	Tools    map[string]bool
@@ -70,6 +72,7 @@ func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool,
 
 	thread := &Thread{
 		ID:       id,
+		Prompt:   prompt,
 		Parent:   tm.parent,
 		Tools:    toolSet,
 		Thinking: thinking,
@@ -219,6 +222,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 	for _, t := range tm.threads {
 		infos = append(infos, ThreadInfo{
 			ID:        t.ID,
+			Prompt:    t.Prompt,
 			Tools:     toolSetToSlice(t.Tools),
 			Thinking:  t.Thinking,
 			Running:   true,

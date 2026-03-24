@@ -438,13 +438,12 @@ func (t *Thinker) Run() {
 
 		t.events <- ThinkEvent{Done: true, Iteration: t.iteration, Duration: duration, ConsumedEvents: consumed, Usage: usage, ToolCalls: toolNames, Replies: replies, Rate: t.rate, Model: t.model, MemoryCount: t.memory.Count(), ThreadCount: threadCount}
 
-		// Log to API
-		clean := stripToolCalls(reply)
-		clean = strings.TrimSpace(clean)
-		if len(clean) > 500 {
-			clean = clean[:500] + "..."
+		// Log to API — include full reply so tool calls are visible too
+		logMsg := strings.TrimSpace(reply)
+		if len(logMsg) > 1000 {
+			logMsg = logMsg[:1000] + "..."
 		}
-		t.logAPI(APIEvent{Type: "thought", Iteration: t.iteration, Message: clean, Duration: duration.Round(time.Millisecond).String()})
+		t.logAPI(APIEvent{Type: "thought", Iteration: t.iteration, Message: logMsg, Duration: duration.Round(time.Millisecond).String()})
 		for _, r := range replies {
 			t.logAPI(APIEvent{Type: "reply", Message: r})
 		}

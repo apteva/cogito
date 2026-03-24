@@ -246,6 +246,7 @@ function ThreadList({ threads, activeThread, onSelect }) {
             <span>#{t.iteration}</span>
           </div>
           {t.tools && t.tools.length > 0 && <div className="mt-1 text-xs text-slate-600">{t.tools.join(', ')}</div>}
+          {t.prompt && <div className="mt-2 text-xs text-slate-500 border-t border-slate-700 pt-2 line-clamp-3">{t.prompt}</div>}
         </div>
       ))}
     </div>
