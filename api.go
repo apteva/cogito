@@ -21,6 +21,7 @@ func startAPI(thinker *Thinker, addr string) error {
 	mux.HandleFunc("/events", api.events)
 	mux.HandleFunc("/event", api.postEvent)
 	mux.HandleFunc("/config", api.config)
+	mux.Handle("/", http.FileServer(http.Dir("web")))
 	return http.ListenAndServe(addr, mux)
 }
 

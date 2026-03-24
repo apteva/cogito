@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Thinking Engine</title>
+  <script src="https://cdn.tailwindcss.com/3.4.16"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: 'JetBrains Mono', 'SF Mono', monospace; }
+    .thread-node { transition: all 0.3s ease; }
+    .thread-line { transition: all 0.3s ease; }
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .pulse { animation: pulse-dot 2s ease-in-out infinite; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const API = '';
+
+function useAPI(path, interval = 2000) {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    const fetch_ = () => fetch(API + path).then(r => r.json()).then(setData).catch(() => {});
+    fetch_();
+    const id = setInterval(fetch_, interval);
+    return () => clearInterval(id);
+  }, [path, interval]);
+  return data;
+}
+
+function useSSE() {
+  const [events, setEvents] = useState([]);
+  useEffect(() => {
+    const es = new EventSource(API + '/events');
+    es.onmessage = (e) => {
+      const ev = JSON.parse(e.data);
+      setEvents(prev => [...prev.slice(-200), { ...ev, time: new Date() }]);
+    };
+    return () => es.close();
+  }, []);
+  return events;
+}
+
+function StatusBar({ status }) {
+  if (!status) return <div className="p-4 text-slate-500">Connecting...</div>;
+  return (
+    <div className="flex items-center gap-4 px-4 py-3 border-b border-slate-700">
+      <div className="flex items-center gap-2">
+        <div className="w-2 h-2 rounded-full bg-emerald-400 pulse"></div>
+        <span className="text-emerald-400 font-bold text-sm">ONLINE</span>
+      </div>
+      <span className="text-slate-400 text-xs">#{status.iteration}</span>
+      <span className="text-slate-400 text-xs">{status.rate}/{status.model}</span>
+      <span className="text-slate-400 text-xs">{status.threads} threads</span>
+      <span className="text-slate-400 text-xs">{status.memories} mem</span>
+      <span className="text-slate-400 text-xs">{Math.floor(status.uptime_seconds/60)}m uptime</span>
+    </div>
+  );
+}
+
+function ThreadGraph({ threads }) {
+  const w = 600, h = 300;
+  const cx = w / 2, cy = h / 2;
+
+  const nodes = [{ id: 'main', x: cx, y: cy }];
+  const lines = [];
+
+  if (threads && threads.length > 0) {
+    const angleStep = (2 * Math.PI) / threads.length;
+    threads.forEach((t, i) => {
+      const angle = angleStep * i - Math.PI / 2;
+      const r = 110;
+      const x = cx + Math.cos(angle) * r;
+      const y = cy + Math.sin(angle) * r;
+      nodes.push({ ...t, x, y });
+      lines.push({ x1: cx, y1: cy, x2: x, y2: y });
+    });
+  }
+
+  const rateColor = (rate) => {
+    switch(rate) {
+      case 'reactive': return '#34d399';
+      case 'fast': return '#60a5fa';
+      case 'normal': return '#fbbf24';
+      case 'slow': return '#f97316';
+      case 'sleep': return '#6b7280';
+      default: return '#94a3b8';
+    }
+  };
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{maxHeight: '300px'}}>
+      {lines.map((l, i) => (
+        <line key={i} x1={l.x1} y1={l.y1} x2={l.x2} y2={l.y2}
+          className="thread-line" stroke="#334155" strokeWidth="2" strokeDasharray="6,4" />
+      ))}
+      {nodes.map((n, i) => {
+        const isMain = n.id === 'main';
+        const color = isMain ? '#818cf8' : rateColor(n.rate);
+        const size = isMain ? 30 : 22;
+        return (
+          <g key={n.id} className="thread-node">
+            <circle cx={n.x} cy={n.y} r={size} fill={color} opacity="0.15" stroke={color} strokeWidth="2" />
+            <circle cx={n.x} cy={n.y} r={4} fill={color} className={n.rate === 'reactive' || n.rate === 'fast' ? 'pulse' : ''} />
+            <text x={n.x} y={n.y + size + 14} textAnchor="middle" fill="#94a3b8" fontSize="11">{n.id}</text>
+            {!isMain && (
+              <text x={n.x} y={n.y + size + 26} textAnchor="middle" fill="#64748b" fontSize="9">
+                {n.rate} #{n.iteration}
+              </text>
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+function EventLog({ events }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+  }, [events]);
+
+  const typeColor = (type) => {
+    switch(type) {
+      case 'reply': return 'text-emerald-400';
+      case 'started': return 'text-blue-400';
+      case 'done': return 'text-orange-400';
+      case 'report': return 'text-purple-400';
+      default: return 'text-slate-400';
+    }
+  };
+
+  return (
+    <div ref={ref} className="overflow-y-auto h-full space-y-1 p-3 text-xs font-mono">
+      {events.length === 0 && <div className="text-slate-600">Waiting for events...</div>}
+      {events.map((ev, i) => (
+        <div key={i} className="flex gap-2">
+          <span className="text-slate-600 shrink-0">{ev.time.toLocaleTimeString()}</span>
+          <span className={`shrink-0 ${typeColor(ev.type)}`}>[{ev.type}]</span>
+          <span className="text-slate-500 shrink-0">{ev.thread}</span>
+          <span className="text-slate-300 truncate">{ev.message}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Console() {
+  const [cmd, setCmd] = useState('');
+  const [history, setHistory] = useState([]);
+
+  const send = useCallback(() => {
+    if (!cmd.trim()) return;
+    fetch(API + '/event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: cmd }),
+    });
+    setHistory(prev => [...prev, cmd]);
+    setCmd('');
+  }, [cmd]);
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex-1 overflow-y-auto p-3 space-y-1 text-xs font-mono">
+        {history.map((h, i) => (
+          <div key={i} className="text-amber-400">&gt; {h}</div>
+        ))}
+      </div>
+      <div className="border-t border-slate-700 p-2 flex gap-2">
+        <span className="text-amber-400 text-sm">&gt;</span>
+        <input
+          value={cmd}
+          onChange={e => setCmd(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && send()}
+          className="flex-1 bg-transparent text-sm text-slate-200 outline-none placeholder-slate-600"
+          placeholder="command..."
+        />
+        <button onClick={send} className="text-xs text-slate-400 hover:text-white px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function DirectiveEditor() {
+  const config = useAPI('/config', 5000);
+  const [text, setText] = useState('');
+  const [saved, setSaved] = useState(false);
+  const loaded = useRef(false);
+
+  useEffect(() => {
+    if (config && !loaded.current) {
+      setText(config.directive);
+      loaded.current = true;
+    }
+  }, [config]);
+
+  const save = () => {
+    fetch(API + '/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ directive: text }),
+    }).then(() => { setSaved(true); setTimeout(() => setSaved(false), 2000); });
+  };
+
+  return (
+    <div className="flex flex-col h-full p-3 gap-2">
+      <div className="flex items-center justify-between">
+        <span className="text-yellow-400 text-sm font-bold">Directive</span>
+        <button onClick={save}
+          className={`text-xs px-3 py-1 rounded ${saved ? 'bg-emerald-800 text-emerald-300' : 'bg-slate-800 hover:bg-slate-700 text-slate-300'}`}>
+          {saved ? 'Saved!' : 'Save'}
+        </button>
+      </div>
+      <textarea
+        value={text}
+        onChange={e => setText(e.target.value)}
+        className="flex-1 bg-slate-900 border border-slate-700 rounded p-3 text-sm text-slate-200 outline-none resize-none focus:border-yellow-500"
+        placeholder="Enter system directive..."
+      />
+    </div>
+  );
+}
+
+function ThreadList({ threads }) {
+  if (!threads || threads.length === 0) {
+    return <div className="p-3 text-slate-600 text-sm">No threads</div>;
+  }
+  return (
+    <div className="space-y-2 p-3">
+      {threads.map(t => (
+        <div key={t.id} className="bg-slate-800 rounded p-3 border border-slate-700">
+          <div className="flex items-center justify-between">
+            <span className="text-indigo-400 font-bold text-sm">{t.id}</span>
+            <span className="text-xs text-slate-500">{t.age}</span>
+          </div>
+          <div className="flex gap-3 mt-1 text-xs text-slate-400">
+            <span>{t.rate}/{t.model}</span>
+            <span>#{t.iteration}</span>
+            <span>{t.thinking ? 'thinking' : 'one-shot'}</span>
+          </div>
+          <div className="mt-1 text-xs text-slate-600">
+            {t.tools && t.tools.join(', ')}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function App() {
+  const status = useAPI('/status', 1000);
+  const threads = useAPI('/threads', 2000);
+  const events = useSSE();
+  const [tab, setTab] = useState('graph');
+
+  return (
+    <div className="h-screen flex flex-col">
+      <StatusBar status={status} />
+
+      <div className="flex-1 flex overflow-hidden">
+        {/* Left panel */}
+        <div className="w-80 border-r border-slate-700 flex flex-col shrink-0">
+          {/* Tabs */}
+          <div className="flex border-b border-slate-700">
+            {['graph', 'threads', 'console', 'directive'].map(t => (
+              <button key={t} onClick={() => setTab(t)}
+                className={`flex-1 py-2 text-xs font-medium ${tab === t ? 'text-indigo-400 border-b-2 border-indigo-400 bg-slate-800/50' : 'text-slate-500 hover:text-slate-300'}`}>
+                {t}
+              </button>
+            ))}
+          </div>
+
+          {/* Tab content */}
+          <div className="flex-1 overflow-hidden">
+            {tab === 'graph' && <ThreadGraph threads={threads} />}
+            {tab === 'threads' && <ThreadList threads={threads} />}
+            {tab === 'console' && <Console />}
+            {tab === 'directive' && <DirectiveEditor />}
+          </div>
+        </div>
+
+        {/* Right panel — event stream */}
+        <div className="flex-1 flex flex-col overflow-hidden">
+          <div className="px-4 py-2 border-b border-slate-700 flex items-center gap-2">
+            <span className="text-sm font-bold text-slate-300">Events</span>
+            <span className="text-xs text-slate-600">{events.length} events</span>
+          </div>
+          <EventLog events={events} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
