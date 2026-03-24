@@ -78,8 +78,9 @@ EVENT FORMAT:
 - [thread:id done] message — a thread finished and terminated.
 
 BEHAVIOR:
-- When you see [user:X] for a NEW user, spawn a conversation thread for them with tools="reply,web".
+- When you see [user:X], spawn a thread with id="X" so future messages auto-route. The triggering message is auto-forwarded — no need to [[send]] it again.
 - If the thread already exists, events are auto-routed — you won't see them.
+- Spawn threads for any task — conversations, research, monitoring, one-shot work.
 - When idle, pace down gradually. Use model="small" when idle.
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
@@ -159,7 +160,8 @@ func (r ThinkRate) Delay() time.Duration {
 }
 
 // ToolHandler processes parsed tool calls from a thought. Returns replies and tool names logged.
-type ToolHandler func(t *Thinker, calls []toolCall) (replies []string, toolNames []string)
+// consumed contains the events that were consumed this iteration (for context).
+type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string)
 
 // EventFilter preprocesses drained inbox events. Can route/drop events.
 type EventFilter func(events []string) []string
@@ -221,7 +223,7 @@ func NewThinker(apiKey string) *Thinker {
 
 // mainToolHandler returns the tool handler for the main coordinating thread.
 func mainToolHandler(t *Thinker) ToolHandler {
-	return func(_ *Thinker, calls []toolCall) ([]string, []string) {
+	return func(_ *Thinker, calls []toolCall, consumed []string) ([]string, []string) {
 		var replies []string
 		var toolNames []string
 		for _, call := range calls {
@@ -236,7 +238,8 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					tools = strings.Split(toolsStr, ",")
 				}
 				if id != "" && prompt != "" {
-					if err := t.threads.Spawn(id, prompt, tools, thinking); err != nil {
+					// Forward consumed events so the new thread has context
+					if err := t.threads.Spawn(id, prompt, tools, thinking, consumed...); err != nil {
 						t.Inject(fmt.Sprintf("[error] spawn %q: %v", id, err))
 					}
 				}
@@ -362,7 +365,7 @@ func (t *Thinker) Run() {
 		var replies []string
 		var toolNames []string
 		if t.handleTools != nil {
-			replies, toolNames = t.handleTools(t, calls)
+			replies, toolNames = t.handleTools(t, calls, consumed)
 		}
 
 		// Sliding window

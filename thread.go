@@ -48,7 +48,7 @@ func NewThreadManager(parent *Thinker) *ThreadManager {
 	}
 }
 
-func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool) error {
+func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool, initialMessages ...string) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -98,6 +98,11 @@ func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool)
 
 	tm.threads[id] = thread
 
+	// Inject initial messages before starting so first thought picks them up
+	for _, msg := range initialMessages {
+		thinker.inbox <- msg
+	}
+
 	// Same Run() as the main thinker — no duplicated loop
 	go thinker.Run()
 
@@ -109,7 +114,7 @@ func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool)
 
 // threadToolHandler returns a ToolHandler scoped to a thread's allowed tools.
 func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
-	return func(t *Thinker, calls []toolCall) ([]string, []string) {
+	return func(t *Thinker, calls []toolCall, _ []string) ([]string, []string) {
 		var replies []string
 		var toolNames []string
 		for _, call := range calls {

@@ -370,7 +370,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
-		case "[":
+		case "[", "shift+tab":
 			// Prev tab
 			for i, tab := range m.tabs {
 				if tab == m.activeTab {
