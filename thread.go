@@ -181,6 +181,30 @@ func (tm *ThreadManager) Kill(id string) {
 		return
 	}
 	thread.Thinker.Stop()
+	// Wait briefly for cleanup
+	for i := 0; i < 20; i++ {
+		time.Sleep(50 * time.Millisecond)
+		tm.mu.RLock()
+		_, still := tm.threads[id]
+		tm.mu.RUnlock()
+		if !still {
+			return
+		}
+	}
+	// Force cleanup if still lingering
+	tm.cleanupThread(id)
+}
+
+func (tm *ThreadManager) KillAll() {
+	tm.mu.RLock()
+	ids := make([]string, 0, len(tm.threads))
+	for id := range tm.threads {
+		ids = append(ids, id)
+	}
+	tm.mu.RUnlock()
+	for _, id := range ids {
+		tm.Kill(id)
+	}
 }
 
 func (tm *ThreadManager) Send(id, message string) bool {

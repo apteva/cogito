@@ -64,6 +64,13 @@ func (c *Config) SetDirective(d string) {
 	c.Save()
 }
 
+func (c *Config) ClearThreads() {
+	c.mu.Lock()
+	c.Threads = nil
+	c.mu.Unlock()
+	c.Save()
+}
+
 func (c *Config) SaveThread(pt PersistentThread) {
 	c.mu.Lock()
 	// Update if exists, otherwise append
