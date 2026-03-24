@@ -246,7 +246,6 @@ function ThreadList({ threads, activeThread, onSelect }) {
             <span>#{t.iteration}</span>
           </div>
           {t.tools && t.tools.length > 0 && <div className="mt-1 text-xs text-slate-600">{t.tools.join(', ')}</div>}
-          {t.prompt && <div className="mt-2 text-xs text-slate-500 border-t border-slate-700 pt-2 line-clamp-3">{t.prompt}</div>}
         </div>
       ))}
     </div>
@@ -260,6 +259,9 @@ function App() {
   const [sideTab, setSideTab] = useState('threads');
   const [activeThread, setActiveThread] = useState('main');
   const [rightTab, setRightTab] = useState('thoughts');
+  const [showPrompt, setShowPrompt] = useState(false);
+
+  const activeThreadData = threads ? threads.find(t => t.id === activeThread) : null;
 
   // Collect unique thread IDs from events for tab bar
   const threadIDs = ['main'];
@@ -314,6 +316,23 @@ function App() {
               ))}
             </div>
           </div>
+          {/* Thread prompt detail */}
+          {activeThreadData && activeThreadData.prompt && (
+            <div className="border-b border-slate-700">
+              <button onClick={() => setShowPrompt(!showPrompt)}
+                className="w-full px-3 py-1.5 flex items-center gap-2 text-xs text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
+                <span className="text-slate-600">{showPrompt ? '▼' : '▶'}</span>
+                <span className="font-medium">System Prompt</span>
+                <span className="text-slate-600 truncate flex-1">{!showPrompt && activeThreadData.prompt.substring(0, 80) + '...'}</span>
+              </button>
+              {showPrompt && (
+                <div className="px-4 pb-3 text-xs text-slate-300 whitespace-pre-wrap leading-relaxed bg-slate-900/50 max-h-48 overflow-y-auto">
+                  {activeThreadData.prompt}
+                </div>
+              )}
+            </div>
+          )}
+
           {rightTab === 'thoughts'
             ? <ThoughtsPanel events={events} activeThread={activeThread} />
             : <EventLog events={events} />
