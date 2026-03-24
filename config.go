@@ -25,7 +25,7 @@ type Config struct {
 func NewConfig() *Config {
 	c := &Config{
 		path:      configFile,
-		Directive: "You are a general-purpose thinking engine. Observe events, coordinate threads, and help users with their tasks.",
+		Directive: "Idle. Waiting for configuration via directive.",
 	}
 	c.load()
 	return c
