@@ -57,7 +57,7 @@ func main() {
 
 	apiPort := os.Getenv("API_PORT")
 	if apiPort == "" {
-		apiPort = "8080"
+		apiPort = "3210"
 	}
 	go startAPI(thinker, ":"+apiPort)
 

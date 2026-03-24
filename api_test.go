@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -199,4 +200,73 @@ func TestAPI_Config_WrongMethod(t *testing.T) {
 	if w.Code != 405 {
 		t.Errorf("expected 405, got %d", w.Code)
 	}
+}
+
+// Full HTTP server integration test — verifies routing and real HTTP round-trips
+func TestAPI_FullServer(t *testing.T) {
+	api, _ := newTestAPI()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", api.health)
+	mux.HandleFunc("/status", api.status)
+	mux.HandleFunc("/threads", api.threads)
+	mux.HandleFunc("/event", api.postEvent)
+	mux.HandleFunc("/config", api.config)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Health
+	resp, err := http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("health: expected 200, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Status
+	resp, err = http.Get(srv.URL + "/status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	var status map[string]any
+	json.NewDecoder(resp.Body).Decode(&status)
+	resp.Body.Close()
+	if _, ok := status["uptime_seconds"]; !ok {
+		t.Error("status missing uptime_seconds")
+	}
+
+	// Post event
+	payload, _ := json.Marshal(map[string]string{"message": "hello"})
+	resp, err = http.Post(srv.URL+"/event", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("event: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("event: expected 200, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Config round-trip
+	payload, _ = json.Marshal(map[string]string{"directive": "full server test"})
+	req, _ := http.NewRequest("PUT", srv.URL+"/config", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("config PUT: %v", err)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(srv.URL + "/config")
+	if err != nil {
+		t.Fatalf("config GET: %v", err)
+	}
+	var cfg map[string]string
+	json.NewDecoder(resp.Body).Decode(&cfg)
+	resp.Body.Close()
+	if cfg["directive"] != "full server test" {
+		t.Errorf("config round-trip failed, got %q", cfg["directive"])
+	}
+
+	t.Log("All endpoints working via real HTTP server")
 }

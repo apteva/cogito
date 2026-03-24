@@ -64,18 +64,20 @@ function StatusBar({ status }) {
   );
 }
 
-function ThreadGraph({ threads }) {
-  const w = 600, h = 300;
+function ThreadGraph({ threads, status }) {
+  const count = threads ? threads.length : 0;
+  const w = 600, h = count > 0 ? 250 : 120;
   const cx = w / 2, cy = h / 2;
 
-  const nodes = [{ id: 'main', x: cx, y: cy }];
+  const mainRate = status ? status.rate : 'normal';
+  const nodes = [{ id: 'main', x: cx, y: cy, rate: mainRate }];
   const lines = [];
 
-  if (threads && threads.length > 0) {
-    const angleStep = (2 * Math.PI) / threads.length;
+  if (count > 0) {
+    const angleStep = (2 * Math.PI) / count;
     threads.forEach((t, i) => {
       const angle = angleStep * i - Math.PI / 2;
-      const r = 110;
+      const r = 90;
       const x = cx + Math.cos(angle) * r;
       const y = cy + Math.sin(angle) * r;
       nodes.push({ ...t, x, y });
@@ -261,35 +263,37 @@ function App() {
   const status = useAPI('/status', 1000);
   const threads = useAPI('/threads', 2000);
   const events = useSSE();
-  const [tab, setTab] = useState('graph');
+  const [tab, setTab] = useState('threads');
 
   return (
     <div className="h-screen flex flex-col">
       <StatusBar status={status} />
 
+      {/* Graph — top panel */}
+      <div className="border-b border-slate-700 bg-slate-900/50">
+        <ThreadGraph threads={threads} status={status} />
+      </div>
+
+      {/* Bottom: sidebar + event stream */}
       <div className="flex-1 flex overflow-hidden">
         {/* Left panel */}
         <div className="w-80 border-r border-slate-700 flex flex-col shrink-0">
-          {/* Tabs */}
           <div className="flex border-b border-slate-700">
-            {['graph', 'threads', 'console', 'directive'].map(t => (
+            {['threads', 'console', 'directive'].map(t => (
               <button key={t} onClick={() => setTab(t)}
                 className={`flex-1 py-2 text-xs font-medium ${tab === t ? 'text-indigo-400 border-b-2 border-indigo-400 bg-slate-800/50' : 'text-slate-500 hover:text-slate-300'}`}>
                 {t}
               </button>
             ))}
           </div>
-
-          {/* Tab content */}
           <div className="flex-1 overflow-hidden">
-            {tab === 'graph' && <ThreadGraph threads={threads} />}
             {tab === 'threads' && <ThreadList threads={threads} />}
             {tab === 'console' && <Console />}
             {tab === 'directive' && <DirectiveEditor />}
           </div>
         </div>
 
-        {/* Right panel — event stream */}
+        {/* Right — event stream */}
         <div className="flex-1 flex flex-col overflow-hidden">
           <div className="px-4 py-2 border-b border-slate-700 flex items-center gap-2">
             <span className="text-sm font-bold text-slate-300">Events</span>
