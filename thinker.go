@@ -358,12 +358,8 @@ func (t *Thinker) Run() {
 		if hasExternalEvent {
 			t.rate = RateReactive
 			t.model = ModelLarge
-		} else if hadEvents {
-			// Tool results — process quickly but don't go full reactive
-			if t.rate > RateFast {
-				t.rate = RateFast
-			}
 		}
+		// Tool results don't change rate — agent already set its pace
 		if hadEvents {
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
@@ -643,6 +639,12 @@ func (t *Thinker) InjectConsole(msg string) {
 func (t *Thinker) Inject(msg string) {
 	t.inbox <- msg
 	t.wake()
+}
+
+// injectToolResult puts a tool result in the inbox without waking the thinker.
+// The result will be picked up on the next natural iteration.
+func (t *Thinker) injectToolResult(msg string) {
+	t.inbox <- msg
 }
 
 func (t *Thinker) InjectUserMessage(userID, msg string) {

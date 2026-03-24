@@ -72,6 +72,9 @@ func listFilesTool(args map[string]string) string {
 	}
 	entries, err := os.ReadDir(full)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return "(directory does not exist)"
+		}
 		return fmt.Sprintf("error: %v", err)
 	}
 	var lines []string
