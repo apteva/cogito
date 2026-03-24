@@ -123,6 +123,7 @@ type model struct {
 
 	chat        []chatMessage
 	rate        ThinkRate
+	aiModel     ModelTier
 	memoryCount int
 
 	// Left panel mode
@@ -302,6 +303,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentChunk.Reset()
 			m.lastDuration = ev.Duration
 			m.rate = ev.Rate
+			m.aiModel = ev.Model
 			m.memoryCount = ev.MemoryCount
 
 			u := ev.Usage
@@ -542,7 +544,7 @@ func (m model) View() string {
 	if m.paused {
 		statusRender = pausedStyle.Render("PAUSED")
 	} else {
-		statusRender = statusBarStyle.Render(fmt.Sprintf("THINKING (%s)", m.rate))
+		statusRender = statusBarStyle.Render(fmt.Sprintf("THINKING (%s/%s)", m.rate, m.aiModel))
 	}
 
 	stats := statsStyle.Render(fmt.Sprintf(

@@ -50,6 +50,35 @@ func TestRateNames(t *testing.T) {
 	}
 }
 
+func TestModelTier_String(t *testing.T) {
+	if ModelLarge.String() != "large" {
+		t.Errorf("expected 'large', got %q", ModelLarge.String())
+	}
+	if ModelSmall.String() != "small" {
+		t.Errorf("expected 'small', got %q", ModelSmall.String())
+	}
+}
+
+func TestModelTier_ID(t *testing.T) {
+	if ModelLarge.ID() == "" {
+		t.Error("large model ID should not be empty")
+	}
+	if ModelSmall.ID() == "" {
+		t.Error("small model ID should not be empty")
+	}
+	if ModelLarge.ID() == ModelSmall.ID() {
+		t.Error("large and small should have different model IDs")
+	}
+}
+
+func TestModelNames(t *testing.T) {
+	for name, tier := range modelNames {
+		if tier.String() != name {
+			t.Errorf("modelNames[%q] = %d, String() = %q", name, tier, tier.String())
+		}
+	}
+}
+
 func TestDrainInbox_Empty(t *testing.T) {
 	thinker := &Thinker{
 		inbox: make(chan string, 10),

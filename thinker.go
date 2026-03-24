@@ -13,9 +13,40 @@ import (
 
 const (
 	fireworksURL = "https://api.fireworks.ai/inference/v1/chat/completions"
-	aiModel      = "accounts/fireworks/models/kimi-k2p5"
-	maxHistory   = 20 // keep last N thoughts to manage context
+	maxHistory   = 20
 )
+
+type ModelTier int
+
+const (
+	ModelLarge ModelTier = iota
+	ModelSmall
+)
+
+var modelIDs = map[ModelTier]string{
+	ModelLarge: "accounts/fireworks/models/kimi-k2p5",
+	ModelSmall: "accounts/fireworks/models/qwen3-8b",
+}
+
+var modelNames = map[string]ModelTier{
+	"large": ModelLarge,
+	"small": ModelSmall,
+}
+
+func (m ModelTier) String() string {
+	switch m {
+	case ModelLarge:
+		return "large"
+	case ModelSmall:
+		return "small"
+	default:
+		return "large"
+	}
+}
+
+func (m ModelTier) ID() string {
+	return modelIDs[m]
+}
 
 const systemPrompt = `You are an AI agent with a continuous thinking loop — your mind never stops.
 You are not a chatbot. You are a reasoning engine that plans, reflects, and refines.
@@ -38,7 +69,7 @@ You have tools. Call them inline in your response using EXACTLY this syntax:
 - [[reply]] is how you talk to the user. The user CANNOT see your thoughts — only [[reply]] messages. When you see a [user] event, respond with [[reply]].
 - Only use [[reply]] once per [user] message. Do not reply again until the user sends another message.
 - [[web]] fetches a URL. The only parameter is "url". Do NOT use "search", "query", or any other parameter.
-- [[pace]] controls how fast your next thought comes. Rates: "fast" (2s), "normal" (10s), "slow" (30s), "sleep" (2min). Pace down gradually — don't jump straight to "sleep". Example: after replying to a user, go "normal". If still nothing after a few thoughts, go "slow", then eventually "sleep". When actively working or waiting for tool results, use "fast".
+- [[pace]] controls how fast you think and which model to use. Rates: "fast" (2s), "normal" (10s), "slow" (30s), "sleep" (2min). Models: "large" (full power), "small" (lightweight, cheap). Example: [[pace rate="slow" model="small"]] or [[pace rate="fast" model="large"]]. Pace down gradually — don't jump straight to "sleep". After replying to a user, go "normal". If still nothing, go "slow" then "sleep". Use model="small" when idle to save cost. Events automatically switch to large model.
 - Tool results arrive as events in your next thought — they are non-blocking.
 
 You have persistent memory across restarts. Relevant memories from past sessions appear automatically as [memories] blocks. Use them to maintain continuity — remember past conversations, user preferences, and prior conclusions.`
@@ -60,6 +91,7 @@ type ThinkEvent struct {
 	ToolCalls      []string
 	Replies        []string
 	Rate           ThinkRate
+	Model          ModelTier
 	MemoryCount    int
 }
 
@@ -125,9 +157,11 @@ type Thinker struct {
 	quit      chan struct{}
 	iteration int
 	paused    bool
-	rate      ThinkRate
-	agentRate ThinkRate
-	memory    *MemoryStore
+	rate       ThinkRate
+	agentRate  ThinkRate
+	model      ModelTier
+	agentModel ModelTier
+	memory     *MemoryStore
 }
 
 func NewThinker(apiKey string) *Thinker {
@@ -174,6 +208,7 @@ func (t *Thinker) Run() {
 		hadEvents := len(consumed) > 0
 		if hadEvents {
 			t.rate = RateReactive
+			t.model = ModelLarge // always use large for events
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
 			for _, ev := range consumed {
@@ -230,6 +265,9 @@ func (t *Thinker) Run() {
 				if r, ok := rateNames[call.Args["rate"]]; ok {
 					t.agentRate = r
 				}
+				if m, ok := modelNames[call.Args["model"]]; ok {
+					t.agentModel = m
+				}
 			default:
 				executeTool(t, call)
 				toolNames = append(toolNames, call.Raw)
@@ -249,14 +287,16 @@ func (t *Thinker) Run() {
 			}
 		}
 
-		// After reactive burst, fall back to agent's chosen rate
+		// After reactive burst, fall back to agent's chosen rate/model
 		if hadEvents {
 			t.rate = RateReactive
+			t.model = ModelLarge
 		} else {
 			t.rate = t.agentRate
+			t.model = t.agentModel
 		}
 
-		t.events <- ThinkEvent{Done: true, Iteration: t.iteration, Duration: duration, ConsumedEvents: consumed, Usage: usage, ToolCalls: toolNames, Replies: replies, Rate: t.rate, MemoryCount: t.memory.Count()}
+		t.events <- ThinkEvent{Done: true, Iteration: t.iteration, Duration: duration, ConsumedEvents: consumed, Usage: usage, ToolCalls: toolNames, Replies: replies, Rate: t.rate, Model: t.model, MemoryCount: t.memory.Count()}
 
 		// Interruptible sleep — wakeup signal skips the delay
 		select {
@@ -271,7 +311,7 @@ func (t *Thinker) Run() {
 
 func (t *Thinker) think() (string, TokenUsage, error) {
 	reqBody := Request{
-		Model:    aiModel,
+		Model:    t.model.ID(),
 		Messages: t.messages,
 		Stream:   true,
 	}
