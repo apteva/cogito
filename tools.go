@@ -46,7 +46,7 @@ func executeTool(t *Thinker, call toolCall) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				t.inbox <- fmt.Sprintf("[tool:%s] error: panic: %v", call.Name, r)
+				t.Inject(fmt.Sprintf("[tool:%s] error: panic: %v", call.Name, r))
 			}
 		}()
 		var result string
@@ -62,8 +62,7 @@ func executeTool(t *Thinker, call toolCall) {
 		default:
 			result = fmt.Sprintf("unknown tool %q", call.Name)
 		}
-		// Put in inbox but don't wake — result picked up on next natural iteration
-		t.inbox <- fmt.Sprintf("[tool:%s] %s", call.Name, result)
+		t.Inject(fmt.Sprintf("[tool:%s] %s", call.Name, result))
 	}()
 }
 
