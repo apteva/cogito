@@ -7,6 +7,15 @@ import (
 	"time"
 )
 
+const baseThreadPrompt = `You are a thread in a continuous thinking engine. Your loop runs forever.
+
+BEHAVIOR:
+- Think out loud — explain what you're doing and why. Never output empty thoughts.
+- Process events when they arrive. Use your tools to accomplish tasks.
+- Use [[send id="main" message="..."]] to report results to the coordinator.
+- When idle, pace down gradually with [[pace]]. New events auto-wake you.
+- Keep each thought concise — 1-2 short paragraphs max.`
+
 type ThreadInfo struct {
 	ID        string
 	Prompt    string
@@ -67,8 +76,8 @@ func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool,
 	toolSet["done"] = true
 	toolSet["pace"] = true
 
-	// Build system prompt
-	threadSystemPrompt := prompt + "\n\n" + buildThreadToolDocs(toolSet)
+	// Build system prompt: core behavior + user prompt + tool docs
+	threadSystemPrompt := baseThreadPrompt + "\n\n[ROLE]\n" + prompt + "\n\n" + buildThreadToolDocs(toolSet)
 
 	thread := &Thread{
 		ID:       id,
