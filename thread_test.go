@@ -150,32 +150,51 @@ func TestThreadManager_ToolSetAlwaysIncludesBuiltins(t *testing.T) {
 	}
 }
 
-func TestBuildThreadToolDocs(t *testing.T) {
-	tools := map[string]bool{"reply": true, "web": true, "send": true, "done": true, "pace": true}
-	docs := buildThreadToolDocs(tools)
+func TestToolRegistry_CoreDocs(t *testing.T) {
+	reg := NewToolRegistry("test")
+	docs := reg.CoreDocs(true)
 
-	if !strings.Contains(docs, "[[reply") {
-		t.Error("expected reply in docs")
-	}
-	if !strings.Contains(docs, "[[web") {
-		t.Error("expected web in docs")
+	if !strings.Contains(docs, "[[spawn") {
+		t.Error("expected spawn in main core docs")
 	}
 	if !strings.Contains(docs, "[[send") {
-		t.Error("expected send in docs")
+		t.Error("expected send in core docs")
 	}
-	if !strings.Contains(docs, "[[done") {
-		t.Error("expected done in docs")
+	if !strings.Contains(docs, "[[pace") {
+		t.Error("expected pace in core docs")
+	}
+
+	// Without main-only
+	docs = reg.CoreDocs(false)
+	if strings.Contains(docs, "[[spawn") {
+		t.Error("spawn should not be in non-main core docs")
+	}
+	if !strings.Contains(docs, "[[send") {
+		t.Error("expected send in non-main core docs")
 	}
 }
 
-func TestBuildThreadToolDocs_NoReply(t *testing.T) {
-	tools := map[string]bool{"web": true, "send": true, "done": true, "pace": true}
-	docs := buildThreadToolDocs(tools)
+func TestToolRegistry_Dispatch(t *testing.T) {
+	reg := NewToolRegistry("test")
 
-	if strings.Contains(docs, "[[reply") {
-		t.Error("should not include reply when not in tools")
+	// Known tool with handler
+	result, ok := reg.Dispatch("list_files", map[string]string{"path": "."})
+	if !ok {
+		t.Error("expected list_files to dispatch")
 	}
-	if !strings.Contains(docs, "[[web") {
-		t.Error("expected web in docs")
+	if result == "" {
+		t.Error("expected non-empty result")
+	}
+
+	// Core tool (no handler)
+	_, ok = reg.Dispatch("pace", nil)
+	if ok {
+		t.Error("pace should not dispatch (no handler)")
+	}
+
+	// Unknown tool
+	_, ok = reg.Dispatch("nonexistent", nil)
+	if ok {
+		t.Error("nonexistent should not dispatch")
 	}
 }

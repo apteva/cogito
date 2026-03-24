@@ -82,8 +82,12 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, thinking bo
 	toolSet["pace"] = true
 	toolSet["evolve"] = true
 
-	// Build system prompt: core behavior + directive + tool docs
-	threadSystemPrompt := baseThreadPrompt + "\n\n[DIRECTIVE]\n" + directive + "\n\n" + buildThreadToolDocs(toolSet)
+	// Build system prompt: core behavior + directive + core tool docs
+	coreDocs := ""
+	if tm.parent.registry != nil {
+		coreDocs = "\n" + tm.parent.registry.CoreDocs(false)
+	}
+	threadSystemPrompt := baseThreadPrompt + coreDocs + "\n\n[DIRECTIVE]\n" + directive
 
 	thread := &Thread{
 		ID:        id,
@@ -112,9 +116,11 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, thinking bo
 		onStop:    func() { tm.cleanupThread(id) },
 		handleTools: threadToolHandler(thread, tm),
 		threadID:  id,
-		apiLog:    tm.parent.apiLog,
-		apiMu:     tm.parent.apiMu,
-		apiNotify: tm.parent.apiNotify,
+		apiLog:        tm.parent.apiLog,
+		apiMu:         tm.parent.apiMu,
+		apiNotify:     tm.parent.apiNotify,
+		registry:      tm.parent.registry,
+		toolAllowlist: toolSet,
 	}
 	thread.Thinker = thinker
 
@@ -182,9 +188,11 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
 					thread.Directive = d
-					// Rebuild system prompt with new directive
-					newSysPrompt := baseThreadPrompt + "\n\n[DIRECTIVE]\n" + d + "\n\n" + buildThreadToolDocs(thread.Tools)
-					t.messages[0] = Message{Role: "system", Content: newSysPrompt}
+					coreDocs := ""
+					if tm.parent.registry != nil {
+						coreDocs = "\n" + tm.parent.registry.CoreDocs(false)
+					}
+					t.messages[0] = Message{Role: "system", Content: baseThreadPrompt + coreDocs + "\n\n[DIRECTIVE]\n" + d}
 					// Persist
 					tm.parent.config.SaveThread(PersistentThread{
 						ID: thread.ID, Directive: d, Tools: toolSetToSlice(thread.Tools), Thinking: thread.Thinking,
@@ -308,43 +316,3 @@ func toolSetToSlice(m map[string]bool) []string {
 	return out
 }
 
-func buildThreadToolDocs(tools map[string]bool) string {
-	var sb strings.Builder
-	sb.WriteString("You have tools. Call them inline:\n")
-	if tools["reply"] {
-		sb.WriteString("  [[reply message=\"Your response to the user\"]]\n")
-	}
-	if tools["web"] {
-		sb.WriteString("  [[web url=\"https://example.com\"]]\n")
-	}
-	if tools["write_file"] {
-		sb.WriteString("  [[write_file path=\"drafts/doc.md\" content=\"...\"]]\n")
-	}
-	if tools["read_file"] {
-		sb.WriteString("  [[read_file path=\"drafts/doc.md\"]]\n")
-	}
-	if tools["list_files"] {
-		sb.WriteString("  [[list_files path=\"drafts/\"]]\n")
-	}
-	sb.WriteString("  [[send id=\"thread-name\" message=\"message to send\"]]\n")
-	sb.WriteString("  [[done message=\"Final result, then PERMANENTLY terminate this thread\"]]\n")
-	sb.WriteString("  [[pace rate=\"fast\" model=\"large\"]]\n")
-	sb.WriteString("  [[evolve directive=\"Updated directive for this thread\"]]\n")
-	sb.WriteString("\nRULES:\n")
-	if tools["reply"] {
-		sb.WriteString("- [[reply]] talks to the user. They can only see [[reply]] messages, not your thoughts.\n")
-	}
-	if tools["web"] {
-		sb.WriteString("- [[web]] fetches a URL. Only param is url.\n")
-	}
-	if tools["write_file"] || tools["read_file"] || tools["list_files"] {
-		sb.WriteString("- File tools operate in the workspace/ directory. Paths are relative.\n")
-	}
-	sb.WriteString("- [[send]] sends a message to any thread by id. Use id=\"main\" for the coordinator.\n")
-	sb.WriteString("- [[done]] PERMANENTLY kills this thread. Only use when your task is truly complete and you will never be needed again. Do NOT use after a single reply in a conversation.\n")
-	sb.WriteString("- [[evolve]] rewrites your own directive. Use this to self-improve based on experience — adjust your approach, add learned rules, refine your role.\n")
-	sb.WriteString(`- [[pace]] controls thinking speed and model. Rates: "fast" (2s), "normal" (10s), "slow" (30s), "sleep" (2min). Models: "large", "small".
-  IMPORTANT: When you have nothing to do, pace down gradually: "normal" → "slow" → "sleep". Do NOT keep generating idle thoughts. New events auto-switch you back to fast.
-`)
-	return sb.String()
-}

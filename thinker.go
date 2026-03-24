@@ -58,24 +58,6 @@ Your thinking should be purposeful:
 - Monitor thread reports and coordinate between them.
 - Keep each thought concise — 1-2 short paragraphs max.
 
-TOOLS — call inline in your response:
-  [[spawn id="name" directive="What this thread should do" tools="reply,web" thinking="true"]]
-  [[kill id="name"]]
-  [[send id="name" message="Message to send to thread"]]
-  [[pace rate="slow" model="small"]]
-  [[evolve directive="Updated directive for yourself"]]
-
-RULES:
-- [[spawn]] creates a new thread. Spawned threads are persistent — they survive restarts. Parameters:
-  - id: unique name (use the user's name for conversations, descriptive name for tasks)
-  - directive: what the thread should do
-  - tools: comma-separated list from: reply, web, write_file, read_file, list_files. Every thread also gets send, done, pace, evolve.
-  - thinking: "true" for continuous loop (default), "false" for one-shot
-- [[kill]] stops a thread immediately and removes it from persistent config.
-- [[send]] sends a message to a thread's inbox.
-- [[pace]] controls your own thinking speed/model.
-- [[evolve]] rewrites your own directive. Use to self-improve based on experience.
-
 EVENT FORMAT:
 - [user:name] message — a user sent a message. Spawn or route to a thread for them.
 - [from:id] message — a thread sent you a message via [[send]].
@@ -86,17 +68,21 @@ BEHAVIOR:
 - When you see [user:X], spawn a thread with id="X" so future messages auto-route. The triggering message is auto-forwarded — no need to [[send]] it again.
 - If the thread already exists, events are auto-routed — you won't see them.
 - Spawn threads for any task — conversations, research, monitoring, one-shot work.
+- Additional tools may appear in [available tools] blocks based on context. If you need a tool you don't see, describe what you need.
 
 PACING — critical:
 - Sub-threads will [[send]] you messages when they need your attention. You do NOT need to stay awake to monitor them.
 - After setting up the system, pace down aggressively: "normal" → "slow" → "sleep". Use model="small" when idle.
 - Do NOT repeat status updates. If nothing changed, go to sleep. You will be woken automatically when an event arrives.
-- Example: once threads are running, set [[pace rate="sleep" model="small"]] and stop thinking until something happens.
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
-func buildSystemPrompt(directive string) string {
-	return baseSystemPrompt + "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
+func buildSystemPrompt(directive string, registry *ToolRegistry) string {
+	coreDocs := ""
+	if registry != nil {
+		coreDocs = "\n" + registry.CoreDocs(true)
+	}
+	return baseSystemPrompt + coreDocs + "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
 }
 
 type TokenUsage struct {
@@ -206,12 +192,14 @@ type Thinker struct {
 	memory     *MemoryStore
 	threads    *ThreadManager
 	config     *Config
+	registry   *ToolRegistry
 
 	// Hooks — set these to customize behavior. nil = defaults.
-	handleTools  ToolHandler
-	filterEvents EventFilter
-	onStop       func()
-	oneShot      bool
+	handleTools    ToolHandler
+	filterEvents   EventFilter
+	onStop         func()
+	oneShot        bool
+	toolAllowlist  map[string]bool // nil = all tools allowed (main thread)
 
 	// API event log — shared across all threads, owned by main thinker
 	apiLog    *[]APIEvent
@@ -225,7 +213,7 @@ func NewThinker(apiKey string) *Thinker {
 	t := &Thinker{
 		apiKey: apiKey,
 		messages: []Message{
-			{Role: "system", Content: buildSystemPrompt(cfg.GetDirective())},
+			{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), nil)},
 		},
 		config: cfg,
 		events:    make(chan ThinkEvent, 100),
@@ -242,6 +230,13 @@ func NewThinker(apiKey string) *Thinker {
 		threadID:  "main",
 	}
 	t.threads = NewThreadManager(t)
+	t.registry = NewToolRegistry(apiKey)
+
+	// Rebuild system prompt now that registry exists (with core tool docs)
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), t.registry)}
+
+	// Embed tool descriptions in background (non-blocking)
+	go t.registry.EmbedAll(t.memory)
 
 	// Main thread hooks
 	t.filterEvents = func(events []string) []string {
@@ -310,7 +305,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
 					t.config.SetDirective(d)
-					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d)}
+					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.registry)}
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 				}
 			case "pace":
@@ -406,6 +401,26 @@ func (t *Thinker) Run() {
 				if ctx := t.memory.BuildContext(recalled); ctx != "" {
 					t.messages = append(t.messages, Message{Role: "system", Content: ctx})
 				}
+			}
+		}
+
+		// Tool discovery via RAG — inject relevant tools based on context
+		if t.registry != nil {
+			var toolQuery string
+			if hadEvents {
+				toolQuery = strings.Join(consumed, " ")
+			} else {
+				for i := len(t.messages) - 1; i >= 0; i-- {
+					if t.messages[i].Role == "assistant" {
+						toolQuery = t.messages[i].Content
+						break
+					}
+				}
+			}
+			// Retrieve up to 5 relevant tools (generous — low threshold)
+			tools := t.registry.Retrieve(toolQuery, 5, t.allowedTools(), t.memory)
+			if docs := t.registry.BuildDocs(tools); docs != "" {
+				t.messages = append(t.messages, Message{Role: "system", Content: docs})
 			}
 		}
 
@@ -638,9 +653,16 @@ func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
 	return events, len(*t.apiLog)
 }
 
+// allowedTools returns the tool allowlist for this thinker. nil = all tools allowed.
+func (t *Thinker) allowedTools() map[string]bool {
+	// Main thread has no restrictions
+	// Sub-threads get their allowlist set during spawn
+	return t.toolAllowlist
+}
+
 func (t *Thinker) ReloadDirective() {
 	directive := t.config.GetDirective()
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry)}
 	t.InjectConsole("Directive updated to: " + directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
 }
 

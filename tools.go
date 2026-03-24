@@ -50,17 +50,26 @@ func executeTool(t *Thinker, call toolCall) {
 			}
 		}()
 		var result string
-		switch call.Name {
-		case "web":
-			result = webTool(call.Args)
-		case "write_file":
-			result = writeFileTool(call.Args)
-		case "read_file":
-			result = readFileTool(call.Args)
-		case "list_files":
-			result = listFilesTool(call.Args)
-		default:
-			result = fmt.Sprintf("unknown tool %q", call.Name)
+		if t.registry != nil {
+			if res, ok := t.registry.Dispatch(call.Name, call.Args); ok {
+				result = res
+			} else {
+				result = fmt.Sprintf("unknown tool %q", call.Name)
+			}
+		} else {
+			// Fallback for tests without registry
+			switch call.Name {
+			case "web":
+				result = webTool(call.Args)
+			case "write_file":
+				result = writeFileTool(call.Args)
+			case "read_file":
+				result = readFileTool(call.Args)
+			case "list_files":
+				result = listFilesTool(call.Args)
+			default:
+				result = fmt.Sprintf("unknown tool %q", call.Name)
+			}
 		}
 		t.Inject(fmt.Sprintf("[tool:%s] %s", call.Name, result))
 	}()
