@@ -158,6 +158,12 @@ func (r ThinkRate) Delay() time.Duration {
 	}
 }
 
+// ToolHandler processes parsed tool calls from a thought. Returns replies and tool names logged.
+type ToolHandler func(t *Thinker, calls []toolCall) (replies []string, toolNames []string)
+
+// EventFilter preprocesses drained inbox events. Can route/drop events.
+type EventFilter func(events []string) []string
+
 type Thinker struct {
 	apiKey    string
 	messages  []Message
@@ -174,6 +180,12 @@ type Thinker struct {
 	agentModel ModelTier
 	memory     *MemoryStore
 	threads    *ThreadManager
+
+	// Hooks — set these to customize behavior. nil = defaults.
+	handleTools  ToolHandler
+	filterEvents EventFilter
+	onStop       func()
+	oneShot      bool
 }
 
 func NewThinker(apiKey string) *Thinker {
@@ -192,91 +204,26 @@ func NewThinker(apiKey string) *Thinker {
 		memory:    NewMemoryStore(apiKey),
 	}
 	t.threads = NewThreadManager(t)
+
+	// Main thread hooks
+	t.filterEvents = func(events []string) []string {
+		var kept []string
+		for _, ev := range events {
+			if !t.threads.Route(ev) {
+				kept = append(kept, ev)
+			}
+		}
+		return kept
+	}
+	t.handleTools = mainToolHandler(t)
 	return t
 }
 
-func (t *Thinker) Run() {
-	for {
-		// Check pause/quit
-		select {
-		case <-t.quit:
-			return
-		case p := <-t.pause:
-			t.paused = p
-			if t.paused {
-				select {
-				case p = <-t.pause:
-					t.paused = p
-				case <-t.quit:
-					return
-				}
-			}
-		default:
-		}
-
-		t.iteration++
-
-		// Drain inbox, route events to threads first
-		raw := t.drainInbox()
-		var consumed []string
-		for _, ev := range raw {
-			if t.threads.Route(ev) {
-				continue // routed to a thread
-			}
-			consumed = append(consumed, ev)
-		}
-
-		now := time.Now().Format("2006-01-02 15:04:05")
-		hadEvents := len(consumed) > 0
-		if hadEvents {
-			t.rate = RateReactive
-			t.model = ModelLarge
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
-			for _, ev := range consumed {
-				sb.WriteString("• " + ev + "\n")
-			}
-			t.messages = append(t.messages, Message{Role: "user", Content: sb.String()})
-		} else {
-			t.messages = append(t.messages, Message{Role: "system", Content: fmt.Sprintf("[%s] No new events.", now)})
-		}
-
-		// Memory recall — build query from events or last thought
-		var memQuery string
-		if hadEvents {
-			memQuery = strings.Join(consumed, " ")
-		} else if len(t.messages) >= 2 {
-			// Use the last assistant message as query
-			for i := len(t.messages) - 1; i >= 0; i-- {
-				if t.messages[i].Role == "assistant" {
-					memQuery = t.messages[i].Content
-					break
-				}
-			}
-		}
-		if memQuery != "" && t.memory.Count() > 0 {
-			recalled := t.memory.Retrieve(memQuery, recallTopN)
-			if ctx := t.memory.BuildContext(recalled); ctx != "" {
-				t.messages = append(t.messages, Message{Role: "system", Content: ctx})
-			}
-		}
-
-		start := time.Now()
-		reply, usage, err := t.think()
-		duration := time.Since(start)
-
-		if err != nil {
-			t.events <- ThinkEvent{Error: err, Iteration: t.iteration}
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		t.messages = append(t.messages, Message{Role: "assistant", Content: reply})
-
-		// Parse and dispatch tool calls from the reply
-		calls := parseToolCalls(reply)
-		var toolNames []string
+// mainToolHandler returns the tool handler for the main coordinating thread.
+func mainToolHandler(t *Thinker) ToolHandler {
+	return func(_ *Thinker, calls []toolCall) ([]string, []string) {
 		var replies []string
+		var toolNames []string
 		for _, call := range calls {
 			switch call.Name {
 			case "spawn":
@@ -315,25 +262,119 @@ func (t *Thinker) Run() {
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
 				}
-			default:
-				toolNames = append(toolNames, call.Raw)
+			}
+		}
+		return replies, toolNames
+	}
+}
+
+func (t *Thinker) Run() {
+	defer func() {
+		if t.onStop != nil {
+			t.onStop()
+		}
+	}()
+
+	for {
+		// Check pause/quit
+		select {
+		case <-t.quit:
+			return
+		case p := <-t.pause:
+			t.paused = p
+			if t.paused {
+				select {
+				case p = <-t.pause:
+					t.paused = p
+				case <-t.quit:
+					return
+				}
+			}
+		default:
+		}
+
+		t.iteration++
+
+		// Drain inbox, optionally filter/route events
+		consumed := t.drainInbox()
+		if t.filterEvents != nil {
+			consumed = t.filterEvents(consumed)
+		}
+
+		now := time.Now().Format("2006-01-02 15:04:05")
+		hadEvents := len(consumed) > 0
+		if hadEvents {
+			t.rate = RateReactive
+			t.model = ModelLarge
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
+			for _, ev := range consumed {
+				sb.WriteString("• " + ev + "\n")
+			}
+			t.messages = append(t.messages, Message{Role: "user", Content: sb.String()})
+		} else {
+			t.messages = append(t.messages, Message{Role: "system", Content: fmt.Sprintf("[%s] No new events.", now)})
+		}
+
+		// Memory recall
+		if t.memory != nil && t.memory.Count() > 0 {
+			var memQuery string
+			if hadEvents {
+				memQuery = strings.Join(consumed, " ")
+			} else {
+				for i := len(t.messages) - 1; i >= 0; i-- {
+					if t.messages[i].Role == "assistant" {
+						memQuery = t.messages[i].Content
+						break
+					}
+				}
+			}
+			if memQuery != "" {
+				recalled := t.memory.Retrieve(memQuery, recallTopN)
+				if ctx := t.memory.BuildContext(recalled); ctx != "" {
+					t.messages = append(t.messages, Message{Role: "system", Content: ctx})
+				}
 			}
 		}
 
-		// Sliding window: keep system prompt + last N messages
+		start := time.Now()
+		reply, usage, err := t.think()
+		duration := time.Since(start)
+
+		if err != nil {
+			t.events <- ThinkEvent{Error: err, Iteration: t.iteration}
+			select {
+			case <-time.After(5 * time.Second):
+			case <-t.quit:
+				return
+			}
+			continue
+		}
+
+		t.messages = append(t.messages, Message{Role: "assistant", Content: reply})
+
+		// Dispatch tool calls via handler
+		calls := parseToolCalls(reply)
+		var replies []string
+		var toolNames []string
+		if t.handleTools != nil {
+			replies, toolNames = t.handleTools(t, calls)
+		}
+
+		// Sliding window
 		if len(t.messages) > maxHistory+1 {
 			t.messages = append(t.messages[:1], t.messages[len(t.messages)-maxHistory:]...)
 		}
 
-		// Store memory — only for iterations with substance
-		if hadEvents || len(replies) > 0 || len(toolNames) > 0 {
+		// Store memory for meaningful iterations
+		if t.memory != nil && (hadEvents || len(replies) > 0 || len(toolNames) > 0) {
 			summary := t.buildMemorySummary(consumed, reply, replies, toolNames)
 			if summary != "" {
 				go t.memory.Store(summary)
 			}
 		}
 
-		// After reactive burst, fall back to agent's chosen rate/model
+		// Fall back to agent's chosen rate/model
 		if hadEvents {
 			t.rate = RateReactive
 			t.model = ModelLarge
@@ -342,9 +383,20 @@ func (t *Thinker) Run() {
 			t.model = t.agentModel
 		}
 
-		t.events <- ThinkEvent{Done: true, Iteration: t.iteration, Duration: duration, ConsumedEvents: consumed, Usage: usage, ToolCalls: toolNames, Replies: replies, Rate: t.rate, Model: t.model, MemoryCount: t.memory.Count(), ThreadCount: t.threads.Count()}
+		// Thread count (0 if no thread manager)
+		threadCount := 0
+		if t.threads != nil {
+			threadCount = t.threads.Count()
+		}
 
-		// Interruptible sleep — wakeup signal skips the delay
+		t.events <- ThinkEvent{Done: true, Iteration: t.iteration, Duration: duration, ConsumedEvents: consumed, Usage: usage, ToolCalls: toolNames, Replies: replies, Rate: t.rate, Model: t.model, MemoryCount: t.memory.Count(), ThreadCount: threadCount}
+
+		// One-shot: run once and stop
+		if t.oneShot {
+			return
+		}
+
+		// Interruptible sleep
 		select {
 		case <-time.After(t.rate.Delay()):
 		case <-t.wakeup:
