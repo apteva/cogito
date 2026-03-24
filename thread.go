@@ -13,8 +13,13 @@ BEHAVIOR:
 - Think out loud — explain what you're doing and why. Never output empty thoughts.
 - Process events when they arrive. Use your tools to accomplish tasks.
 - Use [[send id="main" message="..."]] to report results to the coordinator.
-- When idle, pace down gradually with [[pace]]. New events auto-wake you.
-- Keep each thought concise — 1-2 short paragraphs max.`
+- Keep each thought concise — 1-2 short paragraphs max.
+
+PACING — this is critical:
+- Tool results (like [[list_files]] or [[web]]) will wake you up for the next thought. Do NOT set [[pace]] in the same thought as a tool call — you'll be woken immediately.
+- Instead: call tools first, THEN in the next thought (after seeing results), set your pace.
+- Example flow: Thought 1: call [[list_files]]. Thought 2: process results, [[send]] report, [[pace rate="sleep"]].
+- Only use [[pace]] when you have NO pending tool calls and are ready to wait.`
 
 type ThreadInfo struct {
 	ID        string
