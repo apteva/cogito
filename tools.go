@@ -18,9 +18,9 @@ type toolCall struct {
 	Raw  string // original matched text
 }
 
-// [[tool_name key="val" key2="val2"]] — values can span multiple lines
-var toolCallRe = regexp.MustCompile(`(?s)\[\[(\w+)((?:\s+\w+="[^"]*")*)\]\]`)
-var argRe = regexp.MustCompile(`(?s)(\w+)="([^"]*)"`)
+// [[tool_name key="val" key2="val2"]] — values can span multiple lines, escaped quotes allowed
+var toolCallRe = regexp.MustCompile(`(?s)\[\[(\w+)((?:\s+\w+="(?:[^"\\]|\\.)*")*)\]\]`)
+var argRe = regexp.MustCompile(`(?s)(\w+)="((?:[^"\\]|\\.)*)"`)
 
 // stripToolCalls removes [[...]] tool call syntax from text for display
 func stripToolCalls(text string) string {
@@ -35,7 +35,9 @@ func parseToolCalls(text string) []toolCall {
 		name := m[1]
 		args := make(map[string]string)
 		for _, a := range argRe.FindAllStringSubmatch(m[2], -1) {
-			args[a[1]] = a[2]
+			// Unescape \" in values
+			val := strings.ReplaceAll(a[2], `\"`, `"`)
+			args[a[1]] = val
 		}
 		calls = append(calls, toolCall{Name: name, Args: args, Raw: m[0]})
 	}

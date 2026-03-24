@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -64,6 +65,23 @@ func TestParseToolCalls_Pace(t *testing.T) {
 	}
 	if calls[0].Args["rate"] != "slow" {
 		t.Errorf("expected 'slow', got %q", calls[0].Args["rate"])
+	}
+}
+
+func TestParseToolCalls_EscapedQuotes(t *testing.T) {
+	text := `[[spawn id="timer" directive="Send a notification saying \"hello world\" to the user" tools="pushover_send_notification"]]`
+	calls := parseToolCalls(text)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(calls))
+	}
+	if calls[0].Name != "spawn" {
+		t.Errorf("expected 'spawn', got %q", calls[0].Name)
+	}
+	if !strings.Contains(calls[0].Args["directive"], `"hello world"`) {
+		t.Errorf("expected unescaped quotes in directive, got %q", calls[0].Args["directive"])
+	}
+	if calls[0].Args["tools"] != "pushover_send_notification" {
+		t.Errorf("expected tools, got %q", calls[0].Args["tools"])
 	}
 }
 
