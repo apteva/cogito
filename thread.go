@@ -212,7 +212,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			}
 		}
 
-		// Process done — report to parent but DON'T kill yet, let the thread pace down to sleep
+		// Process done LAST — after all other tools have been dispatched
 		if doneMsg != nil {
 			if *doneMsg != "" {
 				thread.Parent.Inject(fmt.Sprintf("[thread:%s done] %s", thread.ID, *doneMsg))
@@ -220,8 +220,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				thread.Parent.Inject(fmt.Sprintf("[thread:%s done]", thread.ID))
 			}
 			tm.events <- ThreadEvent{ThreadID: thread.ID, Type: "done", Message: *doneMsg}
-			// Thread stays alive but goes to sleep — main can kill it if needed
-			t.agentRate = RateSleep
+			t.Stop()
 		}
 
 		return replies, toolNames
