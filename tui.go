@@ -96,11 +96,25 @@ var (
 				Foreground(lipgloss.Color("235")).
 				Background(lipgloss.Color("77")).
 				Bold(true)
+
+	tabActiveStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("235")).
+			Background(lipgloss.Color("39")).
+			Padding(0, 1)
+
+	tabInactiveStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("241")).
+				Padding(0, 1)
 )
 
 type tickMsg time.Time
 type thinkEventMsg ThinkEvent
 type threadEventMsg ThreadEvent
+type threadThinkEventMsg struct {
+	ThreadID string
+	Event    ThinkEvent
+}
 
 const (
 	priceInputPerToken  = 0.60 / 1_000_000
@@ -122,23 +136,26 @@ const (
 	panelThreads
 )
 
-type model struct {
-	thinker      *Thinker
+type threadView struct {
 	thoughts     []thought
 	currentChunk *strings.Builder
+	iteration    int
+	rate         ThinkRate
+	model        ModelTier
+}
+
+type model struct {
+	thinker      *Thinker
 	width        int
 	height       int
 	scrollOffset int
 	paused       bool
-	iteration    int
 	startTime    time.Time
 	lastDuration time.Duration
 	input        textinput.Model
 	inputActive  bool
 
 	chat         []chatMessage
-	rate         ThinkRate
-	aiModel      ModelTier
 	memoryCount  int
 	threadCount  int
 
@@ -146,7 +163,11 @@ type model struct {
 	memoryCursor int
 	threadCursor int
 
-	// Which user ID to send messages as (for now just "user")
+	// Tab system: "main" + thread IDs
+	activeTab    string              // which tab is shown in thoughts panel
+	tabs         []string            // ordered tab list: ["main", "thread1", ...]
+	threadViews  map[string]*threadView
+
 	userID string
 
 	totalPromptTokens     int
@@ -166,14 +187,50 @@ func newModel(thinker *Thinker) model {
 	ti.Placeholder = "message..."
 	ti.CharLimit = 500
 	return model{
-		thinker:      thinker,
-		thoughts:     []thought{},
-		currentChunk: &strings.Builder{},
-		startTime:    time.Now(),
-		input:        ti,
-		rate:         RateSlow,
-		memoryCount:  thinker.memory.Count(),
-		userID:       "user",
+		thinker:     thinker,
+		startTime:   time.Now(),
+		input:       ti,
+		memoryCount: thinker.memory.Count(),
+		userID:      "user",
+		activeTab:   "main",
+		tabs:        []string{"main"},
+		threadViews: map[string]*threadView{
+			"main": {currentChunk: &strings.Builder{}},
+		},
+	}
+}
+
+func (m *model) getOrCreateView(id string) *threadView {
+	if v, ok := m.threadViews[id]; ok {
+		return v
+	}
+	v := &threadView{currentChunk: &strings.Builder{}}
+	m.threadViews[id] = v
+	// Add tab if not present
+	found := false
+	for _, t := range m.tabs {
+		if t == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.tabs = append(m.tabs, id)
+	}
+	return v
+}
+
+func (m *model) removeTab(id string) {
+	delete(m.threadViews, id)
+	for i, t := range m.tabs {
+		if t == id {
+			m.tabs = append(m.tabs[:i], m.tabs[i+1:]...)
+			break
+		}
+	}
+	if m.activeTab == id {
+		m.activeTab = "main"
+		m.scrollOffset = 0
 	}
 }
 
@@ -181,6 +238,7 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		pollEvents(m.thinker),
 		pollThreadEvents(m.thinker.threads),
+		pollThreadThinkEvents(m.thinker.threads),
 		tickCmd(),
 	)
 }
@@ -194,6 +252,33 @@ func pollEvents(t *Thinker) tea.Cmd {
 func pollThreadEvents(tm *ThreadManager) tea.Cmd {
 	return func() tea.Msg {
 		return threadEventMsg(<-tm.events)
+	}
+}
+
+// pollThreadThinkEvents watches all thread thinkers for thought events.
+func pollThreadThinkEvents(tm *ThreadManager) tea.Cmd {
+	return func() tea.Msg {
+		// Poll all current threads, return first event from any
+		for {
+			tm.mu.RLock()
+			threads := make(map[string]*Thread, len(tm.threads))
+			for k, v := range tm.threads {
+				threads[k] = v
+			}
+			tm.mu.RUnlock()
+
+			for id, thread := range threads {
+				select {
+				case ev := <-thread.Thinker.events:
+					return threadThinkEventMsg{ThreadID: id, Event: ev}
+				default:
+				}
+			}
+			// Small sleep to avoid busy-looping
+			select {
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
 	}
 }
 
@@ -275,6 +360,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+		case "]", "tab":
+			// Next tab
+			for i, tab := range m.tabs {
+				if tab == m.activeTab {
+					m.activeTab = m.tabs[(i+1)%len(m.tabs)]
+					m.scrollOffset = 0
+					break
+				}
+			}
+			return m, nil
+		case "[":
+			// Prev tab
+			for i, tab := range m.tabs {
+				if tab == m.activeTab {
+					idx := (i - 1 + len(m.tabs)) % len(m.tabs)
+					m.activeTab = m.tabs[idx]
+					m.scrollOffset = 0
+					break
+				}
+			}
+			return m, nil
 		case " ":
 			m.paused = !m.paused
 			m.thinker.TogglePause()
@@ -327,61 +433,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case thinkEventMsg:
 		ev := ThinkEvent(msg)
-		if ev.Error != nil {
-			m.thoughts = append(m.thoughts, thought{
-				iteration: ev.Iteration,
-				content:   fmt.Sprintf("ERROR: %v", ev.Error),
-			})
-			m.scrollOffset = m.maxScroll()
-			return m, pollEvents(m.thinker)
-		}
-
-		if ev.Chunk != "" {
-			m.currentChunk.WriteString(ev.Chunk)
-			m.iteration = ev.Iteration
-			m.scrollOffset = m.maxScroll()
-		}
-
+		v := m.getOrCreateView("main")
+		m.applyThinkEvent(v, "main", ev)
 		if ev.Done {
-			m.thoughts = append(m.thoughts, thought{
-				iteration: ev.Iteration,
-				content:   m.currentChunk.String(),
-				duration:  ev.Duration,
-			})
-			m.currentChunk.Reset()
-			m.lastDuration = ev.Duration
-			m.rate = ev.Rate
-			m.aiModel = ev.Model
 			m.memoryCount = ev.MemoryCount
 			m.threadCount = ev.ThreadCount
-
-			u := ev.Usage
-			m.totalPromptTokens += u.PromptTokens
-			m.totalCachedTokens += u.CachedTokens
-			m.totalCompletionTokens += u.CompletionTokens
-			uncachedInput := u.PromptTokens - u.CachedTokens
-			if uncachedInput < 0 {
-				uncachedInput = 0
-			}
-			m.totalCost += float64(uncachedInput)*priceInputPerToken +
-				float64(u.CachedTokens)*priceCachedPerToken +
-				float64(u.CompletionTokens)*priceOutputPerToken
-
-			m.scrollOffset = m.maxScroll()
 		}
-
 		return m, pollEvents(m.thinker)
+
+	case threadThinkEventMsg:
+		v := m.getOrCreateView(msg.ThreadID)
+		m.applyThinkEvent(v, msg.ThreadID, msg.Event)
+		return m, pollThreadThinkEvents(m.thinker.threads)
 
 	case threadEventMsg:
 		ev := ThreadEvent(msg)
 		switch ev.Type {
 		case "reply":
 			m.chat = append(m.chat, chatMessage{isUser: false, text: ev.Message, threadID: ev.ThreadID})
-		case "report":
-			// Reports show in thoughts area as system info
 		case "started":
+			m.getOrCreateView(ev.ThreadID)
 			m.threadCount = m.thinker.threads.Count()
 		case "done":
+			m.removeTab(ev.ThreadID)
 			m.threadCount = m.thinker.threads.Count()
 		}
 		return m, pollThreadEvents(m.thinker.threads)
@@ -393,11 +467,60 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) applyThinkEvent(v *threadView, tabID string, ev ThinkEvent) {
+	if ev.Error != nil {
+		v.thoughts = append(v.thoughts, thought{
+			iteration: ev.Iteration,
+			content:   fmt.Sprintf("ERROR: %v", ev.Error),
+		})
+		if m.activeTab == tabID {
+			m.scrollOffset = m.maxScroll()
+		}
+		return
+	}
+
+	if ev.Chunk != "" {
+		v.currentChunk.WriteString(ev.Chunk)
+		v.iteration = ev.Iteration
+		if m.activeTab == tabID {
+			m.scrollOffset = m.maxScroll()
+		}
+	}
+
+	if ev.Done {
+		v.thoughts = append(v.thoughts, thought{
+			iteration: ev.Iteration,
+			content:   v.currentChunk.String(),
+			duration:  ev.Duration,
+		})
+		v.currentChunk.Reset()
+		v.rate = ev.Rate
+		v.model = ev.Model
+		m.lastDuration = ev.Duration
+
+		u := ev.Usage
+		m.totalPromptTokens += u.PromptTokens
+		m.totalCachedTokens += u.CachedTokens
+		m.totalCompletionTokens += u.CompletionTokens
+		uncachedInput := u.PromptTokens - u.CachedTokens
+		if uncachedInput < 0 {
+			uncachedInput = 0
+		}
+		m.totalCost += float64(uncachedInput)*priceInputPerToken +
+			float64(u.CachedTokens)*priceCachedPerToken +
+			float64(u.CompletionTokens)*priceOutputPerToken
+
+		if m.activeTab == tabID {
+			m.scrollOffset = m.maxScroll()
+		}
+	}
+}
+
 func (m model) maxScroll() int {
 	thoughtsWidth := m.thoughtsPanelWidth()
 	content := m.renderThoughts(thoughtsWidth)
 	lines := strings.Count(content, "\n")
-	viewHeight := m.height - 5
+	viewHeight := m.height - 6 // header(2) + tabs(1) + footer(1) + padding
 	if lines > viewHeight {
 		return lines - viewHeight
 	}
@@ -427,13 +550,18 @@ func (m model) thoughtsPanelWidth() int {
 }
 
 func (m model) renderThoughts(maxWidth int) string {
+	v, ok := m.threadViews[m.activeTab]
+	if !ok {
+		return ""
+	}
+
 	var sb strings.Builder
 	contentWidth := maxWidth - 4
 	if contentWidth < 10 {
 		contentWidth = 10
 	}
 
-	for _, t := range m.thoughts {
+	for _, t := range v.thoughts {
 		header := thoughtHeaderStyle.Render(fmt.Sprintf("━━━ Thought #%d", t.iteration))
 		if t.duration > 0 {
 			header += statsStyle.Render(fmt.Sprintf(" (%s)", t.duration.Round(time.Millisecond)))
@@ -442,10 +570,10 @@ func (m model) renderThoughts(maxWidth int) string {
 		sb.WriteString(thoughtStyle.Render(wrapText(t.content, contentWidth)) + "\n\n")
 	}
 
-	if m.currentChunk.Len() > 0 {
-		header := thoughtHeaderStyle.Render(fmt.Sprintf("━━━ Thought #%d", m.iteration))
+	if v.currentChunk.Len() > 0 {
+		header := thoughtHeaderStyle.Render(fmt.Sprintf("━━━ Thought #%d", v.iteration))
 		sb.WriteString(header + " ▍\n")
-		sb.WriteString(thoughtStyle.Render(wrapText(m.currentChunk.String(), contentWidth)))
+		sb.WriteString(thoughtStyle.Render(wrapText(v.currentChunk.String(), contentWidth)))
 	}
 
 	return sb.String()
@@ -643,6 +771,22 @@ func (m model) renderThreadPanel(width, height int) string {
 	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
 }
 
+func (m model) renderTabBar() string {
+	var parts []string
+	for _, tab := range m.tabs {
+		label := tab
+		if v, ok := m.threadViews[tab]; ok && tab != "main" {
+			label = fmt.Sprintf("%s #%d", tab, v.iteration)
+		}
+		if tab == m.activeTab {
+			parts = append(parts, tabActiveStyle.Render(label))
+		} else {
+			parts = append(parts, tabInactiveStyle.Render(label))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
 func (m model) View() string {
 	if m.width == 0 {
 		return "Loading..."
@@ -651,16 +795,19 @@ func (m model) View() string {
 	elapsed := time.Since(m.startTime).Round(time.Second)
 	title := titleStyle.Render("Continuous Thinking Engine")
 
+	// Show active tab's status
 	var statusRender string
 	if m.paused {
 		statusRender = pausedStyle.Render("PAUSED")
+	} else if v, ok := m.threadViews[m.activeTab]; ok {
+		statusRender = statusBarStyle.Render(fmt.Sprintf("THINKING (%s/%s)", v.rate, v.model))
 	} else {
-		statusRender = statusBarStyle.Render(fmt.Sprintf("THINKING (%s/%s)", m.rate, m.aiModel))
+		statusRender = statusBarStyle.Render("THINKING")
 	}
 
 	stats := statsStyle.Render(fmt.Sprintf(
-		"#%d │ %s │ %s/thought │ next: %s │ thr: %d",
-		m.iteration, elapsed, m.lastDuration.Round(time.Millisecond), m.rate.Delay(), m.threadCount,
+		"%s │ thr: %d │ mem: %d",
+		elapsed, m.threadCount, m.memoryCount,
 	))
 
 	header := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", statusRender, "  ", stats)
@@ -675,16 +822,20 @@ func (m model) View() string {
 	}
 
 	costLine := statsStyle.Render(fmt.Sprintf(
-		"tok: %d (in:%d cached:%d out:%d) │ $%.4f │ $%.2f/hr │ $%.2f/day │ mem: %d",
+		"tok: %d (in:%d cached:%d out:%d) │ $%.4f │ $%.2f/hr │ $%.2f/day",
 		totalTok, m.totalPromptTokens, m.totalCachedTokens, m.totalCompletionTokens,
-		m.totalCost, costPerHour, costPerDay, m.memoryCount,
+		m.totalCost, costPerHour, costPerDay,
 	))
 
 	header = header + "\n" + costLine
 
+	// Tab bar
+	tabBar := m.renderTabBar() + statsStyle.Render("  [/]: switch tabs")
+
 	footer := helpStyle.Render("space: pause │ j/k: scroll │ g/G: top/bottom │ q: quit")
 
-	viewHeight := m.height - 5
+	// 3 header lines + tab bar + footer = 5 non-content lines
+	viewHeight := m.height - 6
 	if viewHeight < 1 {
 		viewHeight = 1
 	}
@@ -723,7 +874,7 @@ func (m model) View() string {
 		visible = lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", visible)
 	}
 
-	return header + "\n" + visible + "\n" + footer
+	return header + "\n" + tabBar + "\n" + visible + "\n" + footer
 }
 
 func wrapText(s string, width int) string {

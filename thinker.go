@@ -297,15 +297,19 @@ func (t *Thinker) Run() {
 
 		// Drain inbox, optionally filter/route events
 		consumed := t.drainInbox()
+		hadRawEvents := len(consumed) > 0
 		if t.filterEvents != nil {
 			consumed = t.filterEvents(consumed)
 		}
 
 		now := time.Now().Format("2006-01-02 15:04:05")
 		hadEvents := len(consumed) > 0
-		if hadEvents {
+		// Go reactive if ANY events arrived, even if routed to threads
+		if hadRawEvents {
 			t.rate = RateReactive
 			t.model = ModelLarge
+		}
+		if hadEvents {
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
 			for _, ev := range consumed {

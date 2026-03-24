@@ -87,7 +87,7 @@ func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool)
 		wakeup:    make(chan struct{}, 1),
 		pause:     make(chan bool),
 		quit:      make(chan struct{}),
-		rate:      RateNormal,
+		rate:      RateReactive,
 		agentRate: RateNormal,
 		memory:    tm.parent.memory,
 		oneShot:   !thinking,
