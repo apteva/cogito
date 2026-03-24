@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -165,6 +166,15 @@ func (r ThinkRate) Delay() time.Duration {
 	}
 }
 
+type APIEvent struct {
+	Time      time.Time `json:"time"`
+	Type      string    `json:"type"`                 // "thought", "chunk", "reply", "thread_started", "thread_done", "error"
+	ThreadID  string    `json:"thread_id"`
+	Message   string    `json:"message,omitempty"`
+	Iteration int       `json:"iteration,omitempty"`
+	Duration  string    `json:"duration,omitempty"`
+}
+
 // ToolHandler processes parsed tool calls from a thought. Returns replies and tool names logged.
 // consumed contains the events that were consumed this iteration (for context).
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string)
@@ -195,6 +205,12 @@ type Thinker struct {
 	filterEvents EventFilter
 	onStop       func()
 	oneShot      bool
+
+	// API event log — shared across all threads, owned by main thinker
+	apiLog    *[]APIEvent
+	apiMu     *sync.RWMutex
+	apiNotify chan struct{}
+	threadID  string // "main" for main thinker, thread ID for sub-threads
 }
 
 func NewThinker(apiKey string) *Thinker {
@@ -213,6 +229,10 @@ func NewThinker(apiKey string) *Thinker {
 		rate:      RateSlow,
 		agentRate: RateSlow,
 		memory:    NewMemoryStore(apiKey),
+		apiLog:    &[]APIEvent{},
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+		threadID:  "main",
 	}
 	t.threads = NewThreadManager(t)
 
@@ -418,6 +438,17 @@ func (t *Thinker) Run() {
 
 		t.events <- ThinkEvent{Done: true, Iteration: t.iteration, Duration: duration, ConsumedEvents: consumed, Usage: usage, ToolCalls: toolNames, Replies: replies, Rate: t.rate, Model: t.model, MemoryCount: t.memory.Count(), ThreadCount: threadCount}
 
+		// Log to API
+		clean := stripToolCalls(reply)
+		clean = strings.TrimSpace(clean)
+		if len(clean) > 500 {
+			clean = clean[:500] + "..."
+		}
+		t.logAPI(APIEvent{Type: "thought", Iteration: t.iteration, Message: clean, Duration: duration.Round(time.Millisecond).String()})
+		for _, r := range replies {
+			t.logAPI(APIEvent{Type: "reply", Message: r})
+		}
+
 		// One-shot: run once and stop
 		if t.oneShot {
 			return
@@ -554,6 +585,37 @@ func (t *Thinker) buildMemorySummary(consumed []string, thought string, replies 
 		return ""
 	}
 	return strings.Join(parts, " | ")
+}
+
+func (t *Thinker) logAPI(ev APIEvent) {
+	if t.apiNotify == nil || t.apiLog == nil {
+		return
+	}
+	ev.Time = time.Now()
+	if ev.ThreadID == "" {
+		ev.ThreadID = t.threadID
+	}
+	t.apiMu.Lock()
+	*t.apiLog = append(*t.apiLog, ev)
+	if len(*t.apiLog) > 1000 {
+		*t.apiLog = (*t.apiLog)[len(*t.apiLog)-500:]
+	}
+	t.apiMu.Unlock()
+	select {
+	case t.apiNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
+	t.apiMu.RLock()
+	defer t.apiMu.RUnlock()
+	if since >= len(*t.apiLog) {
+		return nil, len(*t.apiLog)
+	}
+	events := make([]APIEvent, len(*t.apiLog)-since)
+	copy(events, (*t.apiLog)[since:])
+	return events, len(*t.apiLog)
 }
 
 func (t *Thinker) ReloadDirective() {

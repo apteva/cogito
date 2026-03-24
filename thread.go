@@ -93,6 +93,10 @@ func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool,
 		oneShot:   !thinking,
 		onStop:    func() { tm.cleanupThread(id) },
 		handleTools: threadToolHandler(thread, tm),
+		threadID:  id,
+		apiLog:    tm.parent.apiLog,
+		apiMu:     tm.parent.apiMu,
+		apiNotify: tm.parent.apiNotify,
 	}
 	thread.Thinker = thinker
 
@@ -108,6 +112,7 @@ func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool,
 
 	tm.events <- ThreadEvent{ThreadID: id, Type: "started", Message: fmt.Sprintf("Thread %q spawned", id)}
 	tm.parent.Inject(fmt.Sprintf("[thread:%s] started", id))
+	tm.parent.logAPI(APIEvent{Type: "thread_started", ThreadID: id})
 
 	return nil
 }
@@ -237,6 +242,7 @@ func (tm *ThreadManager) cleanupThread(id string) {
 	delete(tm.threads, id)
 	tm.mu.Unlock()
 	tm.events <- ThreadEvent{ThreadID: id, Type: "done"}
+	tm.parent.logAPI(APIEvent{Type: "thread_done", ThreadID: id})
 }
 
 func toolSetToSlice(m map[string]bool) []string {

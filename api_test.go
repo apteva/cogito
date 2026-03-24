@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -22,6 +23,10 @@ func newTestAPI() (*APIServer, *Thinker) {
 		agentRate: RateSlow,
 		memory:    &MemoryStore{path: "/dev/null"},
 		config:    &Config{Directive: "test directive"},
+		apiLog:    &[]APIEvent{},
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+		threadID:  "main",
 	}
 	t.threads = NewThreadManager(t)
 	api := &APIServer{thinker: t, startTime: time.Now()}
@@ -70,7 +75,7 @@ func TestAPI_Status(t *testing.T) {
 	}
 }
 
-func TestAPI_Threads_Empty(t *testing.T) {
+func TestAPI_Threads_MainOnly(t *testing.T) {
 	api, _ := newTestAPI()
 	req := httptest.NewRequest("GET", "/threads", nil)
 	w := httptest.NewRecorder()
@@ -79,14 +84,17 @@ func TestAPI_Threads_Empty(t *testing.T) {
 	if w.Code != 200 {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
-	var body []any
+	var body []map[string]any
 	json.Unmarshal(w.Body.Bytes(), &body)
-	if len(body) != 0 {
-		t.Errorf("expected empty array, got %d items", len(body))
+	if len(body) != 1 {
+		t.Fatalf("expected 1 thread (main), got %d", len(body))
+	}
+	if body[0]["id"] != "main" {
+		t.Errorf("expected id 'main', got %v", body[0]["id"])
 	}
 }
 
-func TestAPI_Threads_WithThreads(t *testing.T) {
+func TestAPI_Threads_WithSubThreads(t *testing.T) {
 	api, thinker := newTestAPI()
 	thinker.threads.Spawn("test-thread", "test prompt", []string{"web"}, true)
 	defer thinker.threads.Kill("test-thread")
@@ -97,11 +105,14 @@ func TestAPI_Threads_WithThreads(t *testing.T) {
 
 	var body []map[string]any
 	json.Unmarshal(w.Body.Bytes(), &body)
-	if len(body) != 1 {
-		t.Fatalf("expected 1 thread, got %d", len(body))
+	if len(body) != 2 {
+		t.Fatalf("expected 2 threads (main + test-thread), got %d", len(body))
 	}
-	if body[0]["id"] != "test-thread" {
-		t.Errorf("expected id test-thread, got %v", body[0]["id"])
+	if body[0]["id"] != "main" {
+		t.Errorf("expected first thread 'main', got %v", body[0]["id"])
+	}
+	if body[1]["id"] != "test-thread" {
+		t.Errorf("expected second thread 'test-thread', got %v", body[1]["id"])
 	}
 }
 

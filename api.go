@@ -36,24 +36,33 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 		"iteration":      a.thinker.iteration,
 		"rate":           a.thinker.rate.String(),
 		"model":          a.thinker.model.String(),
-		"threads":        a.thinker.threads.Count(),
+		"threads":        a.thinker.threads.Count() + 1, // +1 for main
 		"memories":       a.thinker.memory.Count(),
 	})
 }
 
+type threadJSON struct {
+	ID        string   `json:"id"`
+	Tools     []string `json:"tools,omitempty"`
+	Thinking  bool     `json:"thinking"`
+	Iteration int      `json:"iteration"`
+	Rate      string   `json:"rate"`
+	Model     string   `json:"model"`
+	Age       string   `json:"age"`
+}
+
 func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
-	threads := a.thinker.threads.List()
-	type threadJSON struct {
-		ID        string   `json:"id"`
-		Tools     []string `json:"tools"`
-		Thinking  bool     `json:"thinking"`
-		Iteration int      `json:"iteration"`
-		Rate      string   `json:"rate"`
-		Model     string   `json:"model"`
-		Age       string   `json:"age"`
-	}
-	var out []threadJSON
-	for _, t := range threads {
+	// Always include main
+	out := []threadJSON{{
+		ID:        "main",
+		Thinking:  true,
+		Iteration: a.thinker.iteration,
+		Rate:      a.thinker.rate.String(),
+		Model:     a.thinker.model.String(),
+		Age:       formatAge(time.Since(a.startTime)),
+	}}
+
+	for _, t := range a.thinker.threads.List() {
 		out = append(out, threadJSON{
 			ID:        t.ID,
 			Tools:     t.Tools,
@@ -63,9 +72,6 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 			Model:     t.Model.String(),
 			Age:       formatAge(time.Since(t.Started)),
 		})
-	}
-	if out == nil {
-		out = []threadJSON{}
 	}
 	writeJSON(w, out)
 }
@@ -79,30 +85,29 @@ func (a *APIServer) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	// Send existing events first
+	events, cursor := a.thinker.APIEvents(0)
+	for _, ev := range events {
+		data, _ := json.Marshal(ev)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+	}
 	flusher.Flush()
 
-	// Tap into thread manager events
+	// Then stream new ones
 	ctx := r.Context()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case ev := <-a.thinker.threads.events:
-			data, _ := json.Marshal(map[string]string{
-				"type":    ev.Type,
-				"thread":  ev.ThreadID,
-				"message": ev.Message,
-			})
-			fmt.Fprintf(w, "data: %s\n\n", data)
-			flusher.Flush()
-			// Re-broadcast so TUI still gets it
-			go func() { a.thinker.threads.events <- ev }()
-		default:
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(100 * time.Millisecond):
+		case <-a.thinker.apiNotify:
+			newEvents, newCursor := a.thinker.APIEvents(cursor)
+			cursor = newCursor
+			for _, ev := range newEvents {
+				data, _ := json.Marshal(ev)
+				fmt.Fprintf(w, "data: %s\n\n", data)
 			}
+			flusher.Flush()
 		}
 	}
 }
