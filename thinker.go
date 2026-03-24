@@ -340,17 +340,29 @@ func (t *Thinker) Run() {
 
 		// Drain inbox, optionally filter/route events
 		consumed := t.drainInbox()
-		hadRawEvents := len(consumed) > 0
 		if t.filterEvents != nil {
 			consumed = t.filterEvents(consumed)
 		}
 
+		// Only go reactive for non-tool events (user messages, console, thread sends)
+		hasExternalEvent := false
+		for _, ev := range consumed {
+			if !strings.HasPrefix(ev, "[tool:") {
+				hasExternalEvent = true
+				break
+			}
+		}
+
 		now := time.Now().Format("2006-01-02 15:04:05")
 		hadEvents := len(consumed) > 0
-		// Go reactive if ANY events arrived, even if routed to threads
-		if hadRawEvents {
+		if hasExternalEvent {
 			t.rate = RateReactive
 			t.model = ModelLarge
+		} else if hadEvents {
+			// Tool results — process quickly but don't go full reactive
+			if t.rate > RateFast {
+				t.rate = RateFast
+			}
 		}
 		if hadEvents {
 			var sb strings.Builder
@@ -422,7 +434,7 @@ func (t *Thinker) Run() {
 		}
 
 		// Fall back to agent's chosen rate/model
-		if hadEvents {
+		if hasExternalEvent {
 			t.rate = RateReactive
 			t.model = ModelLarge
 		} else {
