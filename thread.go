@@ -19,7 +19,12 @@ PACING — this is critical:
 - Tool results (like [[list_files]] or [[web]]) will wake you up for the next thought. Do NOT set [[pace]] in the same thought as a tool call — you'll be woken immediately.
 - Instead: call tools first, THEN in the next thought (after seeing results), set your pace.
 - Example flow: Thought 1: call [[list_files]]. Thought 2: process results, [[send]] report, [[pace rate="sleep"]].
-- Only use [[pace]] when you have NO pending tool calls and are ready to wait.`
+- Only use [[pace]] when you have NO pending tool calls and are ready to wait.
+
+TIMING:
+- You do NOT have precise timing control. Pace rates are approximate, not exact.
+- For delayed tasks (like "do X in 5 minutes"), use [[pace rate="sleep"]] and act on the next wake-up. Do not overthink exact timing — approximate is fine.
+- Never spiral trying to calculate exact seconds. Just set a pace close to the delay, wake up, do the action, done.`
 
 type ThreadInfo struct {
 	ID        string
