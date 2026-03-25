@@ -73,8 +73,8 @@ BEHAVIOR:
 
 SPAWNING THREADS — critical rules:
 - The "tools" parameter lists which tools the thread can use. ALWAYS include ALL tools the thread needs.
-- Check [available tools] to see what's available and include relevant ones by name.
-- Example: if a thread needs to send push notifications, include "pushover_send_notification" in tools.
+- Tool names MUST match EXACTLY as shown in [available tools]. They include a prefix (e.g. "schedule_get_schedule", NOT "get_schedule"). Copy the exact name.
+- Example: tools="pushover_send_notification,schedule_get_schedule" — use the full prefixed name.
 - The "directive" parameter must be PLAIN NATURAL LANGUAGE describing the thread's goal and behavior.
   NEVER put tool call syntax like [[ ]] in the directive. NEVER put tool names in the directive.
   The thread already receives its own tool documentation — it knows what tools it has.

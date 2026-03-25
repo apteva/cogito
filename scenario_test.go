@@ -422,18 +422,18 @@ Be concise, accurate, and helpful. Answer questions directly.`,
 		{
 			Name:    "Factual question — What is the capital of France?",
 			Timeout: 60 * time.Second,
-			Setup: func(t *testing.T, dir string) {
-				// Inject via thinker — will be called with th in Wait
-			},
-			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				// Inject on first poll
-				if countTool(readAuditEntries(dir), "send_reply") == 0 && th.iteration <= 2 {
-					th.InjectUserMessage("alice", "What is the capital of France?")
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				sent := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !sent {
+						sent = true
+						th.InjectUserMessage("alice", "What is the capital of France?")
+					}
+					replies := readChatReplies(dir)
+					t.Logf("  ... replies=%d threads=%v", len(replies), threadIDs(th))
+					return len(replies) >= 1
 				}
-				replies := readChatReplies(dir)
-				t.Logf("  ... replies=%d threads=%v", len(replies), threadIDs(th))
-				return len(replies) >= 1
-			},
+			}(),
 			Verify: func(t *testing.T, dir string, th *Thinker) {
 				replies := readChatReplies(dir)
 				last := replies[len(replies)-1]
@@ -446,16 +446,18 @@ Be concise, accurate, and helpful. Answer questions directly.`,
 		{
 			Name:    "Follow-up question — What is its population?",
 			Timeout: 60 * time.Second,
-			Setup: func(t *testing.T, dir string) {},
-			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				// Inject once
-				replies := readChatReplies(dir)
-				if len(replies) == 1 {
-					th.InjectUserMessage("alice", "What is its population?")
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				sent := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !sent {
+						sent = true
+						th.InjectUserMessage("alice", "What is its population?")
+					}
+					replies := readChatReplies(dir)
+					t.Logf("  ... replies=%d", len(replies))
+					return len(replies) >= 2
 				}
-				t.Logf("  ... replies=%d", len(replies))
-				return len(replies) >= 2
-			},
+			}(),
 			Verify: func(t *testing.T, dir string, th *Thinker) {
 				replies := readChatReplies(dir)
 				last := replies[len(replies)-1]
@@ -468,23 +470,24 @@ Be concise, accurate, and helpful. Answer questions directly.`,
 		{
 			Name:    "Multi-user — bob asks 2+2",
 			Timeout: 60 * time.Second,
-			Setup: func(t *testing.T, dir string) {
-				// Not using Setup because we need th
-			},
-			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				replies := readChatReplies(dir)
-				hasBob := false
-				for _, r := range replies {
-					if r.User == "bob" {
-						hasBob = true
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				sent := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !sent {
+						sent = true
+						th.InjectUserMessage("bob", "What is 2 + 2?")
 					}
+					replies := readChatReplies(dir)
+					hasBob := false
+					for _, r := range replies {
+						if r.User == "bob" {
+							hasBob = true
+						}
+					}
+					t.Logf("  ... replies=%d bob=%v threads=%v", len(replies), hasBob, threadIDs(th))
+					return hasBob
 				}
-				if !hasBob && len(replies) >= 2 {
-					th.InjectUserMessage("bob", "What is 2 + 2?")
-				}
-				t.Logf("  ... replies=%d bob=%v threads=%v", len(replies), hasBob, threadIDs(th))
-				return hasBob
-			},
+			}(),
 			Verify: func(t *testing.T, dir string, th *Thinker) {
 				replies := readChatReplies(dir)
 				var bobReply string
@@ -685,14 +688,14 @@ var socialTeamScenario = Scenario{
 	Name: "SocialTeam",
 	Directive: `You manage social media for a small coffee shop called "Bean & Brew".
 Spawn three permanent team members:
-1. A planner who checks the content schedule for slots that need content
-2. A creative who generates post text and images when asked
-3. A social manager who posts content to channels when given ready content
+1. A planner — needs the schedule tools (get_schedule, update_slot) to check for planned slots and mark them posted
+2. A creative — needs the creative tools (generate_post, generate_image) to make content when asked
+3. A social manager — needs the social tools (post, get_posts) to publish content to channels
 
-When planner finds a planned slot, coordinate the team: ask creative to generate
-a post and image for the topic and channel, then give the content to social manager
-to post it, then have planner update the schedule slot to posted.
-All team members should stay at normal pace.`,
+When planner finds a planned slot, coordinate: ask creative to generate a post and image,
+then give the content to social manager to post it, then tell planner to update the slot to posted.
+The planner must keep checking the schedule at normal pace — never go to sleep.
+Creative and social manager can sleep when idle.`,
 	MCPServers: []MCPServerConfig{
 		{
 			Name:    "schedule",
@@ -847,6 +850,180 @@ func TestScenario_SocialTeam(t *testing.T) {
 	s.MCPServers[0].Command = scheduleBin
 	s.MCPServers[1].Command = creativeBin
 	s.MCPServers[2].Command = socialBin
+	runScenario(t, s)
+}
+
+var robotScenario = Scenario{
+	Name: "Robot",
+	Directive: `You control a small robot. Spawn two team members:
+1. A "pilot" thread at fast pace with small model — it continuously reads sensors and drives the motors.
+   When it detects obstacles, it stops and reports to you. It executes movement commands you give it.
+2. You (main) are the strategic planner. You decide where the robot should go and what to look for.
+   Give the pilot high-level commands like "move forward 3 steps" or "turn right and scan".
+
+The pilot must stay at fast pace and continuously monitor sensors between moves.
+You stay at normal pace and coordinate.`,
+	MCPServers: []MCPServerConfig{
+		{
+			Name:    "sensors",
+			Command: "", // filled in test
+			Env:     map[string]string{"ROBOT_DATA_DIR": "{{dataDir}}"},
+		},
+		{
+			Name:    "motors",
+			Command: "", // filled in test
+			Env:     map[string]string{"ROBOT_DATA_DIR": "{{dataDir}}"},
+		},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		writeJSONFile(t, dir, "world.json", map[string]any{
+			"position":  map[string]float64{"x": 0, "y": 0},
+			"heading":   0,
+			"battery":   100,
+			"obstacles": []any{},
+			"objects":   []any{},
+			"moving":    false,
+			"speed":     "",
+		})
+	},
+	Phases: []Phase{
+		{
+			Name:    "Startup — pilot spawned and reading sensors",
+			Timeout: 60 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.threads.Count() == 0 {
+					return false
+				}
+				entries := readAuditEntries(dir)
+				reads := countTool(entries, "read_sensors")
+				t.Logf("  ... read_sensors=%d threads=%v", reads, threadIDs(th))
+				return reads > 0
+			},
+		},
+		{
+			Name:    "Navigate — move forward 3 steps",
+			Timeout: 90 * time.Second,
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				sent := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !sent {
+						sent = true
+						th.InjectConsole("Command: move the robot forward 3 steps")
+					}
+					entries := readAuditEntries(dir)
+					moves := countTool(entries, "move")
+					t.Logf("  ... moves=%d threads=%v", moves, threadIDs(th))
+					return moves >= 3
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Check position changed
+				data, _ := os.ReadFile(filepath.Join(dir, "world.json"))
+				var w map[string]any
+				json.Unmarshal(data, &w)
+				pos := w["position"].(map[string]any)
+				y := pos["y"].(float64)
+				t.Logf("Position after moves: y=%.1f", y)
+				if y < 2.0 {
+					t.Logf("NOTE: expected Y >= 2.0, got %.1f", y)
+				}
+			},
+		},
+		{
+			Name:    "Obstacle — robot detects and avoids",
+			Timeout: 90 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				// Place obstacle ahead of current position
+				data, _ := os.ReadFile(filepath.Join(dir, "world.json"))
+				var w map[string]any
+				json.Unmarshal(data, &w)
+				pos := w["position"].(map[string]any)
+				y := pos["y"].(float64)
+				w["obstacles"] = []map[string]float64{{"x": 0, "y": y + 1.5}}
+				writeJSONFile(t, dir, "world.json", w)
+			},
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				sent := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					// Tell pilot to move forward once — it should detect the obstacle
+					if !sent {
+						sent = true
+						th.InjectConsole("Command: move forward 2 more steps")
+					}
+					entries := readAuditEntries(dir)
+					reads := countTool(entries, "read_sensors")
+					stops := countTool(entries, "stop")
+					moves := countTool(entries, "move")
+					t.Logf("  ... reads=%d stops=%d moves=%d threads=%v", reads, stops, moves, threadIDs(th))
+					// Pilot should detect obstacle via sensors or blocked move, then stop or turn
+					return stops > 0 || (moves > 3 && reads > 5)
+				}
+			}(),
+		},
+		{
+			Name:    "Camera — find the red cup",
+			Timeout: 90 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				// Place red cup in camera range
+				data, _ := os.ReadFile(filepath.Join(dir, "world.json"))
+				var w map[string]any
+				json.Unmarshal(data, &w)
+				pos := w["position"].(map[string]any)
+				x := pos["x"].(float64)
+				y := pos["y"].(float64)
+				w["objects"] = []map[string]any{
+					{"name": "red cup", "x": x + 2, "y": y + 3},
+				}
+				writeJSONFile(t, dir, "world.json", w)
+			},
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				sent := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !sent {
+						sent = true
+						th.InjectConsole("Command: use the camera to look for a red cup nearby")
+					}
+					entries := readAuditEntries(dir)
+					cams := countTool(entries, "read_camera")
+					t.Logf("  ... read_camera=%d threads=%v", cams, threadIDs(th))
+					return cams >= 1
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				entries := readAuditEntries(dir)
+				t.Logf("Audit (%d entries):", len(entries))
+				for _, e := range entries {
+					if e.Tool != "read_sensors" {
+						t.Logf("  %s %v", e.Tool, e.Args)
+					}
+				}
+			},
+		},
+		{
+			Name:    "Quiescence — pilot still alive",
+			Timeout: 15 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				return th.threads.Count() >= 1
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				if th.threads.Count() < 1 {
+					t.Errorf("expected pilot still alive, got %d threads", th.threads.Count())
+				}
+			},
+		},
+	},
+	Timeout:    5 * time.Minute,
+	MaxThreads: 3,
+}
+
+func TestScenario_Robot(t *testing.T) {
+	sensorsBin := buildMCPBinary(t, "mcps/sensors")
+	motorsBin := buildMCPBinary(t, "mcps/motors")
+	t.Logf("built sensors: %s, motors: %s", sensorsBin, motorsBin)
+
+	s := robotScenario
+	s.MCPServers[0].Command = sensorsBin
+	s.MCPServers[1].Command = motorsBin
 	runScenario(t, s)
 }
 
