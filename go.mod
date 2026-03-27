@@ -1,4 +1,4 @@
-module github.com/apteva/cogito
+module github.com/apteva/core
 
 go 1.25.1
 

@@ -78,7 +78,7 @@ func main() {
 	}
 
 	if headless {
-		fmt.Fprintf(os.Stderr, "cogito running headless (API on :%s)\n", apiPort)
+		fmt.Fprintf(os.Stderr, "apteva-core running headless (API on :%s)\n", apiPort)
 		<-thinker.quit
 	} else {
 		p := tea.NewProgram(newModel(thinker), tea.WithAltScreen())

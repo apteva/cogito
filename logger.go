@@ -14,7 +14,7 @@ var (
 )
 
 func initLogger() {
-	f, err := os.OpenFile("cogito.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile("apteva-core.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not open log file: %v\n", err)
 		return

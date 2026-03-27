@@ -1,5 +1,7 @@
 .env
 cogito
+apteva-core
+backplane
 thinking
 mcp-pushover-server
 memory.jsonl
@@ -8,4 +10,11 @@ workspace/
 .claude/
 debug.log
 stdout.log
+cogito.log
+apteva-core.log
 *.exe
+mcps/*/mcp-*
+mcps/media/media
+mcps/storage/storage
+mcps/chat/mcp-chat
+mcps/inventory/mcp-inventory

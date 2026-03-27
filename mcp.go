@@ -121,7 +121,7 @@ func connectMCP(cfg MCPServerConfig) (*MCPServer, error) {
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]any{},
 		"clientInfo": map[string]string{
-			"name":    "cogito",
+			"name":    "apteva-core",
 			"version": "1.0.0",
 		},
 	})

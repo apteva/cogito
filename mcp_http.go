@@ -33,7 +33,7 @@ func connectMCPHTTP(name, url string) (*MCPHTTPServer, error) {
 		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]any{},
 		"clientInfo": map[string]string{
-			"name":    "cogito",
+			"name":    "apteva-core",
 			"version": "1.0.0",
 		},
 	})

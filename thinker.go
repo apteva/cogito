@@ -41,7 +41,7 @@ func (t *Thinker) modelID() string {
 }
 
 // baseSystemPrompt contains the fixed rules/tools. The editable directive is prepended at runtime.
-const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine (Cogito). You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
+const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine (Apteva Core). You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
 
 THINKING — every thought must contain meaningful text:
 - Always explain what you observe, what you're doing, and why — even briefly.
@@ -669,7 +669,7 @@ func (t *Thinker) Run() {
 			Iteration: t.iteration, Duration: duration,
 			ConsumedEvents: consumed, Usage: usage,
 			ToolCalls: toolNames, Replies: replies,
-			Rate: t.rate, Model: t.model,
+			Rate: t.rate, SleepDuration: sleepDur, Model: t.model,
 			MemoryCount: t.memory.Count(), ThreadCount: threadCount,
 			ContextMsgs: len(t.messages), ContextChars: ctxChars,
 		})

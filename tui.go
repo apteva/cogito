@@ -207,6 +207,12 @@ type threadView struct {
 	model        ModelTier
 	contextMsgs  int
 	contextChars int
+	// Per-thread cost tracking
+	cost         float64
+	iterations   int
+	started      time.Time
+	lastThought  time.Time
+	sleepDur     time.Duration // current sleep duration for this thread
 }
 
 type model struct {
@@ -281,7 +287,7 @@ func (m *model) getOrCreateView(id string) *threadView {
 	if v, ok := m.threadViews[id]; ok {
 		return v
 	}
-	v := &threadView{currentChunk: &strings.Builder{}}
+	v := &threadView{currentChunk: &strings.Builder{}, started: time.Now()}
 	m.threadViews[id] = v
 	// Add tab if not present
 	found := false
@@ -630,14 +636,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			v.model = ev.Model
 			v.contextMsgs = ev.ContextMsgs
 			v.contextChars = ev.ContextChars
+			v.iterations++
+			v.lastThought = time.Now()
 			m.lastDuration = ev.Duration
 			u := ev.Usage
 			m.totalPromptTokens += u.PromptTokens
 			m.totalCachedTokens += u.CachedTokens
 			m.totalCompletionTokens += u.CompletionTokens
+			iterCost := 0.0
 			if m.thinker.provider != nil {
-				m.totalCost += calculateCostForProvider(m.thinker.provider, u)
+				iterCost = calculateCostForProvider(m.thinker.provider, u)
+				m.totalCost += iterCost
 			}
+			v.cost += iterCost
+			v.sleepDur = ev.SleepDuration
 			if ev.From == "main" {
 				m.memoryCount = ev.MemoryCount
 				m.threadCount = ev.ThreadCount
@@ -1251,7 +1263,7 @@ func (m model) View() string {
 	}
 
 	elapsed := time.Since(m.startTime).Round(time.Second)
-	title := titleStyle.Render("Cogito")
+	title := titleStyle.Render("Apteva")
 
 	// Show active tab's status
 	var statusRender string
@@ -1263,7 +1275,11 @@ func (m model) View() string {
 	if m.paused {
 		statusRender = pausedStyle.Render("PAUSED")
 	} else if v, ok := m.threadViews[m.activeTab]; ok {
-		statusRender = statusBarStyle.Render(fmt.Sprintf("THINKING (%s/%s/%s)", providerName, v.rate, v.model))
+		sleepStr := formatSleep(v.sleepDur)
+		if v.sleepDur == 0 {
+			sleepStr = v.rate.String()
+		}
+		statusRender = statusBarStyle.Render(fmt.Sprintf("THINKING (%s/%s/%s)", providerName, sleepStr, v.model))
 		if v.contextChars > 0 {
 			estTokens := v.contextChars / 4 // rough estimate: ~4 chars per token
 			ctxInfo = fmt.Sprintf(" │ ctx: %dm/~%dtok", v.contextMsgs, estTokens)
@@ -1286,18 +1302,34 @@ func (m model) View() string {
 	header := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", statusRender, "  ", stats)
 
 	totalTok := m.totalPromptTokens + m.totalCompletionTokens
-	costPerHour := 0.0
-	costPerDay := 0.0
-	elapsedHours := elapsed.Hours()
-	if elapsedHours > 0 {
-		costPerHour = m.totalCost / elapsedHours
-		costPerDay = costPerHour * 24
+
+	// Projected cost: sum per-thread estimates based on each thread's
+	// average cost per iteration and current sleep duration
+	projectedPerHour := 0.0
+	for _, v := range m.threadViews {
+		if v.iterations == 0 || v.cost == 0 {
+			continue
+		}
+		costPerIter := v.cost / float64(v.iterations)
+		// Estimate iteration cycle time: avg think duration + current sleep
+		threadElapsed := time.Since(v.started)
+		avgThinkDur := threadElapsed / time.Duration(v.iterations)
+		if avgThinkDur > v.sleepDur {
+			avgThinkDur = 2 * time.Second // fallback
+		}
+		cycleDur := avgThinkDur + v.sleepDur
+		if cycleDur < time.Second {
+			cycleDur = time.Second
+		}
+		itersPerHour := float64(time.Hour) / float64(cycleDur)
+		projectedPerHour += costPerIter * itersPerHour
 	}
+	projectedPerDay := projectedPerHour * 24
 
 	costLine := statsStyle.Render(fmt.Sprintf(
-		"tok: %d (in:%d cached:%d out:%d) │ $%.4f │ $%.2f/hr │ $%.2f/day",
+		"tok: %d (in:%d cached:%d out:%d) │ spent: $%.4f │ proj: $%.2f/hr · $%.2f/day",
 		totalTok, m.totalPromptTokens, m.totalCachedTokens, m.totalCompletionTokens,
-		m.totalCost, costPerHour, costPerDay,
+		m.totalCost, projectedPerHour, projectedPerDay,
 	))
 
 	header = header + "\n" + costLine

@@ -32,6 +32,7 @@ type Event struct {
 	ToolCalls      []string
 	Replies        []string
 	Rate           ThinkRate
+	SleepDuration  time.Duration
 	Model          ModelTier
 	MemoryCount    int
 	ThreadCount    int
