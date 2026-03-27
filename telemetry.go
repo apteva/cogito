@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// TelemetryEvent is the unified event format — matches backplane schema.
+// TelemetryEvent is the unified event format — matches server schema.
 type TelemetryEvent struct {
 	ID         string          `json:"id"`
 	InstanceID int64           `json:"instance_id,omitempty"`
@@ -20,13 +20,13 @@ type TelemetryEvent struct {
 	Data       json.RawMessage `json:"data"`
 }
 
-// Telemetry collects events and forwards them to the backplane.
+// Telemetry collects events and forwards them to the server.
 type Telemetry struct {
 	mu         sync.Mutex
-	log        []TelemetryEvent // stored events (forwarded to backplane)
+	log        []TelemetryEvent // stored events (forwarded to server)
 	liveLog    []TelemetryEvent // all events including live-only (for SSE)
 	notify     chan struct{}
-	backplane  string // backplane URL (e.g. "http://localhost:5280")
+	serverURL string // server URL (e.g. "http://localhost:5280")
 	instanceID int64
 	seq        int64
 	quit       chan struct{}
@@ -38,14 +38,14 @@ func NewTelemetry() *Telemetry {
 		quit:   make(chan struct{}),
 	}
 
-	// Read instance ID from env (set by backplane when spawning)
+	// Read instance ID from env (set by server when spawning)
 	if id := os.Getenv("INSTANCE_ID"); id != "" {
 		fmt.Sscanf(id, "%d", &t.instanceID)
 	}
 
-	// Configure backplane URL for fire-and-forget
-	if url := os.Getenv("BACKPLANE_URL"); url != "" {
-		t.backplane = url
+	// Configure server URL for fire-and-forget
+	if url := os.Getenv("SERVER_URL"); url != "" {
+		t.serverURL = url
 		go t.forwardLoop()
 	}
 
@@ -61,12 +61,12 @@ func (t *Telemetry) generateID() string {
 	return fmt.Sprintf("%d-%d", time.Now().UnixMilli(), t.seq)
 }
 
-// Emit records a telemetry event (stored + forwarded to backplane).
+// Emit records a telemetry event (stored + forwarded to server).
 func (t *Telemetry) Emit(eventType, threadID string, data any) {
 	t.emit(eventType, threadID, data, true)
 }
 
-// EmitLive records a telemetry event for SSE only (not forwarded to backplane).
+// EmitLive records a telemetry event for SSE only (not forwarded to server).
 func (t *Telemetry) EmitLive(eventType, threadID string, data any) {
 	t.emit(eventType, threadID, data, false)
 }
@@ -102,8 +102,8 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 	default:
 	}
 
-	// Forward live-only events to backplane immediately for SSE broadcast
-	if !store && t.backplane != "" {
+	// Forward live-only events to server immediately for SSE broadcast
+	if !store && t.serverURL != "" {
 		go t.forwardLive(ev)
 	}
 }
@@ -113,7 +113,7 @@ func (t *Telemetry) forwardLive(ev TelemetryEvent) {
 	if err != nil {
 		return
 	}
-	req, err := http.NewRequest("POST", t.backplane+"/telemetry/live", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", t.serverURL+"/telemetry/live", bytes.NewReader(body))
 	if err != nil {
 		return
 	}
@@ -148,7 +148,7 @@ func (t *Telemetry) StoredEvents(since int) ([]TelemetryEvent, int) {
 	return events, len(t.log)
 }
 
-// forwardLoop batches events and POSTs them to the backplane every second.
+// forwardLoop batches events and POSTs them to the server every second.
 func (t *Telemetry) forwardLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -169,7 +169,7 @@ func (t *Telemetry) forwardLoop() {
 				continue
 			}
 
-			req, err := http.NewRequest("POST", t.backplane+"/telemetry", bytes.NewReader(body))
+			req, err := http.NewRequest("POST", t.serverURL+"/telemetry", bytes.NewReader(body))
 			if err != nil {
 				continue
 			}
