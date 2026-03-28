@@ -26,6 +26,7 @@ type Telemetry struct {
 	log        []TelemetryEvent // stored events (forwarded to server)
 	liveLog    []TelemetryEvent // all events including live-only (for SSE)
 	notify     chan struct{}
+	forwardCh  chan TelemetryEvent // serialized queue for live event forwarding
 	serverURL string // server URL (e.g. "http://localhost:5280")
 	instanceID int64
 	seq        int64
@@ -34,8 +35,9 @@ type Telemetry struct {
 
 func NewTelemetry() *Telemetry {
 	t := &Telemetry{
-		notify: make(chan struct{}, 1),
-		quit:   make(chan struct{}),
+		notify:    make(chan struct{}, 1),
+		forwardCh: make(chan TelemetryEvent, 500),
+		quit:      make(chan struct{}),
 	}
 
 	// Read instance ID from env (set by server when spawning)
@@ -47,6 +49,7 @@ func NewTelemetry() *Telemetry {
 	if url := os.Getenv("SERVER_URL"); url != "" {
 		t.serverURL = url
 		go t.forwardLoop()
+		go t.liveForwardLoop() // serialized live event forwarding
 	}
 
 	return t
@@ -102,9 +105,26 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 	default:
 	}
 
-	// Forward live-only events to server immediately for SSE broadcast
+	// Queue for ordered forwarding (async goroutines cause chunk reordering)
 	if !store && t.serverURL != "" {
-		go t.forwardLive(ev)
+		select {
+		case t.forwardCh <- ev:
+		default:
+			// Drop if queue full (back-pressure)
+		}
+	}
+}
+
+// liveForwardLoop drains the forwardCh sequentially — one HTTP POST at a time.
+// This guarantees chunks arrive at the server in the correct order.
+func (t *Telemetry) liveForwardLoop() {
+	for {
+		select {
+		case ev := <-t.forwardCh:
+			t.forwardLive(ev)
+		case <-t.quit:
+			return
+		}
 	}
 }
 
