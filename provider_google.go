@@ -319,7 +319,12 @@ var imageMimeTypes = map[string]string{
 // fetchMediaAsBase64 downloads a URL and returns (base64data, mimeType, error).
 func fetchMediaAsBase64(url string) (string, string, error) {
 	logMsg("GEMINI", fmt.Sprintf("fetching media: %s", url))
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("fetch failed: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; AptevaCore/1.0)")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", "", fmt.Errorf("fetch failed: %w", err)
 	}
