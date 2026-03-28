@@ -24,7 +24,7 @@ func TestIntegration_MultiThreadCoordination(t *testing.T) {
 Each thread has tools="done". After spawning all 3, set pace to sleep and wait for their results.
 When all 3 threads report done, say "ALL TASKS COMPLETE" in your thought.`
 
-	provider, err := selectProvider()
+	provider, err := selectProvider(NewConfig())
 	if err != nil {
 		t.Skip("no provider available")
 	}

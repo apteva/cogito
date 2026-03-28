@@ -131,6 +131,8 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 		apiNotify:     tm.parent.apiNotify,
 		registry:      tm.parent.registry,
 		toolAllowlist: toolSet,
+		approvalCh:    tm.parent.approvalCh,
+		config:        tm.parent.config,
 		rebuildPrompt: func(toolDocs string) string {
 			cd := ""
 			if tm.parent.registry != nil {
@@ -182,6 +184,11 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 
 		for _, call := range calls {
 			if !thread.Tools[call.Name] {
+				continue
+			}
+			// Supervised mode gate — applies to all tools
+			if !waitForApproval(t, call) {
+				t.Inject(fmt.Sprintf("[tool:%s] Rejected by user", call.Name))
 				continue
 			}
 			switch call.Name {

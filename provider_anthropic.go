@@ -40,7 +40,20 @@ type anthropicRequest struct {
 
 type anthropicMessage struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"` // string or []anthropicContentBlock
+}
+
+type anthropicContentBlock struct {
+	Type      string                `json:"type"`                 // "text", "image"
+	Text      string                `json:"text,omitempty"`       // type=text
+	Source    *anthropicSource      `json:"source,omitempty"`     // type=image
+}
+
+type anthropicSource struct {
+	Type      string `json:"type"`                // "url", "base64"
+	URL       string `json:"url,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
 }
 
 // Anthropic streaming event types
@@ -74,13 +87,20 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, onChunk func(
 	var anthropicMsgs []anthropicMessage
 	for _, m := range messages {
 		if m.Role == "system" {
-			system = m.Content
+			system = m.TextContent()
 			continue
 		}
-		anthropicMsgs = append(anthropicMsgs, anthropicMessage{
-			Role:    m.Role,
-			Content: m.Content,
-		})
+		if m.HasParts() {
+			anthropicMsgs = append(anthropicMsgs, anthropicMessage{
+				Role:    m.Role,
+				Content: toAnthropicBlocks(m.Parts),
+			})
+		} else {
+			anthropicMsgs = append(anthropicMsgs, anthropicMessage{
+				Role:    m.Role,
+				Content: m.Content,
+			})
+		}
 	}
 
 	// Anthropic requires at least one message
@@ -158,4 +178,43 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, onChunk func(
 	}
 
 	return full.String(), usage, nil
+}
+
+// toAnthropicBlocks converts our ContentParts to Anthropic content blocks.
+func toAnthropicBlocks(parts []ContentPart) []anthropicContentBlock {
+	var blocks []anthropicContentBlock
+	for _, p := range parts {
+		switch p.Type {
+		case "text":
+			blocks = append(blocks, anthropicContentBlock{Type: "text", Text: p.Text})
+		case "image_url":
+			if p.ImageURL != nil {
+				if strings.HasPrefix(p.ImageURL.URL, "data:") {
+					// data:image/png;base64,iVBOR... → extract media type and data
+					segments := strings.SplitN(p.ImageURL.URL, ",", 2)
+					mediaType := strings.TrimPrefix(strings.TrimSuffix(segments[0], ";base64"), "data:")
+					data := ""
+					if len(segments) > 1 {
+						data = segments[1]
+					}
+					blocks = append(blocks, anthropicContentBlock{
+						Type: "image",
+						Source: &anthropicSource{Type: "base64", MediaType: mediaType, Data: data},
+					})
+				} else {
+					blocks = append(blocks, anthropicContentBlock{
+						Type: "image",
+						Source: &anthropicSource{Type: "url", URL: p.ImageURL.URL},
+					})
+				}
+			}
+		case "input_audio":
+			// Anthropic doesn't support audio — include as text note
+			blocks = append(blocks, anthropicContentBlock{Type: "text", Text: "[audio input not supported by this provider]"})
+		}
+	}
+	if len(blocks) == 0 {
+		blocks = append(blocks, anthropicContentBlock{Type: "text", Text: ""})
+	}
+	return blocks
 }

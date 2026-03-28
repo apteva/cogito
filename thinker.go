@@ -270,18 +270,32 @@ type Thinker struct {
 
 	// Live MCP connections — servers connected at runtime
 	mcpServers []MCPConn
+
+	// Supervised mode — tool approval gate
+	approvalCh   chan bool      // receives true=approve, false=reject
+	pendingTool  *toolCall     // tool waiting for approval (nil if none)
+	pendingMu    sync.Mutex
+
+	// Multimodal — parts waiting to be attached to next message
+	pendingParts []ContentPart
+	partsMu      sync.Mutex
 }
 
-func NewThinker(apiKey string, provider LLMProvider) *Thinker {
-	cfg := NewConfig()
+func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
+	var config *Config
+	if len(cfg) > 0 && cfg[0] != nil {
+		config = cfg[0]
+	} else {
+		config = NewConfig()
+	}
 	bus := NewEventBus()
 	t := &Thinker{
 		apiKey:   apiKey,
 		provider: provider,
 		messages: []Message{
-			{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), nil, "", nil)},
+			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), nil, "", nil)},
 		},
-		config:    cfg,
+		config:    config,
 		bus:       bus,
 		sub:       bus.Subscribe("main", 100),
 		pause:     make(chan bool, 1),
@@ -293,14 +307,15 @@ func NewThinker(apiKey string, provider LLMProvider) *Thinker {
 		apiLog:    &[]APIEvent{},
 		apiMu:     &sync.RWMutex{},
 		apiNotify: make(chan struct{}, 1),
-		threadID:  "main",
-		telemetry: NewTelemetry(),
+		threadID:   "main",
+		telemetry:  NewTelemetry(),
+		approvalCh: make(chan bool, 1),
 	}
 	t.threads = NewThreadManager(t)
 	t.registry = NewToolRegistry(apiKey)
 
 	// Rebuild system prompt now that registry exists (with core tool docs)
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), t.registry, "", nil)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", nil)}
 
 	// Embed tool descriptions in background (non-blocking)
 	go t.registry.EmbedAll(t.memory)
@@ -321,14 +336,14 @@ func NewThinker(apiKey string, provider LLMProvider) *Thinker {
 	}
 
 	// Connect MCP servers and register their tools
-	if len(cfg.MCPServers) > 0 {
-		t.mcpServers = connectAndRegisterMCP(cfg.MCPServers, t.registry, t.memory)
+	if len(config.MCPServers) > 0 {
+		t.mcpServers = connectAndRegisterMCP(config.MCPServers, t.registry, t.memory)
 		// Rebuild prompt now that servers are connected
-		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), t.registry, "", t.mcpServers)}
+		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", t.mcpServers)}
 	}
 
 	// Respawn persistent threads from config
-	for _, pt := range cfg.GetThreads() {
+	for _, pt := range config.GetThreads() {
 		t.threads.Spawn(pt.ID, pt.Directive, pt.Tools)
 	}
 
@@ -341,6 +356,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 		var replies []string
 		var toolNames []string
 		for _, call := range calls {
+			// Supervised mode gate — applies to all tools
+			if !waitForApproval(t, call) {
+				t.Inject(fmt.Sprintf("[tool:%s] Rejected by user", call.Name))
+				continue
+			}
 			switch call.Name {
 			case "spawn":
 				id := call.Args["id"]
@@ -557,13 +577,18 @@ func (t *Thinker) Run() {
 		}
 
 		now := time.Now().Format("2006-01-02 15:04:05")
+		pendingParts := t.drainParts()
 		if hadEvents {
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
 			for _, ev := range consumed {
 				sb.WriteString("• " + ev + "\n")
 			}
-			t.messages = append(t.messages, Message{Role: "user", Content: sb.String()})
+			msg := Message{Role: "user", Content: sb.String()}
+			if len(pendingParts) > 0 {
+				msg.Parts = append([]ContentPart{{Type: "text", Text: sb.String()}}, pendingParts...)
+			}
+			t.messages = append(t.messages, msg)
 		} else {
 			t.messages = append(t.messages, Message{Role: "user", Content: fmt.Sprintf("[%s] (no events)", now)})
 		}
@@ -816,6 +841,27 @@ func (t *Thinker) InjectConsole(msg string) {
 // InjectUserMessage sends a user message event to this thinker.
 func (t *Thinker) InjectUserMessage(userID, msg string) {
 	t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Text: fmt.Sprintf("[user:%s] %s", userID, msg)})
+}
+
+// InjectWithParts sends a text event and stores multimodal parts for the next thinking iteration.
+func (t *Thinker) InjectWithParts(text string, parts []ContentPart) {
+	t.partsMu.Lock()
+	t.pendingParts = parts
+	t.partsMu.Unlock()
+	if text != "" {
+		t.InjectConsole(text)
+	} else {
+		t.InjectConsole("[multimodal input]")
+	}
+}
+
+// drainParts returns and clears any pending multimodal parts.
+func (t *Thinker) drainParts() []ContentPart {
+	t.partsMu.Lock()
+	defer t.partsMu.Unlock()
+	parts := t.pendingParts
+	t.pendingParts = nil
+	return parts
 }
 
 func (t *Thinker) TogglePause() {

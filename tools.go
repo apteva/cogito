@@ -44,20 +44,96 @@ func parseToolCalls(text string) []toolCall {
 	return calls
 }
 
+// toolArgsSummary builds a short string representation of tool args.
+func toolArgsSummary(call toolCall) string {
+	argsSummary := ""
+	for k, v := range call.Args {
+		if len(argsSummary) > 0 {
+			argsSummary += ", "
+		}
+		val := v
+		if len(val) > 50 {
+			val = val[:50] + "..."
+		}
+		argsSummary += k + "=" + val
+	}
+	return argsSummary
+}
+
+const approvalTimeout = 5 * time.Minute
+
+// waitForApproval blocks until the user approves or rejects a tool call.
+// Returns true if approved, false if rejected or timed out.
+// Returns true immediately if not in supervised mode or tool is auto-approved.
+func waitForApproval(t *Thinker, call toolCall) bool {
+	if t.config == nil || t.config.GetMode() != ModeSupervised || t.config.IsAutoApproved(call.Name) {
+		return true
+	}
+
+	argsSummary := toolArgsSummary(call)
+	logMsg("APPROVAL", fmt.Sprintf("waiting for approval: %s args=%v", call.Name, call.Args))
+
+	// Set pending tool so API/TUI can see what's waiting
+	t.pendingMu.Lock()
+	t.pendingTool = &call
+	t.pendingMu.Unlock()
+
+	// Emit pending event for dashboard/TUI
+	if t.telemetry != nil {
+		t.telemetry.Emit("tool.pending", t.threadID, ToolCallData{
+			Name: call.Name, Args: argsSummary,
+		})
+	}
+
+	// Drain any stale approval
+	select {
+	case <-t.approvalCh:
+	default:
+	}
+
+	// Block until approved, rejected, or timeout
+	var approved bool
+	select {
+	case approved = <-t.approvalCh:
+	case <-time.After(approvalTimeout):
+		logMsg("APPROVAL", fmt.Sprintf("timeout waiting for approval: %s", call.Name))
+		approved = false
+	case <-t.quit:
+		t.pendingMu.Lock()
+		t.pendingTool = nil
+		t.pendingMu.Unlock()
+		return false
+	}
+
+	// Clear pending
+	t.pendingMu.Lock()
+	t.pendingTool = nil
+	t.pendingMu.Unlock()
+
+	if !approved {
+		logMsg("APPROVAL", fmt.Sprintf("rejected: %s", call.Name))
+		if t.telemetry != nil {
+			t.telemetry.Emit("tool.rejected", t.threadID, ToolCallData{
+				Name: call.Name, Args: argsSummary,
+			})
+		}
+		return false
+	}
+
+	logMsg("APPROVAL", fmt.Sprintf("approved: %s", call.Name))
+	if t.telemetry != nil {
+		t.telemetry.Emit("tool.approved", t.threadID, ToolCallData{
+			Name: call.Name, Args: argsSummary,
+		})
+	}
+	return true
+}
+
 func executeTool(t *Thinker, call toolCall) {
+	argsSummary := toolArgsSummary(call)
+
 	// Telemetry: tool.call
 	if t.telemetry != nil {
-		argsSummary := ""
-		for k, v := range call.Args {
-			if len(argsSummary) > 0 {
-				argsSummary += ", "
-			}
-			val := v
-			if len(val) > 50 {
-				val = val[:50] + "..."
-			}
-			argsSummary += k + "=" + val
-		}
 		t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
 			Name: call.Name, Args: argsSummary,
 		})

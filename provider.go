@@ -24,56 +24,120 @@ type LLMProvider interface {
 	CostPer1M() (float64, float64, float64)
 }
 
-// selectProvider picks the best available LLM provider based on env vars.
-// Priority: explicit COGITO_PROVIDER env, then check for API keys.
-func selectProvider() (LLMProvider, error) {
-	explicit := os.Getenv("COGITO_PROVIDER")
-
-	switch explicit {
+// createProviderByName creates a provider by name, returning nil if the required API key is missing.
+func createProviderByName(name string) LLMProvider {
+	switch name {
+	case "fireworks":
+		if key := os.Getenv("FIREWORKS_API_KEY"); key != "" {
+			return NewFireworksProvider(key)
+		}
 	case "openai":
-		key := os.Getenv("OPENAI_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("OPENAI_API_KEY not set")
+		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+			return NewOpenAIProvider(key)
 		}
-		return NewOpenAIProvider(key), nil
 	case "anthropic":
-		key := os.Getenv("ANTHROPIC_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("ANTHROPIC_API_KEY not set")
+		if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
+			return NewAnthropicProvider(key)
 		}
-		return NewAnthropicProvider(key), nil
 	case "google":
-		key := os.Getenv("GOOGLE_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("GOOGLE_API_KEY not set")
+		if key := os.Getenv("GOOGLE_API_KEY"); key != "" {
+			return NewGoogleProvider(key)
 		}
-		return NewGoogleProvider(key), nil
 	case "ollama":
 		host := os.Getenv("OLLAMA_HOST")
 		if host == "" {
 			host = "http://localhost:11434"
 		}
-		return NewOllamaProvider(host), nil
+		return NewOllamaProvider(host)
+	}
+	return nil
+}
+
+// applyModelOverrides sets model overrides on a provider from a config map.
+func applyModelOverrides(provider LLMProvider, models map[string]string) {
+	if models == nil {
+		return
+	}
+	large := models["large"]
+	small := models["small"]
+
+	switch p := provider.(type) {
+	case *GoogleProvider:
+		if large != "" {
+			p.SetModel(large) // sets both large+small + active
+		}
+		if small != "" {
+			p.models[ModelSmall] = small
+		}
+	case *OpenAICompatProvider:
+		if large != "" {
+			p.models[ModelLarge] = large
+		}
+		if small != "" {
+			p.models[ModelSmall] = small
+		}
+	case *AnthropicProvider:
+		if large != "" {
+			p.models[ModelLarge] = large
+		}
+		if small != "" {
+			p.models[ModelSmall] = small
+		}
+	}
+}
+
+// selectProvider picks the best available LLM provider.
+// Priority: CORE_PROVIDER env → config.json provider → auto-detect from API keys.
+// Model overrides: CORE_MODEL_LARGE/CORE_MODEL_SMALL env → config.json provider.models → provider defaults.
+func selectProvider(cfg *Config) (LLMProvider, error) {
+	var provider LLMProvider
+
+	// 1. Explicit env var (highest priority)
+	if explicit := os.Getenv("CORE_PROVIDER"); explicit != "" {
+		provider = createProviderByName(explicit)
+		if provider == nil {
+			return nil, fmt.Errorf("provider %q requested via CORE_PROVIDER but required API key not set", explicit)
+		}
 	}
 
-	// Auto-detect: check env vars in priority order
-	if key := os.Getenv("FIREWORKS_API_KEY"); key != "" {
-		return NewFireworksProvider(key), nil
-	}
-	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-		return NewOpenAIProvider(key), nil
-	}
-	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
-		return NewAnthropicProvider(key), nil
-	}
-	if key := os.Getenv("GOOGLE_API_KEY"); key != "" {
-		return NewGoogleProvider(key), nil
-	}
-	if host := os.Getenv("OLLAMA_HOST"); host != "" {
-		return NewOllamaProvider(host), nil
+	// 2. Config file
+	if provider == nil {
+		if pc := cfg.GetProvider(); pc != nil && pc.Name != "" {
+			provider = createProviderByName(pc.Name)
+			// Apply config model overrides
+			if provider != nil {
+				applyModelOverrides(provider, pc.Models)
+			}
+		}
 	}
 
-	return nil, fmt.Errorf("no LLM provider configured — set FIREWORKS_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, or OLLAMA_HOST")
+	// 3. Auto-detect from API keys
+	if provider == nil {
+		for _, name := range []string{"fireworks", "openai", "anthropic", "google", "ollama"} {
+			if p := createProviderByName(name); p != nil {
+				provider = p
+				break
+			}
+		}
+	}
+
+	if provider == nil {
+		return nil, fmt.Errorf("no LLM provider configured — set FIREWORKS_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, or OLLAMA_HOST")
+	}
+
+	// 4. Env model overrides (highest priority for models)
+	envModels := map[string]string{}
+	if v := os.Getenv("CORE_MODEL_LARGE"); v != "" {
+		envModels["large"] = v
+	}
+	if v := os.Getenv("CORE_MODEL_SMALL"); v != "" {
+		envModels["small"] = v
+	}
+	if len(envModels) > 0 {
+		applyModelOverrides(provider, envModels)
+	}
+
+	return provider, nil
 }
 
 // availableProviders returns all providers that have credentials configured.

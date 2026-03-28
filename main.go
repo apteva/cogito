@@ -8,9 +8,46 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// ContentPart represents a multimodal content block (OpenAI Chat Completions format).
+type ContentPart struct {
+	Type       string      `json:"type"`                  // "text", "image_url", "input_audio"
+	Text       string      `json:"text,omitempty"`        // type=text
+	ImageURL   *ImageURL   `json:"image_url,omitempty"`   // type=image_url
+	InputAudio *InputAudio `json:"input_audio,omitempty"` // type=input_audio
+}
+
+type ImageURL struct {
+	URL    string `json:"url"`              // https:// or data:image/...;base64,...
+	Detail string `json:"detail,omitempty"` // "low", "high", "auto"
+}
+
+type InputAudio struct {
+	Data   string `json:"data"`   // base64
+	Format string `json:"format"` // "wav", "mp3"
+}
+
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string        `json:"role"`
+	Content string        `json:"content"`
+	Parts   []ContentPart `json:"parts,omitempty"` // when set, providers use this instead of Content
+}
+
+// TextContent returns the text content of a message, whether plain Content or from Parts.
+func (m Message) TextContent() string {
+	if len(m.Parts) == 0 {
+		return m.Content
+	}
+	for _, p := range m.Parts {
+		if p.Type == "text" {
+			return p.Text
+		}
+	}
+	return m.Content
+}
+
+// HasParts returns true if this message has multimodal content.
+func (m Message) HasParts() bool {
+	return len(m.Parts) > 0
 }
 
 type Request struct {
@@ -47,12 +84,15 @@ func main() {
 	godotenv.Load()
 	initLogger()
 
-	provider, err := selectProvider()
+	cfg := NewConfig()
+
+	provider, err := selectProvider(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "LLM provider: %s\n", provider.Name())
+	models := provider.Models()
+	fmt.Fprintf(os.Stderr, "LLM provider: %s (large=%s, small=%s)\n", provider.Name(), models[ModelLarge], models[ModelSmall])
 
 	// Keep apiKey for backward compat (memory embeddings use it)
 	apiKey := os.Getenv("FIREWORKS_API_KEY")
@@ -60,7 +100,7 @@ func main() {
 		apiKey = os.Getenv("OPENAI_API_KEY")
 	}
 
-	thinker := NewThinker(apiKey, provider)
+	thinker := NewThinker(apiKey, provider, cfg)
 	go thinker.Run()
 
 	apiPort := os.Getenv("API_PORT")

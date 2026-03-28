@@ -22,6 +22,7 @@ func startAPI(thinker *Thinker, addr string) error {
 	mux.HandleFunc("/pause", api.pause)
 	mux.HandleFunc("/event", api.postEvent)
 	mux.HandleFunc("/config", api.config)
+	mux.HandleFunc("/approve", api.approve)
 	mux.Handle("/", http.FileServer(http.Dir("web")))
 	return http.ListenAndServe(addr, mux)
 }
@@ -32,14 +33,27 @@ func (a *APIServer) health(w http.ResponseWriter, r *http.Request) {
 
 func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 	elapsed := time.Since(a.startTime)
+	// Check for pending approval
+	a.thinker.pendingMu.Lock()
+	var pending *ToolCallData
+	if a.thinker.pendingTool != nil {
+		pending = &ToolCallData{
+			Name: a.thinker.pendingTool.Name,
+			Args: toolArgsSummary(*a.thinker.pendingTool),
+		}
+	}
+	a.thinker.pendingMu.Unlock()
+
 	writeJSON(w, map[string]any{
-		"uptime_seconds": int(elapsed.Seconds()),
-		"iteration":      a.thinker.iteration,
-		"rate":           formatSleep(a.thinker.agentSleep),
-		"model":          a.thinker.model.String(),
-		"threads":        a.thinker.threads.Count() + 1, // +1 for main
-		"memories":       a.thinker.memory.Count(),
-		"paused":         a.thinker.paused,
+		"uptime_seconds":   int(elapsed.Seconds()),
+		"iteration":        a.thinker.iteration,
+		"rate":             formatSleep(a.thinker.agentSleep),
+		"model":            a.thinker.model.String(),
+		"threads":          a.thinker.threads.Count() + 1, // +1 for main
+		"memories":         a.thinker.memory.Count(),
+		"paused":           a.thinker.paused,
+		"mode":             a.thinker.config.GetMode(),
+		"pending_approval": pending,
 	})
 }
 
@@ -131,48 +145,165 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Message  string `json:"message"`
-		ThreadID string `json:"thread_id"`
+		Message  json.RawMessage `json:"message"`
+		ThreadID string          `json:"thread_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	if body.Message == "" {
+
+	// Parse message: string or []ContentPart
+	var text string
+	var parts []ContentPart
+
+	if err := json.Unmarshal(body.Message, &text); err != nil {
+		// Try array of content parts
+		if err := json.Unmarshal(body.Message, &parts); err != nil {
+			http.Error(w, "message must be a string or array of content parts", http.StatusBadRequest)
+			return
+		}
+		// Extract text from parts for the event bus
+		for _, p := range parts {
+			if p.Type == "text" {
+				text = p.Text
+				break
+			}
+		}
+	}
+
+	if text == "" && len(parts) == 0 {
 		http.Error(w, "message required", http.StatusBadRequest)
 		return
 	}
 
-	if body.ThreadID != "" && body.ThreadID != "main" {
-		// Route to specific thread via EventBus
-		a.thinker.bus.Publish(Event{Type: EventInbox, To: body.ThreadID, Text: body.Message})
-		writeJSON(w, map[string]string{"status": "injected", "thread_id": body.ThreadID})
+	// If multimodal, store parts for next thinking iteration
+	if len(parts) > 0 {
+		a.thinker.InjectWithParts(text, parts)
+	} else if body.ThreadID != "" && body.ThreadID != "main" {
+		a.thinker.bus.Publish(Event{Type: EventInbox, To: body.ThreadID, Text: text})
 	} else {
-		a.thinker.InjectConsole(body.Message)
-		writeJSON(w, map[string]string{"status": "injected", "thread_id": "main"})
+		a.thinker.InjectConsole(text)
 	}
+
+	threadID := body.ThreadID
+	if threadID == "" {
+		threadID = "main"
+	}
+	writeJSON(w, map[string]string{"status": "injected", "thread_id": threadID})
 }
 
 func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, map[string]string{
-			"directive": a.thinker.config.GetDirective(),
+		// Build live provider info
+		var providerInfo map[string]any
+		if a.thinker.provider != nil {
+			models := a.thinker.provider.Models()
+			providerInfo = map[string]any{
+				"name": a.thinker.provider.Name(),
+				"models": map[string]string{
+					"large": models[ModelLarge],
+					"small": models[ModelSmall],
+				},
+			}
+		}
+		writeJSON(w, map[string]any{
+			"directive":    a.thinker.config.GetDirective(),
+			"mode":         a.thinker.config.GetMode(),
+			"auto_approve": a.thinker.config.AutoApprove,
+			"provider":     providerInfo,
 		})
 	case http.MethodPut:
 		var body struct {
-			Directive string `json:"directive"`
+			Directive   string          `json:"directive,omitempty"`
+			Mode        RunMode         `json:"mode,omitempty"`
+			AutoApprove []string        `json:"auto_approve,omitempty"`
+			Provider    *ProviderConfig `json:"provider,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
-		a.thinker.config.SetDirective(body.Directive)
-		a.thinker.ReloadDirective()
+		if body.Directive != "" {
+			a.thinker.config.SetDirective(body.Directive)
+			a.thinker.ReloadDirective()
+		}
+		if body.Mode == ModeAutonomous || body.Mode == ModeSupervised {
+			a.thinker.config.SetMode(body.Mode)
+			if a.thinker.telemetry != nil {
+				a.thinker.telemetry.Emit("mode.changed", "main", map[string]string{"mode": string(body.Mode)})
+			}
+		}
+		if body.AutoApprove != nil {
+			a.thinker.config.mu.Lock()
+			a.thinker.config.AutoApprove = body.AutoApprove
+			a.thinker.config.mu.Unlock()
+			a.thinker.config.Save()
+		}
+		if body.Provider != nil {
+			// Hot-swap provider if name changed
+			if body.Provider.Name != "" {
+				newProvider := createProviderByName(body.Provider.Name)
+				if newProvider != nil {
+					if body.Provider.Models != nil {
+						applyModelOverrides(newProvider, body.Provider.Models)
+					}
+					a.thinker.provider = newProvider
+					a.thinker.config.SetProvider(body.Provider)
+				} else {
+					http.Error(w, fmt.Sprintf("provider %q not available (missing API key?)", body.Provider.Name), http.StatusBadRequest)
+					return
+				}
+			} else if body.Provider.Models != nil {
+				// Just update models on current provider
+				applyModelOverrides(a.thinker.provider, body.Provider.Models)
+				// Merge into config
+				for tier, modelID := range body.Provider.Models {
+					a.thinker.config.SetProviderModel(tier, modelID)
+				}
+			}
+		}
 		writeJSON(w, map[string]string{"status": "updated"})
 	default:
 		http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
 	}
+}
+
+func (a *APIServer) approve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Approved bool `json:"approved"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Check there's actually a pending tool
+	a.thinker.pendingMu.Lock()
+	hasPending := a.thinker.pendingTool != nil
+	a.thinker.pendingMu.Unlock()
+
+	if !hasPending {
+		http.Error(w, "no pending approval", http.StatusConflict)
+		return
+	}
+
+	// Non-blocking send
+	select {
+	case a.thinker.approvalCh <- body.Approved:
+	default:
+	}
+
+	action := "rejected"
+	if body.Approved {
+		action = "approved"
+	}
+	writeJSON(w, map[string]string{"status": action})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

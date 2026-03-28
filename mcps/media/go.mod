@@ -1,3 +1,3 @@
-module github.com/apteva/cogito/mcps/media
+module github.com/apteva/core/mcps/media
 
 go 1.23

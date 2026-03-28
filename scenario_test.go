@@ -186,7 +186,7 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 		path:   filepath.Join(tmpDir, "memory.jsonl"),
 	}
 
-	provider, err := selectProvider()
+	provider, err := selectProvider(NewConfig())
 	if err != nil {
 		t.Fatalf("no LLM provider: %v", err)
 	}

@@ -1,6 +1,5 @@
 .env
-cogito
-apteva-core
+core
 backplane
 thinking
 mcp-pushover-server
@@ -10,11 +9,12 @@ workspace/
 .claude/
 debug.log
 stdout.log
-cogito.log
-apteva-core.log
+core.log
 *.exe
 mcps/*/mcp-*
 mcps/media/media
 mcps/storage/storage
 mcps/chat/mcp-chat
 mcps/inventory/mcp-inventory
+apteva-core
+apteva-core.log

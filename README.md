@@ -1,8 +1,6 @@
-# Cogito
+# Core
 
 A continuous thinking engine that runs autonomous AI agent teams. Agents coordinate through an event bus, use external tool servers, and manage themselves via natural language directives.
-
-*Cogito ergo sum* — I think, therefore I am.
 
 ## Architecture
 
@@ -31,10 +29,10 @@ A continuous thinking engine that runs autonomous AI agent teams. Agents coordin
 echo "FIREWORKS_API_KEY=your-key" > .env
 
 # Build and run with TUI
-go build -o cogito . && ./cogito
+go build -o core . && ./core
 
 # Or run headless (API only)
-./cogito --headless
+./core --headless
 ```
 
 ## API

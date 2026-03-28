@@ -27,10 +27,33 @@ func (p *OpenAICompatProvider) Name() string                          { return p
 func (p *OpenAICompatProvider) Models() map[ModelTier]string          { return p.models }
 func (p *OpenAICompatProvider) CostPer1M() (float64, float64, float64) { return p.inputCost, p.cachedCost, p.outputCost }
 
+// openaiMessage serializes a Message for the OpenAI API.
+// When Parts is set, content becomes the array (native format).
+type openaiMessage struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"` // string or []ContentPart
+}
+
+func toOpenAIMessages(messages []Message) []openaiMessage {
+	out := make([]openaiMessage, len(messages))
+	for i, m := range messages {
+		if m.HasParts() {
+			out[i] = openaiMessage{Role: m.Role, Content: m.Parts}
+		} else {
+			out[i] = openaiMessage{Role: m.Role, Content: m.Content}
+		}
+	}
+	return out
+}
+
 func (p *OpenAICompatProvider) Chat(messages []Message, model string, onChunk func(string)) (string, TokenUsage, error) {
-	reqBody := Request{
+	reqBody := struct {
+		Model    string          `json:"model"`
+		Messages []openaiMessage `json:"messages"`
+		Stream   bool            `json:"stream"`
+	}{
 		Model:    model,
-		Messages: messages,
+		Messages: toOpenAIMessages(messages),
 		Stream:   true,
 	}
 

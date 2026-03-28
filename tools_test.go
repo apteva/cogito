@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseToolCalls_Single(t *testing.T) {
@@ -150,6 +151,298 @@ func TestCollapseWhitespace_Empty(t *testing.T) {
 	result := collapseWhitespace("")
 	if result != "" {
 		t.Errorf("expected empty, got %q", result)
+	}
+}
+
+// --- Config / Supervised Mode Tests ---
+
+func TestConfig_DefaultMode(t *testing.T) {
+	c := &Config{}
+	if c.GetMode() != ModeAutonomous {
+		t.Errorf("expected autonomous, got %s", c.GetMode())
+	}
+}
+
+func TestConfig_SetMode(t *testing.T) {
+	c := &Config{path: "/dev/null"}
+	c.SetMode(ModeSupervised)
+	if c.GetMode() != ModeSupervised {
+		t.Errorf("expected supervised, got %s", c.GetMode())
+	}
+	c.SetMode(ModeAutonomous)
+	if c.GetMode() != ModeAutonomous {
+		t.Errorf("expected autonomous, got %s", c.GetMode())
+	}
+}
+
+func TestConfig_IsAutoApproved_Defaults(t *testing.T) {
+	c := &Config{}
+	// Default auto-approve list
+	if !c.IsAutoApproved("think") {
+		t.Error("expected 'think' to be auto-approved")
+	}
+	if !c.IsAutoApproved("done") {
+		t.Error("expected 'done' to be auto-approved")
+	}
+	if !c.IsAutoApproved("pace") {
+		t.Error("expected 'pace' to be auto-approved")
+	}
+	if !c.IsAutoApproved("send") {
+		t.Error("expected 'send' to be auto-approved")
+	}
+	if !c.IsAutoApproved("recall") {
+		t.Error("expected 'recall' to be auto-approved")
+	}
+	if c.IsAutoApproved("web") {
+		t.Error("expected 'web' to NOT be auto-approved by default")
+	}
+	if c.IsAutoApproved("spawn") {
+		t.Error("expected 'spawn' to NOT be auto-approved by default")
+	}
+}
+
+func TestConfig_IsAutoApproved_Custom(t *testing.T) {
+	c := &Config{AutoApprove: []string{"web", "think"}}
+	if !c.IsAutoApproved("web") {
+		t.Error("expected 'web' to be auto-approved")
+	}
+	if !c.IsAutoApproved("think") {
+		t.Error("expected 'think' to be auto-approved")
+	}
+	if c.IsAutoApproved("spawn") {
+		t.Error("expected 'spawn' to NOT be auto-approved")
+	}
+}
+
+func TestToolArgsSummary(t *testing.T) {
+	call := toolCall{Name: "web", Args: map[string]string{"url": "https://example.com"}}
+	summary := toolArgsSummary(call)
+	if summary != "url=https://example.com" {
+		t.Errorf("unexpected summary: %q", summary)
+	}
+}
+
+func TestToolArgsSummary_Truncated(t *testing.T) {
+	longVal := strings.Repeat("x", 100)
+	call := toolCall{Name: "reply", Args: map[string]string{"message": longVal}}
+	summary := toolArgsSummary(call)
+	if !strings.Contains(summary, "...") {
+		t.Error("expected truncation in summary")
+	}
+}
+
+func TestWaitForApproval_Approved(t *testing.T) {
+	bus := NewEventBus()
+	cfg := &Config{Mode: ModeSupervised, path: "/dev/null"}
+	thinker := &Thinker{
+		bus:        bus,
+		sub:        bus.Subscribe("main", 100),
+		config:     cfg,
+		quit:       make(chan struct{}),
+		approvalCh: make(chan bool, 1),
+		telemetry:  NewTelemetry(),
+		threadID:   "main",
+	}
+
+	call := toolCall{Name: "web", Args: map[string]string{"url": "https://example.com"}}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		thinker.approvalCh <- true
+	}()
+
+	if !waitForApproval(thinker, call) {
+		t.Error("expected approval to succeed")
+	}
+
+	thinker.pendingMu.Lock()
+	if thinker.pendingTool != nil {
+		t.Error("expected pendingTool to be cleared after approval")
+	}
+	thinker.pendingMu.Unlock()
+}
+
+func TestWaitForApproval_Rejected(t *testing.T) {
+	bus := NewEventBus()
+	cfg := &Config{Mode: ModeSupervised, path: "/dev/null"}
+	thinker := &Thinker{
+		bus:        bus,
+		sub:        bus.Subscribe("main", 100),
+		config:     cfg,
+		quit:       make(chan struct{}),
+		approvalCh: make(chan bool, 1),
+		telemetry:  NewTelemetry(),
+		threadID:   "main",
+	}
+
+	call := toolCall{Name: "send_email", Args: map[string]string{"to": "user@test.com"}}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		thinker.approvalCh <- false
+	}()
+
+	if waitForApproval(thinker, call) {
+		t.Error("expected approval to fail (rejected)")
+	}
+}
+
+func TestWaitForApproval_AutoApproved(t *testing.T) {
+	cfg := &Config{Mode: ModeSupervised, path: "/dev/null"}
+	thinker := &Thinker{
+		config:     cfg,
+		quit:       make(chan struct{}),
+		approvalCh: make(chan bool, 1),
+		telemetry:  NewTelemetry(),
+		threadID:   "main",
+	}
+
+	// "think" is in DefaultAutoApprove — should return true immediately
+	call := toolCall{Name: "think", Args: map[string]string{"thought": "testing"}}
+
+	done := make(chan struct{})
+	go func() {
+		if !waitForApproval(thinker, call) {
+			t.Error("expected auto-approved tool to pass")
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// good — did not block
+	case <-time.After(500 * time.Millisecond):
+		t.Error("waitForApproval blocked on auto-approved tool")
+	}
+}
+
+func TestWaitForApproval_AutonomousMode(t *testing.T) {
+	cfg := &Config{Mode: ModeAutonomous, path: "/dev/null"}
+	thinker := &Thinker{
+		config:     cfg,
+		quit:       make(chan struct{}),
+		approvalCh: make(chan bool, 1),
+		threadID:   "main",
+	}
+
+	call := toolCall{Name: "spawn", Args: map[string]string{"id": "worker"}}
+
+	// Should return true immediately in autonomous mode
+	if !waitForApproval(thinker, call) {
+		t.Error("expected autonomous mode to pass without blocking")
+	}
+}
+
+// --- Multimodal Tests ---
+
+func TestMessage_TextContent_Plain(t *testing.T) {
+	m := Message{Role: "user", Content: "hello"}
+	if m.TextContent() != "hello" {
+		t.Errorf("expected 'hello', got %q", m.TextContent())
+	}
+	if m.HasParts() {
+		t.Error("expected no parts")
+	}
+}
+
+func TestMessage_TextContent_WithParts(t *testing.T) {
+	m := Message{
+		Role:    "user",
+		Content: "fallback",
+		Parts: []ContentPart{
+			{Type: "text", Text: "describe this"},
+			{Type: "image_url", ImageURL: &ImageURL{URL: "https://example.com/cat.jpg"}},
+		},
+	}
+	if m.TextContent() != "describe this" {
+		t.Errorf("expected 'describe this', got %q", m.TextContent())
+	}
+	if !m.HasParts() {
+		t.Error("expected HasParts to be true")
+	}
+}
+
+func TestMessage_TextContent_PartsNoText(t *testing.T) {
+	m := Message{
+		Role:    "user",
+		Content: "fallback",
+		Parts:   []ContentPart{{Type: "image_url", ImageURL: &ImageURL{URL: "https://example.com/cat.jpg"}}},
+	}
+	// Falls back to Content when no text part
+	if m.TextContent() != "fallback" {
+		t.Errorf("expected 'fallback', got %q", m.TextContent())
+	}
+}
+
+func TestDetectImageParts(t *testing.T) {
+	parts := detectImageParts("describe this https://example.com/photo.jpg please")
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(parts))
+	}
+	if parts[0].Type != "text" || parts[0].Text != "describe this  please" {
+		t.Errorf("unexpected text part: %+v", parts[0])
+	}
+	if parts[1].Type != "image_url" || parts[1].ImageURL.URL != "https://example.com/photo.jpg" {
+		t.Errorf("unexpected image part: %+v", parts[1])
+	}
+}
+
+func TestDetectImageParts_NoImages(t *testing.T) {
+	parts := detectImageParts("just normal text here")
+	if parts != nil {
+		t.Errorf("expected nil, got %d parts", len(parts))
+	}
+}
+
+func TestDetectImageParts_MultipleImages(t *testing.T) {
+	parts := detectImageParts("compare https://a.com/1.png and https://b.com/2.webp")
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 parts (text + 2 images), got %d", len(parts))
+	}
+	if parts[0].Type != "text" {
+		t.Error("first part should be text")
+	}
+	if parts[1].Type != "image_url" || parts[2].Type != "image_url" {
+		t.Error("second and third parts should be image_url")
+	}
+}
+
+func TestDetectImageParts_OnlyImage(t *testing.T) {
+	parts := detectImageParts("https://example.com/photo.png")
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	if parts[0].Type != "image_url" {
+		t.Errorf("expected image_url, got %s", parts[0].Type)
+	}
+}
+
+func TestExecuteTool_Autonomous_NoBlock(t *testing.T) {
+	bus := NewEventBus()
+	cfg := &Config{Mode: ModeAutonomous, path: "/dev/null"}
+	thinker := &Thinker{
+		bus:        bus,
+		sub:        bus.Subscribe("main", 100),
+		config:     cfg,
+		quit:       make(chan struct{}),
+		approvalCh: make(chan bool, 1),
+		telemetry:  NewTelemetry(),
+		threadID:   "main",
+	}
+
+	call := toolCall{Name: "web", Args: map[string]string{"url": "https://example.com"}}
+
+	done := make(chan struct{})
+	go func() {
+		executeTool(thinker, call)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// good — autonomous mode should not block
+	case <-time.After(500 * time.Millisecond):
+		t.Error("executeTool blocked in autonomous mode")
 	}
 }
 
