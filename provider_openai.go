@@ -34,11 +34,44 @@ type openaiMessage struct {
 	Content any    `json:"content"` // string or []ContentPart
 }
 
+// convertAudioURLParts converts audio_url parts to input_audio (OpenAI format).
+func convertAudioURLParts(parts []ContentPart) []ContentPart {
+	var out []ContentPart
+	for _, p := range parts {
+		if p.Type == "audio_url" && p.AudioURL != nil {
+			if strings.HasPrefix(p.AudioURL.URL, "data:") {
+				data, mime := parseDataURI(p.AudioURL.URL)
+				format := "wav"
+				if strings.Contains(mime, "mp3") || strings.Contains(mime, "mpeg") {
+					format = "mp3"
+				}
+				out = append(out, ContentPart{Type: "input_audio", InputAudio: &InputAudio{Data: data, Format: format}})
+			} else {
+				// Fetch and convert
+				b64, mime, err := fetchMediaAsBase64(p.AudioURL.URL)
+				if err != nil {
+					logMsg("OPENAI", fmt.Sprintf("audio fetch error: %v", err))
+					out = append(out, ContentPart{Type: "text", Text: fmt.Sprintf("[audio fetch failed: %s]", p.AudioURL.URL)})
+				} else {
+					format := "wav"
+					if strings.Contains(mime, "mp3") || strings.Contains(mime, "mpeg") {
+						format = "mp3"
+					}
+					out = append(out, ContentPart{Type: "input_audio", InputAudio: &InputAudio{Data: b64, Format: format}})
+				}
+			}
+		} else {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func toOpenAIMessages(messages []Message) []openaiMessage {
 	out := make([]openaiMessage, len(messages))
 	for i, m := range messages {
 		if m.HasParts() {
-			out[i] = openaiMessage{Role: m.Role, Content: m.Parts}
+			out[i] = openaiMessage{Role: m.Role, Content: convertAudioURLParts(m.Parts)}
 		} else {
 			out[i] = openaiMessage{Role: m.Role, Content: m.Content}
 		}

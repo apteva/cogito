@@ -659,13 +659,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					case inputChat:
 						if parts := detectImageParts(val); len(parts) > 0 {
 							m.thinker.InjectWithParts(val, parts)
+							m.chat = append(m.chat, chatMessage{isUser: true, text: val + " " + mediaLabel(parts), threadID: m.userID})
 						} else {
 							m.thinker.InjectUserMessage(m.userID, val)
+							m.chat = append(m.chat, chatMessage{isUser: true, text: val, threadID: m.userID})
 						}
-						m.chat = append(m.chat, chatMessage{isUser: true, text: val, threadID: m.userID})
 					case inputConsole:
-						m.thinker.InjectConsole(val)
-						m.consoleHistory = append(m.consoleHistory, val)
+						if parts := detectImageParts(val); len(parts) > 0 {
+							m.thinker.InjectWithParts(val, parts)
+							m.consoleHistory = append(m.consoleHistory, val+" "+mediaLabel(parts))
+						} else {
+							m.thinker.InjectConsole(val)
+							m.consoleHistory = append(m.consoleHistory, val)
+						}
 					}
 				}
 				m.input.Reset()
@@ -2004,17 +2010,46 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
-// imageURLRe matches common image URLs in text.
-var imageURLRe = regexp.MustCompile(`https?://\S+\.(?:png|jpg|jpeg|gif|webp)(?:\?\S*)?`)
+// mediaLabel returns a display label like "[+2 img, +1 audio]" for media parts.
+func mediaLabel(parts []ContentPart) string {
+	imgs, auds := 0, 0
+	for _, p := range parts {
+		switch p.Type {
+		case "image_url":
+			imgs++
+		case "audio_url", "input_audio":
+			auds++
+		}
+	}
+	if imgs > 0 && auds > 0 {
+		return fmt.Sprintf("[+%d img, +%d audio]", imgs, auds)
+	}
+	if imgs > 0 {
+		return fmt.Sprintf("[+%d img]", imgs)
+	}
+	if auds > 0 {
+		return fmt.Sprintf("[+%d audio]", auds)
+	}
+	return ""
+}
 
-// detectImageParts scans text for image URLs and returns ContentParts if found.
-// Returns nil if no image URLs detected.
+// mediaURLRe matches image and audio URLs in text.
+var mediaURLRe = regexp.MustCompile(`https?://\S+\.(?:png|jpg|jpeg|gif|webp|mp3|wav|aac|ogg|flac|aiff|m4a)(?:\?\S*)?`)
+
+// audioExts maps file extensions to their media type.
+var audioExts = map[string]bool{
+	"mp3": true, "wav": true, "aac": true, "ogg": true,
+	"flac": true, "aiff": true, "m4a": true,
+}
+
+// detectImageParts scans text for image and audio URLs and returns ContentParts if found.
+// Returns nil if no media URLs detected.
 func detectImageParts(text string) []ContentPart {
-	matches := imageURLRe.FindAllString(text, -1)
+	matches := mediaURLRe.FindAllString(text, -1)
 	if len(matches) == 0 {
 		return nil
 	}
-	// Build parts: text first, then images
+	// Build parts: text first, then media
 	cleanText := text
 	for _, url := range matches {
 		cleanText = strings.Replace(cleanText, url, "", 1)
@@ -2026,7 +2061,20 @@ func detectImageParts(text string) []ContentPart {
 		parts = append(parts, ContentPart{Type: "text", Text: cleanText})
 	}
 	for _, url := range matches {
-		parts = append(parts, ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: url}})
+		// Detect extension to classify as image or audio
+		ext := strings.ToLower(url)
+		if idx := strings.LastIndex(ext, "."); idx >= 0 {
+			ext = ext[idx+1:]
+		}
+		// Strip query params from extension
+		if idx := strings.Index(ext, "?"); idx >= 0 {
+			ext = ext[:idx]
+		}
+		if audioExts[ext] {
+			parts = append(parts, ContentPart{Type: "audio_url", AudioURL: &AudioURL{URL: url}})
+		} else {
+			parts = append(parts, ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: url}})
+		}
 	}
 	return parts
 }

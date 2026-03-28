@@ -3,12 +3,17 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 )
+
+func base64Encode(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
+}
 
 // GoogleModel holds metadata for a Gemini model.
 type GoogleModel struct {
@@ -298,6 +303,70 @@ func (p *GoogleProvider) Chat(messages []Message, model string, onChunk func(str
 	return response, usage, nil
 }
 
+// audioMimeTypes maps file extensions to MIME types for audio.
+var audioMimeTypes = map[string]string{
+	"mp3": "audio/mp3", "wav": "audio/wav", "aac": "audio/aac",
+	"ogg": "audio/ogg", "flac": "audio/flac", "aiff": "audio/aiff",
+	"m4a": "audio/mp4",
+}
+
+// imageMimeTypes maps file extensions to MIME types for images.
+var imageMimeTypes = map[string]string{
+	"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+	"gif": "image/gif", "webp": "image/webp",
+}
+
+// fetchMediaAsBase64 downloads a URL and returns (base64data, mimeType, error).
+func fetchMediaAsBase64(url string) (string, string, error) {
+	logMsg("GEMINI", fmt.Sprintf("fetching media: %s", url))
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", "", fmt.Errorf("fetch failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("fetch failed: HTTP %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024)) // 20MB max
+	if err != nil {
+		return "", "", fmt.Errorf("read failed: %w", err)
+	}
+
+	// Detect MIME from Content-Type header or URL extension
+	mime := resp.Header.Get("Content-Type")
+	if mime == "" || mime == "application/octet-stream" {
+		ext := ""
+		if idx := strings.LastIndex(url, "."); idx >= 0 {
+			ext = strings.ToLower(url[idx+1:])
+			if qIdx := strings.Index(ext, "?"); qIdx >= 0 {
+				ext = ext[:qIdx]
+			}
+		}
+		if m, ok := audioMimeTypes[ext]; ok {
+			mime = m
+		} else if m, ok := imageMimeTypes[ext]; ok {
+			mime = m
+		}
+	}
+
+	encoded := base64Encode(data)
+	logMsg("GEMINI", fmt.Sprintf("fetched media: %d bytes, mime=%s", len(data), mime))
+	return encoded, mime, nil
+}
+
+// parseDataURI parses "data:mime;base64,DATA" and returns (data, mimeType).
+func parseDataURI(uri string) (string, string) {
+	segments := strings.SplitN(uri, ",", 2)
+	mimeType := strings.TrimPrefix(strings.TrimSuffix(segments[0], ";base64"), "data:")
+	data := ""
+	if len(segments) > 1 {
+		data = segments[1]
+	}
+	return data, mimeType
+}
+
 // toGeminiParts converts our ContentParts to Gemini parts.
 func toGeminiParts(parts []ContentPart) []geminiPart {
 	var out []geminiPart
@@ -306,25 +375,46 @@ func toGeminiParts(parts []ContentPart) []geminiPart {
 		case "text":
 			out = append(out, geminiPart{Text: p.Text})
 		case "image_url":
-			if p.ImageURL != nil && strings.HasPrefix(p.ImageURL.URL, "data:") {
-				// data:image/png;base64,iVBOR... → extract mime and data
-				segments := strings.SplitN(p.ImageURL.URL, ",", 2)
-				mimeType := strings.TrimPrefix(strings.TrimSuffix(segments[0], ";base64"), "data:")
-				data := ""
-				if len(segments) > 1 {
-					data = segments[1]
+			if p.ImageURL == nil {
+				continue
+			}
+			if strings.HasPrefix(p.ImageURL.URL, "data:") {
+				data, mime := parseDataURI(p.ImageURL.URL)
+				out = append(out, geminiPart{InlineData: &geminiInline{MimeType: mime, Data: data}})
+			} else {
+				// Fetch URL and encode
+				data, mime, err := fetchMediaAsBase64(p.ImageURL.URL)
+				if err != nil {
+					logMsg("GEMINI", fmt.Sprintf("image fetch error: %v", err))
+					out = append(out, geminiPart{Text: fmt.Sprintf("[image fetch failed: %s]", p.ImageURL.URL)})
+				} else {
+					out = append(out, geminiPart{InlineData: &geminiInline{MimeType: mime, Data: data}})
 				}
-				out = append(out, geminiPart{InlineData: &geminiInline{MimeType: mimeType, Data: data}})
-			} else if p.ImageURL != nil {
-				// URL images — Gemini needs inlineData, so we note it as text
-				// In production, you'd fetch and base64-encode the image
-				out = append(out, geminiPart{Text: fmt.Sprintf("[image: %s]", p.ImageURL.URL)})
+			}
+		case "audio_url":
+			if p.AudioURL == nil {
+				continue
+			}
+			if strings.HasPrefix(p.AudioURL.URL, "data:") {
+				data, mime := parseDataURI(p.AudioURL.URL)
+				out = append(out, geminiPart{InlineData: &geminiInline{MimeType: mime, Data: data}})
+			} else {
+				data, mime, err := fetchMediaAsBase64(p.AudioURL.URL)
+				if err != nil {
+					logMsg("GEMINI", fmt.Sprintf("audio fetch error: %v", err))
+					out = append(out, geminiPart{Text: fmt.Sprintf("[audio fetch failed: %s]", p.AudioURL.URL)})
+				} else {
+					if p.AudioURL.MimeType != "" {
+						mime = p.AudioURL.MimeType
+					}
+					out = append(out, geminiPart{InlineData: &geminiInline{MimeType: mime, Data: data}})
+				}
 			}
 		case "input_audio":
 			if p.InputAudio != nil {
 				mimeType := "audio/wav"
-				if p.InputAudio.Format == "mp3" {
-					mimeType = "audio/mp3"
+				if m, ok := audioMimeTypes[p.InputAudio.Format]; ok {
+					mimeType = m
 				}
 				out = append(out, geminiPart{InlineData: &geminiInline{MimeType: mimeType, Data: p.InputAudio.Data}})
 			}

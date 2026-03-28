@@ -10,10 +10,11 @@ import (
 
 // ContentPart represents a multimodal content block (OpenAI Chat Completions format).
 type ContentPart struct {
-	Type       string      `json:"type"`                  // "text", "image_url", "input_audio"
+	Type       string      `json:"type"`                  // "text", "image_url", "input_audio", "audio_url"
 	Text       string      `json:"text,omitempty"`        // type=text
 	ImageURL   *ImageURL   `json:"image_url,omitempty"`   // type=image_url
 	InputAudio *InputAudio `json:"input_audio,omitempty"` // type=input_audio
+	AudioURL   *AudioURL   `json:"audio_url,omitempty"`   // type=audio_url
 }
 
 type ImageURL struct {
@@ -24,6 +25,11 @@ type ImageURL struct {
 type InputAudio struct {
 	Data   string `json:"data"`   // base64
 	Format string `json:"format"` // "wav", "mp3"
+}
+
+type AudioURL struct {
+	URL      string `json:"url"`                // https:// or data:audio/...;base64,...
+	MimeType string `json:"mime_type,omitempty"` // "audio/mp3", "audio/wav", etc. (auto-detected if empty)
 }
 
 type Message struct {
