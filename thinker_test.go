@@ -191,18 +191,18 @@ func TestInject(t *testing.T) {
 	}
 }
 
-func TestInjectUserMessage(t *testing.T) {
+func TestInjectConsoleMessage(t *testing.T) {
 	bus := NewEventBus()
 	thinker := &Thinker{
 		bus:      bus,
 		sub:      bus.Subscribe("test", 10),
 		threadID: "test",
 	}
-	thinker.InjectUserMessage("marco", "Hello")
+	thinker.InjectConsole("Hello")
 	time.Sleep(10 * time.Millisecond)
 	items := thinker.drainEventTexts()
-	if len(items) != 1 || items[0] != "[user:marco] Hello" {
-		t.Errorf("expected '[user:marco] Hello', got %v", items)
+	if len(items) != 1 || items[0] != "[console] Hello" {
+		t.Errorf("expected '[console] Hello', got %v", items)
 	}
 }
 

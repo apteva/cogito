@@ -34,15 +34,6 @@ When all 3 threads report done, say "ALL TASKS COMPLETE" in your thought.`
 	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, thinker.registry, "", nil)}
 
 	// Set up event filter and tool handler (same as normal startup)
-	thinker.filterEvents = func(events []string) []string {
-		var kept []string
-		for _, ev := range events {
-			if !thinker.threads.Route(ev) {
-				kept = append(kept, ev)
-			}
-		}
-		return kept
-	}
 	thinker.handleTools = mainToolHandler(thinker)
 	thinker.rebuildPrompt = func(toolDocs string) string {
 		return buildSystemPrompt(thinker.config.GetDirective(), thinker.registry, toolDocs, thinker.mcpServers)

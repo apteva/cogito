@@ -13,7 +13,6 @@ const (
 	EventThinkError  = "think_error"  // error during think
 	EventThreadStart = "thread_start" // thread spawned
 	EventThreadDone  = "thread_done"  // thread terminated
-	EventThreadReply = "thread_reply" // thread sent a visible reply
 )
 
 // Event is the single message type flowing through the system.

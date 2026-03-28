@@ -98,31 +98,6 @@ func TestThreadManager_Send(t *testing.T) {
 	}
 }
 
-func TestThreadManager_Route(t *testing.T) {
-	thinker := newTestThinker()
-	defer thinker.Stop()
-
-	thinker.threads.Spawn("marco", "Handle Marco", []string{"web"})
-
-	// Should route to thread
-	routed := thinker.threads.Route("[user:marco] Hello there")
-	if !routed {
-		t.Error("expected event to be routed to thread 'marco'")
-	}
-
-	// Should NOT route (no matching thread)
-	routed = thinker.threads.Route("[user:alice] Hi")
-	if routed {
-		t.Error("expected event NOT to be routed (no thread for alice)")
-	}
-
-	// Should NOT route (not a user event)
-	routed = thinker.threads.Route("[tool:web] some result")
-	if routed {
-		t.Error("expected non-user event NOT to be routed")
-	}
-}
-
 func TestThreadManager_ToolSetAlwaysIncludesBuiltins(t *testing.T) {
 	thinker := newTestThinker()
 	defer thinker.Stop()

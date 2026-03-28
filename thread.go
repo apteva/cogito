@@ -343,26 +343,6 @@ func (tm *ThreadManager) SendWithParts(id, message string, parts []ContentPart) 
 	return true
 }
 
-func (tm *ThreadManager) Route(event string) bool {
-	if strings.HasPrefix(event, "[user:") {
-		idx := strings.Index(event, "]")
-		if idx > 0 {
-			userID := event[6:idx]
-			msg := strings.TrimSpace(event[idx+1:])
-
-			tm.mu.RLock()
-			_, exists := tm.threads[userID]
-			tm.mu.RUnlock()
-
-			if exists {
-				tm.parent.bus.Publish(Event{Type: EventInbox, To: userID, Text: fmt.Sprintf("[user] %s", msg)})
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func (tm *ThreadManager) List() []ThreadInfo {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()

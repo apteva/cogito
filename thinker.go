@@ -51,14 +51,11 @@ THINKING — every thought must contain meaningful text:
 - Keep each thought concise — 1-2 short paragraphs max.
 
 EVENT FORMAT:
-- [user:name] message — a user sent a message. Spawn or route to a thread for them.
+- [console] message — an external event or command. Incorporate into your thinking and take action as needed.
 - [from:id] message — a thread sent you a message via send.
 - [thread:id done] message — a thread finished and terminated.
-- [console] message — a direct system command. Do NOT reply — just incorporate into your thinking.
 
 BEHAVIOR:
-- When you see [user:X], spawn a thread with id="X" so future messages auto-route. The triggering message is auto-forwarded.
-- If the thread already exists, events are auto-routed — you won't see them.
 - Spawn threads for any task — conversations, research, monitoring, timed actions.
 - Additional tools may appear in [available tools] blocks based on context. If you need a tool you don't see, describe what you need.
 
@@ -82,7 +79,7 @@ PACING — critical:
 CRITICAL — never hallucinate events:
 - You ONLY receive events in [Events:] blocks. If there is no [Events:] block, NOTHING happened.
 - NEVER invent, imagine, or assume events that are not explicitly shown to you.
-- NEVER pretend a user sent a message. NEVER fabricate [user:...] events.
+- NEVER fabricate events that did not appear in the [Events:] block.
 - If no events arrived, your ONLY job is to set your pace and wait. Do not take any action.
 - Violating this rule causes real damage — spawning threads or sending notifications based on imagined events wastes resources and confuses users.
 
@@ -229,8 +226,6 @@ type APIEvent struct {
 // consumed contains the events that were consumed this iteration (for context).
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string)
 
-// EventFilter preprocesses drained bus events. Can route/drop events.
-type EventFilter func(events []string) []string
 
 type Thinker struct {
 	apiKey    string
@@ -254,7 +249,6 @@ type Thinker struct {
 
 	// Hooks — set these to customize behavior. nil = defaults.
 	handleTools    ToolHandler
-	filterEvents   EventFilter
 	rebuildPrompt  func(toolDocs string) string // rebuild system prompt with current tool docs
 	onStop         func()
 	toolAllowlist  map[string]bool // nil = all tools allowed (main thread)
@@ -319,15 +313,6 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	go t.registry.EmbedAll(t.memory)
 
 	// Main thread hooks
-	t.filterEvents = func(events []string) []string {
-		var kept []string
-		for _, ev := range events {
-			if !t.threads.Route(ev) {
-				kept = append(kept, ev)
-			}
-		}
-		return kept
-	}
 	t.handleTools = mainToolHandler(t)
 	t.rebuildPrompt = func(toolDocs string) string {
 		return buildSystemPrompt(t.config.GetDirective(), t.registry, toolDocs, t.mcpServers)
@@ -571,10 +556,6 @@ func (t *Thinker) Run() {
 				logMsg("RUN", fmt.Sprintf("[%s]   event[%d]: %s", t.threadID, i, preview))
 			}
 		}
-		if t.filterEvents != nil {
-			consumed = t.filterEvents(consumed)
-		}
-
 		// Only go reactive for non-tool events (user messages, console, thread sends)
 		hasExternalEvent := false
 		for _, ev := range consumed {
@@ -866,11 +847,6 @@ func (t *Thinker) Inject(msg string) {
 // InjectConsole sends a console event to this thinker.
 func (t *Thinker) InjectConsole(msg string) {
 	t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Text: "[console] " + msg})
-}
-
-// InjectUserMessage sends a user message event to this thinker.
-func (t *Thinker) InjectUserMessage(userID, msg string) {
-	t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Text: fmt.Sprintf("[user:%s] %s", userID, msg)})
 }
 
 // InjectWithParts sends a text event with media parts attached.

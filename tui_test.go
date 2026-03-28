@@ -141,8 +141,8 @@ func TestPanelWidths(t *testing.T) {
 }
 
 func TestPanelToggle(t *testing.T) {
-	m := model{panel: panelChat}
-	if m.panel != panelChat {
+	m := model{panel: panelConsole}
+	if m.panel != panelConsole {
 		t.Error("should start in chat mode")
 	}
 	// Simulate 'm' press would toggle to memory
@@ -150,8 +150,8 @@ func TestPanelToggle(t *testing.T) {
 	if m.panel != panelMemory {
 		t.Error("should be in memory mode")
 	}
-	m.panel = panelChat
-	if m.panel != panelChat {
+	m.panel = panelConsole
+	if m.panel != panelConsole {
 		t.Error("should be back in chat mode")
 	}
 }

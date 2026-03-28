@@ -49,22 +49,6 @@ var (
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(lipgloss.Color("62"))
 
-	chatTitleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("212")).
-			Padding(0, 1)
-
-	chatUserStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("170"))
-
-	chatAgentStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("252"))
-
-	chatAgentLabelStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("39"))
-
 	inputLabelStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("212")).
 			Bold(true)
@@ -173,17 +157,11 @@ const (
 	priceOutputPerToken = 3.00 / 1_000_000
 )
 
-type chatMessage struct {
-	isUser   bool
-	text     string
-	threadID string // which thread this belongs to
-}
 
 type panelMode int
 
 const (
-	panelChat      panelMode = iota
-	panelConsole
+	panelConsole panelMode = iota
 	panelMemory
 	panelThreads
 	panelDirective
@@ -195,9 +173,7 @@ const (
 type inputMode int
 
 const (
-	inputChat    inputMode = iota
-	inputConsole
-	inputDirective
+	inputConsole inputMode = iota
 )
 
 // Sidebar menu items
@@ -217,13 +193,12 @@ type sidebarItem struct {
 
 var sidebarItems = []sidebarItem{
 	// View section
-	{label: "Chat", panel: panelChat, section: sidebarView},
+	{label: "Console", panel: panelConsole, section: sidebarView},
 	{label: "Threads", panel: panelThreads, section: sidebarView},
 	{label: "Memory", panel: panelMemory, section: sidebarView},
 	{label: "Tools", panel: panelTools, section: sidebarView},
 	{label: "Bus", panel: panelBus, section: sidebarView},
 	{label: "Telemetry", panel: panelTelemetry, section: sidebarView},
-	{label: "Console", panel: panelConsole, section: sidebarView},
 	// Settings section
 	{label: "Provider", section: sidebarSettings, action: "provider"},
 	{label: "Model", section: sidebarSettings, action: "model"},
@@ -278,7 +253,6 @@ type model struct {
 	inputActive  bool
 	inputMode    inputMode
 
-	chat           []chatMessage
 	consoleHistory []string
 	busLog         []string // recent bus events for display
 	telemetryLog   []string // recent telemetry events for display
@@ -301,8 +275,6 @@ type model struct {
 	activeTab    string
 	tabs         []string
 	threadViews  map[string]*threadView
-
-	userID string
 
 	totalPromptTokens     int
 	totalCachedTokens     int
@@ -344,7 +316,6 @@ func newModel(thinker *Thinker) model {
 		startTime:   time.Now(),
 		input:       ti,
 		memoryCount: thinker.memory.Count(),
-		userID:      "user",
 		activeTab:   "main",
 		tabs:        []string{"main"},
 		threadViews: map[string]*threadView{
@@ -611,7 +582,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				directive := strings.Join(m.directiveLines, "\n")
 				m.thinker.config.SetDirective(directive)
 				m.thinker.ReloadDirective()
-				m.panel = panelChat
+				m.panel = panelConsole
 				return m, nil
 			case "enter":
 				m.directiveLines = append(m.directiveLines[:m.directiveCursor+1],
@@ -655,21 +626,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				val := strings.TrimSpace(m.input.Value())
 				if val != "" {
-					switch m.inputMode {
-					case inputChat:
-						// TODO: re-enable media auto-detection later
-						// if parts := detectImageParts(val); len(parts) > 0 {
-						// 	m.thinker.InjectWithParts(val, parts)
-						// 	m.chat = append(m.chat, chatMessage{isUser: true, text: val + " " + mediaLabel(parts), threadID: m.userID})
-						// } else {
-						m.thinker.InjectUserMessage(m.userID, val)
-						m.chat = append(m.chat, chatMessage{isUser: true, text: val, threadID: m.userID})
-						// }
-					case inputConsole:
-						// TODO: re-enable media auto-detection later
-						m.thinker.InjectConsole(val)
-						m.consoleHistory = append(m.consoleHistory, val)
-					}
+					m.thinker.InjectConsole(val)
+					m.consoleHistory = append(m.consoleHistory, val)
 				}
 				m.input.Reset()
 				m.input.Blur()
@@ -715,17 +673,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "/":
 			cmd := m.openPalette()
 			return m, cmd
-		case "i":
-			m.panel = panelChat
-			m.inputMode = inputChat
-			m.input.Placeholder = "message..."
-			m.inputActive = true
-			m.input.Focus()
-			return m, textinput.Blink
-		case "c":
+		case "i", "c":
 			m.panel = panelConsole
 			m.inputMode = inputConsole
-			m.input.Placeholder = "command..."
+			m.input.Placeholder = "message..."
 			m.inputActive = true
 			m.input.Focus()
 			return m, textinput.Blink
@@ -789,7 +740,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "j", "down":
 			// Sidebar navigation takes priority when in chat panel (default)
 			switch m.panel {
-			case panelChat:
+			case panelConsole:
 				if m.sidebarCursor < len(sidebarItems)-1 {
 					m.sidebarCursor++
 				}
@@ -808,7 +759,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "k", "up":
 			switch m.panel {
-			case panelChat:
+			case panelConsole:
 				if m.sidebarCursor > 0 {
 					m.sidebarCursor--
 				}
@@ -839,9 +790,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scrollOffset = 0
 			return m, nil
 		case "esc":
-			// Return to chat from any sub-panel
-			if m.panel != panelChat {
-				m.panel = panelChat
+			// Return to console from any sub-panel
+			if m.panel != panelConsole {
+				m.panel = panelConsole
 				return m, nil
 			}
 		}
@@ -931,8 +882,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case EventThreadDone:
 			m.removeTab(ev.From)
 			m.threadCount = m.thinker.threads.Count()
-		case EventThreadReply:
-			m.chat = append(m.chat, chatMessage{isUser: false, text: ev.Text, threadID: ev.From})
 		}
 		return m, pollBusEvent(m.busSub)
 
@@ -1091,71 +1040,6 @@ func (m model) renderThoughts(maxWidth int) string {
 	return sb.String()
 }
 
-func (m model) renderChatPanel(width, height int) string {
-	if width <= 0 {
-		return ""
-	}
-	innerWidth := width - 4
-	if innerWidth < 5 {
-		innerWidth = 5
-	}
-
-	title := chatTitleStyle.Render("Chat") + statsStyle.Render(fmt.Sprintf(" [%d thr │ %d mem]", m.threadCount, m.memoryCount))
-
-	var inputArea string
-	if m.inputActive {
-		inputArea = inputLabelStyle.Render("> ") + m.input.View()
-	} else {
-		inputArea = helpStyle.Render("i: chat  c: command  /: menu")
-	}
-
-	listHeight := height - 4
-	if listHeight < 1 {
-		listHeight = 1
-	}
-
-	var lines []string
-	for _, msg := range m.chat {
-		if msg.isUser {
-			wrapped := wrapText(msg.text, innerWidth-6)
-			for i, line := range strings.Split(wrapped, "\n") {
-				if i == 0 {
-					lines = append(lines, chatUserStyle.Render("you: ")+line)
-				} else {
-					lines = append(lines, "     "+line)
-				}
-			}
-		} else {
-			label := "  ↩ "
-			if msg.threadID != "" {
-				label = fmt.Sprintf(" [%s] ", msg.threadID)
-			}
-			wrapped := wrapText(msg.text, innerWidth-len(label)-2)
-			for i, line := range strings.Split(wrapped, "\n") {
-				if i == 0 {
-					lines = append(lines, chatAgentLabelStyle.Render(label)+chatAgentStyle.Render(line))
-				} else {
-					lines = append(lines, strings.Repeat(" ", len(label))+chatAgentStyle.Render(line))
-				}
-			}
-		}
-		lines = append(lines, "")
-	}
-
-	if len(lines) == 0 {
-		lines = append(lines, statsStyle.Render("no messages yet"))
-	}
-
-	if len(lines) > listHeight {
-		lines = lines[len(lines)-listHeight:]
-	}
-	for len(lines) < listHeight {
-		lines = append(lines, "")
-	}
-
-	body := title + "\n" + strings.Join(lines, "\n") + "\n" + inputArea
-	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
-}
 
 func (m model) renderMemoryPanel(width, height int) string {
 	if width <= 0 {
@@ -1845,7 +1729,7 @@ func (m model) View() string {
 		footer = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render(
 			fmt.Sprintf("⚡ APPROVE? %s(%s)  [y] approve  [n] reject", m.pendingApproval.Name, args))
 	} else {
-		footer = helpStyle.Render("space: pause │ i: chat │ c: cmd │ /: menu │ tab: threads │ g/G: top/btm │ q: quit")
+		footer = helpStyle.Render("space: pause │ i: input │ /: menu │ tab: threads │ g/G: top/btm │ q: quit")
 	}
 
 	// header(1) + tab bar(1) + footer(1) = 3 chrome lines + 1 buffer
@@ -1911,7 +1795,7 @@ func (m model) View() string {
 			case panelTelemetry:
 				leftPanel = m.renderTelemetryPanel(leftWidth, viewHeight)
 			default:
-				leftPanel = m.renderChatPanel(leftWidth, viewHeight)
+				leftPanel = m.renderConsolePanel(leftWidth, viewHeight)
 			}
 		}
 		visible = lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", visible)

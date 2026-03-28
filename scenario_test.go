@@ -219,15 +219,6 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 
 	go thinker.registry.EmbedAll(memStore)
 
-	thinker.filterEvents = func(events []string) []string {
-		var kept []string
-		for _, ev := range events {
-			if !thinker.threads.Route(ev) {
-				kept = append(kept, ev)
-			}
-		}
-		return kept
-	}
 	thinker.handleTools = mainToolHandler(thinker)
 	thinker.rebuildPrompt = func(toolDocs string) string {
 		return buildSystemPrompt(cfg.GetDirective(), thinker.registry, toolDocs, thinker.mcpServers)
@@ -416,8 +407,8 @@ func chatContainsAny(replies []chatReply, keywords ...string) bool {
 
 var chatScenario = Scenario{
 	Name: "Chat",
-	Directive: `You are a helpful assistant. Users send messages via [user:name] events.
-When a user writes to you, spawn a thread to handle them. The thread should reply using send_reply with the user's name and your answer.
+	Directive: `You are a helpful assistant. Messages arrive as console events.
+When a message arrives, spawn a thread to handle it. The thread should reply using send_reply and your answer.
 Be concise, accurate, and helpful. Answer questions directly.`,
 	MCPServers: []MCPServerConfig{{
 		Name:    "chat",
@@ -434,7 +425,7 @@ Be concise, accurate, and helpful. Answer questions directly.`,
 				return func(t *testing.T, dir string, th *Thinker) bool {
 					if !sent {
 						sent = true
-						th.InjectUserMessage("alice", "What is the capital of France?")
+						th.InjectConsole("What is the capital of France?")
 					}
 					replies := readChatReplies(dir)
 					t.Logf("  ... replies=%d threads=%v", len(replies), threadIDs(th))
@@ -458,7 +449,7 @@ Be concise, accurate, and helpful. Answer questions directly.`,
 				return func(t *testing.T, dir string, th *Thinker) bool {
 					if !sent {
 						sent = true
-						th.InjectUserMessage("alice", "What is its population?")
+						th.InjectConsole("What is its population?")
 					}
 					replies := readChatReplies(dir)
 					t.Logf("  ... replies=%d", len(replies))
@@ -482,7 +473,7 @@ Be concise, accurate, and helpful. Answer questions directly.`,
 				return func(t *testing.T, dir string, th *Thinker) bool {
 					if !sent {
 						sent = true
-						th.InjectUserMessage("bob", "What is 2 + 2?")
+						th.InjectConsole("What is 2 + 2?")
 					}
 					replies := readChatReplies(dir)
 					hasBob := false

@@ -32,52 +32,13 @@ func newTestThinkerFull() *Thinker {
 	return t
 }
 
-func TestEventFilter_RoutesToThreads(t *testing.T) {
-	thinker := newTestThinkerFull()
-	defer thinker.Stop()
-
-	// Spawn a thread
-	thinker.threads.Spawn("alice", "test", nil)
-	defer thinker.threads.Kill("alice")
-
-	// Set up the filter (same as NewThinker does)
-	thinker.filterEvents = func(events []string) []string {
-		var kept []string
-		for _, ev := range events {
-			if !thinker.threads.Route(ev) {
-				kept = append(kept, ev)
-			}
-		}
-		return kept
-	}
-
-	// Simulate events
-	events := []string{
-		"[user:alice] Hello",
-		"[user:bob] Hi",
-		"[console] do something",
-	}
-
-	filtered := thinker.filterEvents(events)
-
-	// alice's message should be routed, bob's and console should remain
-	if len(filtered) != 2 {
-		t.Fatalf("expected 2 events after filtering, got %d: %v", len(filtered), filtered)
-	}
-	if filtered[0] != "[user:bob] Hi" {
-		t.Errorf("expected bob's message, got %q", filtered[0])
-	}
-	if filtered[1] != "[console] do something" {
-		t.Errorf("expected console message, got %q", filtered[1])
-	}
-}
 
 func TestExternalEventDetection(t *testing.T) {
 	tests := []struct {
 		event      string
 		isExternal bool
 	}{
-		{"[user:marco] Hello", true},
+		{"[console] Hello", true},
 		{"[console] do something", true},
 		{"[from:writer] report", true},
 		{"[tool:list_files] (empty)", false},
