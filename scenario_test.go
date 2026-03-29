@@ -1958,7 +1958,7 @@ Workflow:
 - If analyst recommends a trade, you tell executor to place it with exact symbol, side, qty.
 - Executor sets stop-losses on new positions (10% below buy price).
 
-IMPORTANT: Act decisively. When told to consider buying, have analyst check history, make a concrete recommendation, and have executor place the trade. Do not just observe — trade.`,
+`,
 	MCPServers: []MCPServerConfig{
 		{Name: "market", Command: "", Env: map[string]string{"MARKET_DATA_DIR": "{{dataDir}}"}},
 		{Name: "storage", Command: "", Env: map[string]string{"STORAGE_DATA_DIR": "{{dataDir}}"}},
@@ -2072,13 +2072,17 @@ func TestScenario_Trading(t *testing.T) {
 
 var onboardingScenario = Scenario{
 	Name: "Onboarding",
-	Directive: `You manage customer onboarding. On startup, immediately spawn these 3 threads:
+	Directive: `You manage new customer onboarding for a SaaS platform.
 
-[[spawn id="intake" directive="Fetch and read CSV signup files when told. Report customer data to main." tools="files_fetch_file,files_read_csv,files_list_files,files_file_status,send,done"]]
-[[spawn id="provisioner" directive="Create customer accounts in storage when told. Store each customer record." tools="codebase_write_file,codebase_list_files,storage_store,storage_get,send,done"]]
-[[spawn id="welcome" directive="Send welcome notifications when told." tools="pushover_send_notification,storage_get,send,done"]]
+Spawn and maintain 3 threads:
+1. "intake" — fetches signup CSV files, reads customer data, reports to you.
+   Tools: files_fetch_file, files_read_csv, files_list_files, files_file_status, send, done
+2. "provisioner" — stores customer account records using storage tools.
+   Tools: codebase_write_file, codebase_list_files, storage_store, storage_get, send, done
+3. "welcome" — sends onboarding notifications to new customers.
+   Tools: pushover_send_notification, storage_get, send, done
 
-After spawning, wait for console events with signup file URLs. Forward them to intake, then provisioner, then welcome.`,
+When you receive a signup file URL, tell intake to fetch and read it. Then tell provisioner to create accounts. Then tell welcome to notify customers.`,
 	MCPServers: []MCPServerConfig{
 		{Name: "files", Command: "", Env: map[string]string{"FILES_DATA_DIR": "{{dataDir}}"}},
 		{Name: "codebase", Command: "", Env: map[string]string{"CODEBASE_DIR": "{{dataDir}}"}},
@@ -2113,7 +2117,8 @@ After spawning, wait for console events with signup file URLs. Forward them to i
 					// Check if accounts were provisioned (config files or storage entries)
 					entries, _ := os.ReadDir(filepath.Join(dir, "accounts"))
 					store, _ := os.ReadFile(filepath.Join(dir, "store.json"))
-					return len(entries) >= 2 || strings.Contains(string(store), "alice") || strings.Contains(string(store), "bob")
+					s := strings.ToLower(string(store))
+					return len(entries) >= 2 || strings.Contains(s, "alice") || strings.Contains(s, "bob")
 				}
 			}(),
 			Verify: func(t *testing.T, dir string, th *Thinker) {
