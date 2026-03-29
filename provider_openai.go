@@ -156,6 +156,10 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 		"messages": toOpenAIMessages(messages),
 		"stream":   true,
 	}
+	// OpenAI supports stream_options for usage in streaming; Fireworks may not
+	if p.name == "openai" {
+		reqMap["stream_options"] = map[string]any{"include_usage": true}
+	}
 
 	// Add tools if provider supports them
 	if len(tools) > 0 && p.SupportsNativeTools() {
