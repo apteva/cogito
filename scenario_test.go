@@ -1365,3 +1365,230 @@ func TestScenario_VideoTeam(t *testing.T) {
 
 	runScenario(t, s)
 }
+
+// --- DevTeam Scenario ---
+
+// seedTodoApp writes a minimal Go todo app into the given directory.
+func seedTodoApp(t *testing.T, dir string) {
+	t.Helper()
+	appDir := filepath.Join(dir, "app")
+	os.MkdirAll(appDir, 0755)
+
+	// go.mod
+	os.WriteFile(filepath.Join(appDir, "go.mod"), []byte("module todo\n\ngo 1.21\n"), 0644)
+
+	// todo.go — basic CRUD, no priority field
+	os.WriteFile(filepath.Join(appDir, "todo.go"), []byte(`package todo
+
+type Todo struct {
+	ID        int    `+"`"+`json:"id"`+"`"+`
+	Title     string `+"`"+`json:"title"`+"`"+`
+	Completed bool   `+"`"+`json:"completed"`+"`"+`
+}
+
+var todos []Todo
+var nextID = 1
+
+func Create(title string) Todo {
+	t := Todo{ID: nextID, Title: title}
+	nextID++
+	todos = append(todos, t)
+	return t
+}
+
+func List() []Todo {
+	return todos
+}
+
+func Complete(id int) bool {
+	for i := range todos {
+		if todos[i].ID == id {
+			todos[i].Completed = true
+			return true
+		}
+	}
+	return false
+}
+
+func Delete(id int) bool {
+	for i := range todos {
+		if todos[i].ID == id {
+			todos = append(todos[:i], todos[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func Reset() {
+	todos = nil
+	nextID = 1
+}
+`), 0644)
+
+	// todo_test.go — basic tests
+	os.WriteFile(filepath.Join(appDir, "todo_test.go"), []byte(`package todo
+
+import "testing"
+
+func TestCreate(t *testing.T) {
+	Reset()
+	td := Create("Buy milk")
+	if td.Title != "Buy milk" {
+		t.Errorf("expected 'Buy milk', got %q", td.Title)
+	}
+	if td.ID != 1 {
+		t.Errorf("expected ID 1, got %d", td.ID)
+	}
+}
+
+func TestList(t *testing.T) {
+	Reset()
+	Create("Task 1")
+	Create("Task 2")
+	if len(List()) != 2 {
+		t.Errorf("expected 2 todos, got %d", len(List()))
+	}
+}
+
+func TestComplete(t *testing.T) {
+	Reset()
+	td := Create("Do laundry")
+	if !Complete(td.ID) {
+		t.Error("expected Complete to return true")
+	}
+	if !List()[0].Completed {
+		t.Error("expected todo to be completed")
+	}
+}
+
+func TestDelete(t *testing.T) {
+	Reset()
+	td := Create("Temp")
+	if !Delete(td.ID) {
+		t.Error("expected Delete to return true")
+	}
+	if len(List()) != 0 {
+		t.Error("expected empty list after delete")
+	}
+}
+`), 0644)
+
+	// test.sh at root level (codebase dir) since run_tests runs from there
+	os.WriteFile(filepath.Join(dir, "test.sh"), []byte("#!/bin/bash\ncd app && go test ./... 2>&1\n"), 0644)
+}
+
+var devTeamScenario = Scenario{
+	Name: "DevTeam",
+	Directive: `You manage a small development team maintaining a Todo SaaS app.
+The codebase is in the "app/" directory. It is a Go package with todo.go and todo_test.go.
+
+Spawn and maintain 3 threads:
+1. "support" — monitors helpdesk tickets, triages them (bug vs feature), reports to main with recommendations.
+   Tools: helpdesk_list_tickets, helpdesk_reply_ticket, helpdesk_close_ticket, send, done
+2. "dev" — reads/writes code, implements features and fixes. Always reads existing code before modifying.
+   Tools: codebase_read_file, codebase_write_file, codebase_list_files, codebase_search, send, done
+3. "qa" — runs the test suite and reports results. Triggered by main after dev finishes.
+   Tools: codebase_run_tests, codebase_read_file, send, done
+
+Workflow:
+- Support finds a ticket and tells you what it is
+- You decide what to do and tell dev to implement it
+- After dev is done, tell qa to run tests
+- If tests fail, send dev back to fix. If pass, tell support to close the ticket.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "helpdesk", Command: "", Env: map[string]string{"HELPDESK_DATA_DIR": "{{dataDir}}"}},
+		{Name: "codebase", Command: "", Env: map[string]string{"CODEBASE_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		seedTodoApp(t, dir)
+	},
+	Phases: []Phase{
+		{
+			Name:    "Startup — 3 threads spawned",
+			Timeout: 90 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				return len(threadIDs(th)) >= 3
+			},
+		},
+		{
+			Name:    "Feature request — add priority field",
+			Timeout: 180 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				writeJSONFile(t, dir, "tickets.json", []map[string]string{
+					{"id": "T-101", "question": "Feature request: Please add a Priority field to todos. It should be a string with values low, medium, or high. Default to low. The Create function should accept an optional priority parameter."},
+				})
+			},
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				code, err := os.ReadFile(filepath.Join(dir, "app", "todo.go"))
+				if err != nil {
+					return false
+				}
+				if !strings.Contains(string(code), "Priority") {
+					return false
+				}
+				cmd := exec.Command("bash", "test.sh")
+				cmd.Dir = dir
+				return cmd.Run() == nil
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				code, _ := os.ReadFile(filepath.Join(dir, "app", "todo.go"))
+				if !strings.Contains(string(code), "Priority") {
+					t.Error("expected Priority field in todo.go")
+				}
+				cmd := exec.Command("bash", "test.sh")
+				cmd.Dir = dir
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Errorf("tests should pass after feature: %s", string(out))
+				}
+			},
+		},
+		{
+			Name:    "Bug fix — empty title validation",
+			Timeout: 180 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				writeJSONFile(t, dir, "tickets.json", []map[string]string{
+					{"id": "T-102", "question": "Bug report: Creating a todo with an empty title succeeds but it should not. The Create function should return an error when the title is empty."},
+				})
+			},
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				code, err := os.ReadFile(filepath.Join(dir, "app", "todo.go"))
+				if err != nil {
+					return false
+				}
+				if !strings.Contains(string(code), "error") && !strings.Contains(string(code), "Error") {
+					return false
+				}
+				cmd := exec.Command("bash", "test.sh")
+				cmd.Dir = dir
+				return cmd.Run() == nil
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				code, _ := os.ReadFile(filepath.Join(dir, "app", "todo.go"))
+				if !strings.Contains(string(code), "error") && !strings.Contains(string(code), "Error") {
+					t.Error("expected error handling for empty title in todo.go")
+				}
+				cmd := exec.Command("bash", "test.sh")
+				cmd.Dir = dir
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Errorf("tests should pass after bug fix: %s", string(out))
+				}
+			},
+		},
+	},
+	Timeout:    8 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_DevTeam(t *testing.T) {
+	helpdeskBin := buildMCPBinary(t, "mcps/helpdesk")
+	codebaseBin := buildMCPBinary(t, "mcps/codebase")
+	t.Logf("built helpdesk=%s codebase=%s", helpdeskBin, codebaseBin)
+
+	s := devTeamScenario
+	s.MCPServers[0].Command = helpdeskBin
+	s.MCPServers[1].Command = codebaseBin
+	runScenario(t, s)
+}
