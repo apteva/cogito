@@ -3,11 +3,14 @@ module github.com/apteva/core
 go 1.25.1
 
 require (
+	github.com/apteva/computer v0.0.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/joho/godotenv v1.5.1
 )
+
+replace github.com/apteva/computer => ../computer
 
 require (
 	github.com/atotto/clipboard v0.1.4 // indirect

@@ -328,25 +328,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", t.mcpServers)}
 	}
 
-	// Initialize computer use environment if configured
-	if config.Computer != nil && config.Computer.Type != "" {
-		comp, err := computer.New(computer.Config{
-			Type:      config.Computer.Type,
-			URL:       config.Computer.URL,
-			APIKey:    config.Computer.APIKey,
-			ProjectID: config.Computer.ProjectID,
-			Display: computer.DisplaySize{
-				Width:  config.Computer.Width,
-				Height: config.Computer.Height,
-			},
-		})
-		if err != nil {
-			logMsg("COMPUTER", fmt.Sprintf("failed to create computer: %v", err))
-		} else if comp != nil {
-			t.computer = comp
-			logMsg("COMPUTER", fmt.Sprintf("connected: type=%s display=%dx%d", config.Computer.Type, comp.DisplaySize().Width, comp.DisplaySize().Height))
-		}
-	}
+	// Computer use environment is injected externally via SetComputer()
 
 	// Respawn persistent threads from config
 	for _, pt := range config.GetThreads() {
@@ -987,6 +969,11 @@ func (t *Thinker) TogglePause() {
 	}
 	t.pause <- newState
 	t.paused = newState
+}
+
+// SetComputer attaches a computer use environment to this thinker.
+func (t *Thinker) SetComputer(c computer.Computer) {
+	t.computer = c
 }
 
 func (t *Thinker) Stop() {
