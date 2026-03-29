@@ -17,6 +17,7 @@ type ToolDef struct {
 	ThreadOnly  bool   // only for sub-threads, not main (reply)
 	Handler     func(args map[string]string) string // nil = handled inline by tool handler
 	Embedding   []float64
+	InputSchema map[string]any // JSON Schema for native tool calling (nil = auto-generated from Syntax)
 }
 
 // ToolRegistry holds all tool definitions with embeddings for RAG retrieval.
@@ -329,4 +330,54 @@ func (tr *ToolRegistry) Counts() (core, rag, total int) {
 	}
 	total = core + rag
 	return
+}
+
+// NativeTools returns all tools as NativeTool definitions for the provider API.
+// allowlist filters to specific tools (nil = all non-MainOnly tools).
+func (tr *ToolRegistry) NativeTools(allowlist map[string]bool) []NativeTool {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	var out []NativeTool
+	for _, tool := range tr.tools {
+		// Filter by allowlist if set
+		if allowlist != nil {
+			if !allowlist[tool.Name] {
+				continue
+			}
+		} else if tool.ThreadOnly {
+			continue
+		}
+
+		nt := NativeTool{
+			Name:        tool.Name,
+			Description: tool.Description,
+		}
+		if tool.Rules != "" {
+			nt.Description += " " + tool.Rules
+		}
+
+		// Use explicit schema if provided, otherwise generate from syntax
+		if tool.InputSchema != nil {
+			nt.Parameters = tool.InputSchema
+		} else {
+			nt.Parameters = schemaFromSyntax(tool.Syntax)
+		}
+		out = append(out, nt)
+	}
+	return out
+}
+
+// schemaFromSyntax extracts a JSON Schema from tool syntax like: [[name key="val" key2="val2"]]
+func schemaFromSyntax(syntax string) map[string]any {
+	props := make(map[string]any)
+	// Extract key="..." patterns
+	for _, m := range argRe.FindAllStringSubmatch(syntax, -1) {
+		if len(m) >= 2 {
+			props[m[1]] = map[string]string{"type": "string", "description": m[1]}
+		}
+	}
+	if len(props) == 0 {
+		return map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	return map[string]any{"type": "object", "properties": props}
 }

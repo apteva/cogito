@@ -630,8 +630,10 @@ func (t *Thinker) Run() {
 		}
 
 		start := time.Now()
-		reply, usage, err := t.think()
+		chatResp, err := t.think()
 		duration := time.Since(start)
+		reply := chatResp.Text
+		usage := chatResp.Usage
 
 		if err != nil {
 			t.bus.Publish(Event{Type: EventThinkError, From: t.threadID, Error: err, Iteration: t.iteration})
@@ -648,10 +650,40 @@ func (t *Thinker) Run() {
 			continue
 		}
 
-		t.messages = append(t.messages, Message{Role: "assistant", Content: reply})
+		// Build assistant message — may include native tool calls
+		assistantMsg := Message{Role: "assistant", Content: reply, ToolCalls: chatResp.ToolCalls}
+		t.messages = append(t.messages, assistantMsg)
+
+		// Stream native tool calls to TUI as visual chunks
+		if len(chatResp.ToolCalls) > 0 {
+			for _, ntc := range chatResp.ToolCalls {
+				summary := "\n→ " + ntc.Name + "("
+				first := true
+				for k, v := range ntc.Args {
+					if !first {
+						summary += ", "
+					}
+					if len(v) > 60 {
+						v = v[:60] + "..."
+					}
+					summary += k + "=" + v
+					first = false
+				}
+				summary += ")"
+				t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: summary, Iteration: t.iteration})
+			}
+		}
 
 		// Dispatch tool calls via handler
-		calls := parseToolCalls(reply)
+		// Prefer native tool calls; fall back to text parsing if none
+		var calls []toolCall
+		if len(chatResp.ToolCalls) > 0 {
+			for _, ntc := range chatResp.ToolCalls {
+				calls = append(calls, toolCall{Name: ntc.Name, Args: ntc.Args, Raw: fmt.Sprintf("[[%s]]", ntc.Name), NativeID: ntc.ID})
+			}
+		} else {
+			calls = parseToolCalls(reply)
+		}
 		var replies []string
 		var toolNames []string
 		if t.handleTools != nil {
@@ -752,7 +784,7 @@ func (t *Thinker) Run() {
 	}
 }
 
-func (t *Thinker) think() (string, TokenUsage, error) {
+func (t *Thinker) think() (ChatResponse, error) {
 	onChunk := func(chunk string) {
 		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: chunk, Iteration: t.iteration})
 		if t.telemetry != nil && chunk != "" {
@@ -761,7 +793,14 @@ func (t *Thinker) think() (string, TokenUsage, error) {
 			})
 		}
 	}
-	return t.provider.Chat(t.messages, t.modelID(), onChunk)
+
+	// Build native tools from registry if provider supports it
+	var nativeTools []NativeTool
+	if t.provider != nil && t.provider.SupportsNativeTools() && t.registry != nil {
+		nativeTools = t.registry.NativeTools(t.toolAllowlist)
+	}
+
+	return t.provider.Chat(t.messages, t.modelID(), nativeTools, onChunk)
 }
 
 // drainEvents reads all pending events and wake signals from this thinker's bus subscription.

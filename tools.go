@@ -13,9 +13,10 @@ import (
 const maxToolResultLen = 4000
 
 type toolCall struct {
-	Name string
-	Args map[string]string
-	Raw  string // original matched text
+	Name     string
+	Args     map[string]string
+	Raw      string // original matched text (or synthetic for native calls)
+	NativeID string // provider-assigned ID for native tool calls (empty for text-parsed)
 }
 
 // [[tool_name key="val" key2="val2"]] — values can span multiple lines, escaped quotes allowed
@@ -195,6 +196,13 @@ func executeTool(t *Thinker, call toolCall) {
 				Result: resultSummary,
 			})
 		}
+
+		// Emit visual chunk for TUI so tool results appear in thoughts stream
+		resultPreviewForTUI := result
+		if len(resultPreviewForTUI) > 120 {
+			resultPreviewForTUI = resultPreviewForTUI[:120] + "..."
+		}
+		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: "\n← " + call.Name + ": " + resultPreviewForTUI, Iteration: t.iteration})
 
 		t.Inject(fmt.Sprintf("[tool:%s] %s", call.Name, result))
 	}()

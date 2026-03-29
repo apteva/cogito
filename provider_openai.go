@@ -23,9 +23,13 @@ type OpenAICompatProvider struct {
 	authHeader string // "Bearer" or empty for no auth (Ollama)
 }
 
-func (p *OpenAICompatProvider) Name() string                          { return p.name }
-func (p *OpenAICompatProvider) Models() map[ModelTier]string          { return p.models }
+func (p *OpenAICompatProvider) Name() string                            { return p.name }
+func (p *OpenAICompatProvider) Models() map[ModelTier]string            { return p.models }
 func (p *OpenAICompatProvider) CostPer1M() (float64, float64, float64) { return p.inputCost, p.cachedCost, p.outputCost }
+func (p *OpenAICompatProvider) SupportsNativeTools() bool {
+	// OpenAI and Fireworks support tools; Ollama may not
+	return p.name == "openai" || p.name == "fireworks"
+}
 
 // openaiMessage serializes a Message for the OpenAI API.
 // When Parts is set, content becomes the array (native format).
@@ -67,37 +71,113 @@ func convertAudioURLParts(parts []ContentPart) []ContentPart {
 	return out
 }
 
-func toOpenAIMessages(messages []Message) []openaiMessage {
-	out := make([]openaiMessage, len(messages))
-	for i, m := range messages {
+// openaiToolCallDelta tracks streaming tool call assembly.
+type openaiToolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function *struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function,omitempty"`
+}
+
+// openaiToolDef is the OpenAI tool format for the request.
+type openaiToolDef struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string         `json:"name"`
+		Description string         `json:"description"`
+		Parameters  map[string]any `json:"parameters"`
+	} `json:"function"`
+}
+
+// openaiToolResultMsg is a tool result message.
+type openaiToolResultMsg struct {
+	Role       string `json:"role"` // "tool"
+	Content    string `json:"content"`
+	ToolCallID string `json:"tool_call_id"`
+}
+
+func toOpenAIMessages(messages []Message) []any {
+	var out []any
+	for _, m := range messages {
+		// Tool result messages
+		if len(m.ToolResults) > 0 {
+			for _, tr := range m.ToolResults {
+				out = append(out, openaiToolResultMsg{
+					Role:       "tool",
+					Content:    tr.Content,
+					ToolCallID: tr.CallID,
+				})
+			}
+			continue
+		}
+
+		// Assistant message with tool calls
+		if len(m.ToolCalls) > 0 {
+			toolCalls := make([]map[string]any, len(m.ToolCalls))
+			for i, tc := range m.ToolCalls {
+				argsJSON, _ := json.Marshal(tc.Args)
+				toolCalls[i] = map[string]any{
+					"id":   tc.ID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      tc.Name,
+						"arguments": string(argsJSON),
+					},
+				}
+			}
+			msg := map[string]any{
+				"role":       "assistant",
+				"tool_calls": toolCalls,
+			}
+			if m.Content != "" {
+				msg["content"] = m.Content
+			}
+			out = append(out, msg)
+			continue
+		}
+
+		// Regular message
 		if m.HasParts() {
-			out[i] = openaiMessage{Role: m.Role, Content: convertAudioURLParts(m.Parts)}
+			out = append(out, openaiMessage{Role: m.Role, Content: convertAudioURLParts(m.Parts)})
 		} else {
-			out[i] = openaiMessage{Role: m.Role, Content: m.Content}
+			out = append(out, openaiMessage{Role: m.Role, Content: m.Content})
 		}
 	}
 	return out
 }
 
-func (p *OpenAICompatProvider) Chat(messages []Message, model string, onChunk func(string)) (string, TokenUsage, error) {
-	reqBody := struct {
-		Model    string          `json:"model"`
-		Messages []openaiMessage `json:"messages"`
-		Stream   bool            `json:"stream"`
-	}{
-		Model:    model,
-		Messages: toOpenAIMessages(messages),
-		Stream:   true,
+func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string)) (ChatResponse, error) {
+	// Build request
+	reqMap := map[string]any{
+		"model":    model,
+		"messages": toOpenAIMessages(messages),
+		"stream":   true,
 	}
 
-	body, err := json.Marshal(reqBody)
+	// Add tools if provider supports them
+	if len(tools) > 0 && p.SupportsNativeTools() {
+		var defs []openaiToolDef
+		for _, t := range tools {
+			def := openaiToolDef{Type: "function"}
+			def.Function.Name = t.Name
+			def.Function.Description = t.Description
+			def.Function.Parameters = t.Parameters
+			defs = append(defs, def)
+		}
+		reqMap["tools"] = defs
+	}
+
+	body, err := json.Marshal(reqMap)
 	if err != nil {
-		return "", TokenUsage{}, err
+		return ChatResponse{}, err
 	}
 
 	req, err := http.NewRequest("POST", p.url, bytes.NewReader(body))
 	if err != nil {
-		return "", TokenUsage{}, err
+		return ChatResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if p.apiKey != "" && p.authHeader != "" {
@@ -106,17 +186,24 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, onChunk fu
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", TokenUsage{}, err
+		return ChatResponse{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", TokenUsage{}, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return ChatResponse{}, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var full strings.Builder
 	var usage TokenUsage
+	// Track streamed tool calls by index
+	pendingTools := make(map[int]*struct {
+		id       string
+		name     string
+		argsJSON strings.Builder
+	})
+
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -128,16 +215,46 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, onChunk fu
 			break
 		}
 
-		var event StreamEvent
+		var event struct {
+			Choices []struct {
+				Delta struct {
+					Content   string                 `json:"content"`
+					ToolCalls []openaiToolCallDelta   `json:"tool_calls,omitempty"`
+				} `json:"delta"`
+			} `json:"choices"`
+			Usage *Usage `json:"usage,omitempty"`
+		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			continue
 		}
 		if len(event.Choices) > 0 {
-			chunk := event.Choices[0].Delta.Content
-			if chunk != "" {
-				full.WriteString(chunk)
+			delta := event.Choices[0].Delta
+			if delta.Content != "" {
+				full.WriteString(delta.Content)
 				if onChunk != nil {
-					onChunk(chunk)
+					onChunk(delta.Content)
+				}
+			}
+			for _, tc := range delta.ToolCalls {
+				pt, ok := pendingTools[tc.Index]
+				if !ok {
+					pt = &struct {
+						id       string
+						name     string
+						argsJSON strings.Builder
+					}{}
+					pendingTools[tc.Index] = pt
+				}
+				if tc.ID != "" {
+					pt.id = tc.ID
+				}
+				if tc.Function != nil {
+					if tc.Function.Name != "" {
+						pt.name = tc.Function.Name
+					}
+					if tc.Function.Arguments != "" {
+						pt.argsJSON.WriteString(tc.Function.Arguments)
+					}
 				}
 			}
 		}
@@ -150,7 +267,32 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, onChunk fu
 		}
 	}
 
-	return full.String(), usage, nil
+	// Assemble completed tool calls
+	var toolCalls []NativeToolCall
+	for i := 0; i < len(pendingTools); i++ {
+		pt, ok := pendingTools[i]
+		if !ok {
+			continue
+		}
+		args := make(map[string]string)
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(pt.argsJSON.String()), &raw); err == nil {
+			for k, v := range raw {
+				args[k] = fmt.Sprintf("%v", v)
+			}
+		}
+		toolCalls = append(toolCalls, NativeToolCall{
+			ID:   pt.id,
+			Name: pt.name,
+			Args: args,
+		})
+	}
+
+	return ChatResponse{
+		Text:      full.String(),
+		ToolCalls: toolCalls,
+		Usage:     usage,
+	}, nil
 }
 
 // --- Factory functions ---

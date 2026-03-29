@@ -74,6 +74,7 @@ func NewGoogleProvider(apiKey string) LLMProvider {
 
 func (p *GoogleProvider) Name() string                 { return "google" }
 func (p *GoogleProvider) Models() map[ModelTier]string  { return p.models }
+func (p *GoogleProvider) SupportsNativeTools() bool     { return true }
 
 func (p *GoogleProvider) CostPer1M() (float64, float64, float64) {
 	if m, ok := geminiModels[p.activeModel]; ok {
@@ -100,9 +101,20 @@ func (p *GoogleProvider) AvailableModels() []string { return GeminiModelOrder }
 
 // Gemini API request format
 type geminiRequest struct {
-	Contents         []geminiContent        `json:"contents"`
-	SystemInstruction *geminiContent        `json:"systemInstruction,omitempty"`
-	GenerationConfig  map[string]any        `json:"generationConfig,omitempty"`
+	Contents          []geminiContent        `json:"contents"`
+	SystemInstruction *geminiContent         `json:"systemInstruction,omitempty"`
+	GenerationConfig  map[string]any         `json:"generationConfig,omitempty"`
+	Tools             []geminiToolDecl       `json:"tools,omitempty"`
+}
+
+type geminiToolDecl struct {
+	FunctionDeclarations []geminiFunctionDecl `json:"functionDeclarations,omitempty"`
+}
+
+type geminiFunctionDecl struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 type geminiContent struct {
@@ -111,8 +123,14 @@ type geminiContent struct {
 }
 
 type geminiPart struct {
-	Text       string          `json:"text,omitempty"`
-	InlineData *geminiInline   `json:"inlineData,omitempty"`
+	Text         string              `json:"text,omitempty"`
+	InlineData   *geminiInline       `json:"inlineData,omitempty"`
+	FunctionCall *geminiFunctionCall `json:"functionCall,omitempty"`
+}
+
+type geminiFunctionCall struct {
+	Name string         `json:"name"`
+	Args map[string]any `json:"args"`
 }
 
 type geminiInline struct {
@@ -134,7 +152,7 @@ type geminiStreamResponse struct {
 	} `json:"usageMetadata"`
 }
 
-func (p *GoogleProvider) Chat(messages []Message, model string, onChunk func(string)) (string, TokenUsage, error) {
+func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string)) (ChatResponse, error) {
 	// Track active model for cost calculation
 	p.activeModel = model
 
@@ -225,42 +243,60 @@ func (p *GoogleProvider) Chat(messages []Message, model string, onChunk func(str
 		maxTokens = m.MaxOutputTokens
 	}
 
+	// Convert native tools to Gemini function declarations
+	var geminiTools []geminiToolDecl
+	if len(tools) > 0 {
+		var funcs []geminiFunctionDecl
+		for _, t := range tools {
+			funcs = append(funcs, geminiFunctionDecl{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.Parameters,
+			})
+		}
+		geminiTools = []geminiToolDecl{{FunctionDeclarations: funcs}}
+	}
+
 	reqBody := geminiRequest{
 		Contents:          contents,
 		SystemInstruction: systemContent,
 		GenerationConfig: map[string]any{
 			"maxOutputTokens": maxTokens,
 		},
+		Tools: geminiTools,
 	}
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", TokenUsage{}, err
+		return ChatResponse{}, err
 	}
 
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", model, p.apiKey)
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
-		return "", TokenUsage{}, err
+		return ChatResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", TokenUsage{}, err
+		return ChatResponse{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		logMsg("GEMINI", fmt.Sprintf("ERROR %d: %s", resp.StatusCode, string(respBody)))
-		return "", TokenUsage{}, fmt.Errorf("Gemini API error %d: %s", resp.StatusCode, string(respBody))
+		return ChatResponse{}, fmt.Errorf("Gemini API error %d: %s", resp.StatusCode, string(respBody))
 	}
 	logMsg("GEMINI", "streaming response started")
 
 	var full strings.Builder
 	var usage TokenUsage
+	var toolCalls []NativeToolCall
+	toolCallSeq := 0
+
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
@@ -284,6 +320,18 @@ func (p *GoogleProvider) Chat(messages []Message, model string, onChunk func(str
 						onChunk(part.Text)
 					}
 				}
+				if part.FunctionCall != nil {
+					toolCallSeq++
+					args := make(map[string]string)
+					for k, v := range part.FunctionCall.Args {
+						args[k] = fmt.Sprintf("%v", v)
+					}
+					toolCalls = append(toolCalls, NativeToolCall{
+						ID:   fmt.Sprintf("gemini_%d", toolCallSeq),
+						Name: part.FunctionCall.Name,
+						Args: args,
+					})
+				}
 			}
 		}
 
@@ -299,8 +347,8 @@ func (p *GoogleProvider) Chat(messages []Message, model string, onChunk func(str
 	if len(preview) > 200 {
 		preview = preview[:200] + "..."
 	}
-	logMsg("GEMINI", fmt.Sprintf("done tokens_in=%d tokens_out=%d len=%d response=%q", usage.PromptTokens, usage.CompletionTokens, len(response), preview))
-	return response, usage, nil
+	logMsg("GEMINI", fmt.Sprintf("done tokens_in=%d tokens_out=%d len=%d tools=%d response=%q", usage.PromptTokens, usage.CompletionTokens, len(response), len(toolCalls), preview))
+	return ChatResponse{Text: response, ToolCalls: toolCalls, Usage: usage}, nil
 }
 
 // audioMimeTypes maps file extensions to MIME types for audio.

@@ -33,9 +33,11 @@ type AudioURL struct {
 }
 
 type Message struct {
-	Role    string        `json:"role"`
-	Content string        `json:"content"`
-	Parts   []ContentPart `json:"parts,omitempty"` // when set, providers use this instead of Content
+	Role        string           `json:"role"`
+	Content     string           `json:"content"`
+	Parts       []ContentPart    `json:"parts,omitempty"`        // multimodal content
+	ToolCalls   []NativeToolCall `json:"tool_calls,omitempty"`   // assistant messages: structured tool calls
+	ToolResults []ToolResult     `json:"tool_results,omitempty"` // user messages: results for prior tool calls
 }
 
 // TextContent returns the text content of a message, whether plain Content or from Parts.

@@ -66,7 +66,8 @@ func TestIntegration_Think(t *testing.T) {
 	})
 
 	stop := drainEvents(thinker)
-	reply, usage, err := thinker.think()
+	resp, err := thinker.think()
+	reply, usage := resp.Text, resp.Usage
 	chunks := stop()
 
 	if err != nil {
@@ -93,7 +94,8 @@ func TestIntegration_ThinkWithToolCall(t *testing.T) {
 	})
 
 	stop := drainEvents(thinker)
-	reply, _, err := thinker.think()
+	resp2, err := thinker.think()
+	reply := resp2.Text
 	stop()
 
 	if err != nil {

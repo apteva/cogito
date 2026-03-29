@@ -5,14 +5,44 @@ import (
 	"os"
 )
 
+// NativeTool defines a tool sent to the provider API.
+type NativeTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"` // JSON Schema
+}
+
+// NativeToolCall is a structured tool call returned by the provider.
+type NativeToolCall struct {
+	ID   string            `json:"id"`   // provider-assigned ID for matching results
+	Name string            `json:"name"`
+	Args map[string]string `json:"args"`
+}
+
+// ToolResult is sent back to the provider after executing a tool.
+type ToolResult struct {
+	CallID  string `json:"call_id"`
+	Content string `json:"content"`           // text result
+	Image   []byte `json:"image,omitempty"`   // optional image (screenshot etc.)
+	IsError bool   `json:"is_error,omitempty"`
+}
+
+// ChatResponse is the structured return from Chat().
+type ChatResponse struct {
+	Text      string           // streamed text content
+	ToolCalls []NativeToolCall // structured tool calls (empty if none)
+	Usage     TokenUsage
+}
+
 // LLMProvider abstracts the LLM API call.
 // All thinking, threading, tool handling stays in the Thinker.
 // The provider only handles: send messages → get streaming response.
 type LLMProvider interface {
 	// Chat sends messages and streams the response.
+	// tools: native tool definitions to include in the request (nil = no tools).
 	// onChunk is called for each token chunk as it arrives.
-	// Returns the full response text, token usage, and any error.
-	Chat(messages []Message, model string, onChunk func(string)) (string, TokenUsage, error)
+	// Returns ChatResponse with text, tool calls, and usage.
+	Chat(messages []Message, model string, tools []NativeTool, onChunk func(string)) (ChatResponse, error)
 
 	// Models returns model IDs for each tier.
 	Models() map[ModelTier]string
@@ -22,6 +52,9 @@ type LLMProvider interface {
 
 	// CostPer1M returns pricing per 1M tokens: (input, cached, output).
 	CostPer1M() (float64, float64, float64)
+
+	// SupportsNativeTools returns true if this provider handles structured tool calling.
+	SupportsNativeTools() bool
 }
 
 // createProviderByName creates a provider by name, returning nil if the required API key is missing.
