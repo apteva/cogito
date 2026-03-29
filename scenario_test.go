@@ -1592,3 +1592,533 @@ func TestScenario_DevTeam(t *testing.T) {
 	s.MCPServers[1].Command = codebaseBin
 	runScenario(t, s)
 }
+
+// --- Ecommerce Scenario ---
+
+var ecommerceScenario = Scenario{
+	Name: "Ecommerce",
+	Directive: `You manage order fulfillment for an online bakery.
+
+Spawn and maintain 3 threads:
+1. "warehouse" — checks inventory for pending orders, reserves stock, marks orders as ready.
+   Tools: inventory_check_stock, inventory_use_stock, inventory_list_stock, orders_get_orders, orders_get_order, orders_update_order, send, done
+2. "shipping" — picks up ready orders, marks them as shipped, stores tracking info.
+   Tools: orders_get_orders, orders_update_order, storage_store, send, done
+3. "comms" — sends customer notifications when orders ship.
+   Tools: pushover_send_notification, storage_get, send, done
+
+Workflow:
+- When you receive a console event about new orders, tell warehouse to process them.
+- Warehouse checks stock, reserves ingredients, marks order as "ready".
+- If out of stock, warehouse reports to you and you notify comms.
+- When warehouse finishes, tell shipping to dispatch.
+- When shipping finishes, tell comms to notify the customer.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "orders", Command: "", Env: map[string]string{"ORDERS_DATA_DIR": "{{dataDir}}"}},
+		{Name: "inventory", Command: "", Env: map[string]string{"INVENTORY_DATA_DIR": "{{dataDir}}"}},
+		{Name: "storage", Command: "", Env: map[string]string{"STORAGE_DATA_DIR": "{{dataDir}}"}},
+		{Name: "pushover", Command: "", Env: map[string]string{"PUSHOVER_USER_KEY": "test", "PUSHOVER_API_TOKEN": "test"}},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		writeJSONFile(t, dir, "stock.json", map[string]int{
+			"flour": 50, "sugar": 30, "butter": 20, "eggs": 100, "chocolate": 5,
+		})
+		writeJSONFile(t, dir, "orders.json", []map[string]any{})
+	},
+	Phases: []Phase{
+		{
+			Name:    "Startup — 3 threads spawned",
+			Timeout: 90 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				return len(threadIDs(th)) >= 3
+			},
+		},
+		{
+			Name:    "Order fulfillment — process and ship",
+			Timeout: 180 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				writeJSONFile(t, dir, "orders.json", []map[string]string{
+					{"id": "ORD-001", "item": "chocolate cake", "qty": "2", "status": "pending"},
+					{"id": "ORD-002", "item": "croissant", "qty": "12", "status": "pending"},
+				})
+			},
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("New orders received: ORD-001 (chocolate cake x2), ORD-002 (croissant x12). Please process them.")
+						injected = true
+					}
+					data, err := os.ReadFile(filepath.Join(dir, "orders.json"))
+					if err != nil {
+						return false
+					}
+					// Check if at least one order was updated beyond pending
+					return strings.Contains(string(data), "ready") || strings.Contains(string(data), "shipped")
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "orders.json"))
+				s := string(data)
+				if !strings.Contains(s, "ready") && !strings.Contains(s, "shipped") {
+					t.Error("expected at least one order to be ready or shipped")
+				}
+			},
+		},
+		{
+			Name:    "Out of stock — chocolate depleted",
+			Timeout: 180 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				writeJSONFile(t, dir, "stock.json", map[string]int{
+					"flour": 50, "sugar": 30, "butter": 20, "eggs": 100, "chocolate": 0,
+				})
+				writeJSONFile(t, dir, "orders.json", []map[string]string{
+					{"id": "ORD-003", "item": "chocolate truffle", "qty": "5", "status": "pending"},
+				})
+			},
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("New order: ORD-003 (chocolate truffle x5). Please process.")
+						injected = true
+					}
+					data, err := os.ReadFile(filepath.Join(dir, "orders.json"))
+					if err != nil {
+						return false
+					}
+					// Warehouse should report out-of-stock or backorder
+					return strings.Contains(string(data), "backorder") ||
+						strings.Contains(string(data), "out_of_stock") ||
+						strings.Contains(string(data), "cancelled")
+				}
+			}(),
+		},
+	},
+	Timeout:    6 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_Ecommerce(t *testing.T) {
+	ordersBin := buildMCPBinary(t, "mcps/orders")
+	inventoryBin := buildMCPBinary(t, "mcps/inventory")
+	storageBin := buildMCPBinary(t, "mcps/storage")
+	pushoverBin := buildMCPBinary(t, "mcps/pushover")
+	t.Logf("built orders=%s inventory=%s storage=%s pushover=%s", ordersBin, inventoryBin, storageBin, pushoverBin)
+
+	s := ecommerceScenario
+	s.MCPServers[0].Command = ordersBin
+	s.MCPServers[1].Command = inventoryBin
+	s.MCPServers[2].Command = storageBin
+	s.MCPServers[3].Command = pushoverBin
+	runScenario(t, s)
+}
+
+// --- Incident Scenario ---
+
+var incidentScenario = Scenario{
+	Name: "Incident",
+	Directive: `You are the on-call SRE coordinator for a web platform with services: api, web, worker.
+
+Spawn and maintain 3 threads:
+1. "monitor" — continuously reads metrics for all services, watches for threshold violations.
+   Tools: metrics_get_metrics, metrics_get_history, metrics_set_threshold, metrics_get_alerts, send, done
+2. "responder" — investigates alerts, reads config/logs, applies fixes.
+   Tools: codebase_read_file, codebase_write_file, codebase_search, metrics_get_history, metrics_acknowledge_alert, send, done
+3. "comms" — sends status updates to stakeholders via pushover.
+   Tools: pushover_send_notification, send, done
+
+On startup, have monitor set thresholds:
+- cpu max 80 for all services
+- error_rate max 5 for all services
+- latency_ms max 200 for api
+
+Workflow:
+- Monitor checks metrics and reports alerts to you.
+- You dispatch responder to investigate and fix.
+- You tell comms to send status updates.
+- After fix is applied, have monitor verify recovery.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "metrics", Command: "", Env: map[string]string{"METRICS_DATA_DIR": "{{dataDir}}"}},
+		{Name: "codebase", Command: "", Env: map[string]string{"CODEBASE_DIR": "{{dataDir}}"}},
+		{Name: "pushover", Command: "", Env: map[string]string{"PUSHOVER_USER_KEY": "test", "PUSHOVER_API_TOKEN": "test"}},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		// Create a config file the responder can read/edit
+		os.MkdirAll(filepath.Join(dir, "config"), 0755)
+		os.WriteFile(filepath.Join(dir, "config", "api.yaml"), []byte("max_connections: 100\ntimeout_ms: 5000\ncache_enabled: true\n"), 0644)
+		os.WriteFile(filepath.Join(dir, "config", "worker.yaml"), []byte("concurrency: 10\nretry_limit: 3\n"), 0644)
+	},
+	Phases: []Phase{
+		{
+			Name:    "Startup — 3 threads and thresholds set",
+			Timeout: 120 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if len(threadIDs(th)) < 3 {
+					return false
+				}
+				// Check if thresholds were set
+				data, err := os.ReadFile(filepath.Join(dir, "thresholds.json"))
+				if err != nil {
+					return false
+				}
+				return strings.Contains(string(data), "cpu") && strings.Contains(string(data), "error_rate")
+			},
+		},
+		{
+			Name:    "Incident — CPU spike detected and investigated",
+			Timeout: 180 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				// Seed a CPU spike in metrics history so get_metrics returns high values
+				writeJSONFile(t, dir, "metrics.json", []map[string]any{
+					{"service": "api", "metric": "cpu", "value": 95.0, "timestamp": time.Now().UTC().Format(time.RFC3339)},
+					{"service": "api", "metric": "error_rate", "value": 12.0, "timestamp": time.Now().UTC().Format(time.RFC3339)},
+					{"service": "api", "metric": "latency_ms", "value": 350.0, "timestamp": time.Now().UTC().Format(time.RFC3339)},
+				})
+			},
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("ALERT: api service showing high CPU and errors. Please investigate immediately.")
+						injected = true
+					}
+					// Check if alerts were generated and acknowledged
+					data, err := os.ReadFile(filepath.Join(dir, "alerts.json"))
+					if err != nil {
+						return false
+					}
+					return strings.Contains(string(data), "acknowledged")
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "alerts.json"))
+				if !strings.Contains(string(data), `"acknowledged":true`) {
+					t.Error("expected alerts to be acknowledged after investigation")
+				}
+			},
+		},
+	},
+	Timeout:    6 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_Incident(t *testing.T) {
+	metricsBin := buildMCPBinary(t, "mcps/metrics")
+	codebaseBin := buildMCPBinary(t, "mcps/codebase")
+	pushoverBin := buildMCPBinary(t, "mcps/pushover")
+	t.Logf("built metrics=%s codebase=%s pushover=%s", metricsBin, codebaseBin, pushoverBin)
+
+	s := incidentScenario
+	s.MCPServers[0].Command = metricsBin
+	s.MCPServers[1].Command = codebaseBin
+	s.MCPServers[2].Command = pushoverBin
+	runScenario(t, s)
+}
+
+// --- Content Pipeline Scenario ---
+
+var contentPipelineScenario = Scenario{
+	Name: "ContentPipeline",
+	Directive: `You manage a content production pipeline for a tech company blog.
+
+Spawn and maintain 3 threads:
+1. "researcher" — given a topic, gathers information and stores research notes.
+   Tools: storage_store, storage_get, storage_list, send, done
+2. "writer" — uses research to generate blog posts and social media content.
+   Tools: creative_generate_post, creative_generate_image, storage_get, send, done
+3. "publisher" — schedules and publishes content across social channels.
+   Tools: social_post, social_get_channels, schedule_get_schedule, schedule_update_slot, send, done
+
+Workflow:
+- You receive a topic via console and tell researcher to gather info.
+- When research is done, tell writer to draft a blog post and social posts.
+- When content is ready, tell publisher to schedule and post across channels.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "storage", Command: "", Env: map[string]string{"STORAGE_DATA_DIR": "{{dataDir}}"}},
+		{Name: "creative", Command: "", Env: map[string]string{"CREATIVE_DATA_DIR": "{{dataDir}}"}},
+		{Name: "social", Command: "", Env: map[string]string{"SOCIAL_DATA_DIR": "{{dataDir}}"}},
+		{Name: "schedule", Command: "", Env: map[string]string{"SCHEDULE_DATA_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		// Seed social channels
+		writeJSONFile(t, dir, "channels.json", []map[string]string{
+			{"id": "twitter", "name": "Twitter/X"},
+			{"id": "linkedin", "name": "LinkedIn"},
+			{"id": "instagram", "name": "Instagram"},
+		})
+		// Empty schedule
+		writeJSONFile(t, dir, "schedule.json", []map[string]any{})
+	},
+	Phases: []Phase{
+		{
+			Name:    "Startup — 3 threads spawned",
+			Timeout: 90 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				return len(threadIDs(th)) >= 3
+			},
+		},
+		{
+			Name:    "Content production — topic to published posts",
+			Timeout: 180 * time.Second,
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("New content topic: 'Why AI agents are replacing SaaS dashboards'. Research this topic, write a blog post and social posts, then publish across all channels.")
+						injected = true
+					}
+					// Check if posts were published
+					data, err := os.ReadFile(filepath.Join(dir, "posts.json"))
+					if err != nil {
+						return false
+					}
+					return strings.Contains(string(data), "AI") || strings.Contains(string(data), "agent")
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Verify content was generated
+				data, _ := os.ReadFile(filepath.Join(dir, "audit.jsonl"))
+				if len(data) == 0 {
+					t.Error("expected audit trail of creative/social actions")
+				}
+			},
+		},
+	},
+	Timeout:    6 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_ContentPipeline(t *testing.T) {
+	storageBin := buildMCPBinary(t, "mcps/storage")
+	creativeBin := buildMCPBinary(t, "mcps/creative")
+	socialBin := buildMCPBinary(t, "mcps/social")
+	scheduleBin := buildMCPBinary(t, "mcps/schedule")
+	t.Logf("built storage=%s creative=%s social=%s schedule=%s", storageBin, creativeBin, socialBin, scheduleBin)
+
+	s := contentPipelineScenario
+	s.MCPServers[0].Command = storageBin
+	s.MCPServers[1].Command = creativeBin
+	s.MCPServers[2].Command = socialBin
+	s.MCPServers[3].Command = scheduleBin
+	runScenario(t, s)
+}
+
+// --- Trading Scenario ---
+
+var tradingScenario = Scenario{
+	Name: "Trading",
+	Directive: `You manage a simple trading portfolio. Starting cash: $10,000.
+Available symbols: AAPL, GOOGL, MSFT, TSLA.
+
+Spawn and maintain 3 threads:
+1. "data-feed" — reads prices periodically, stores history, reports significant moves to you.
+   Tools: market_get_prices, market_get_history, storage_store, send, done
+2. "analyst" — analyzes price data, identifies buy/sell signals based on price changes.
+   Tools: market_get_history, market_get_prices, storage_get, storage_store, send, done
+3. "executor" — places trades and manages stop-losses based on analyst signals.
+   Tools: market_place_order, market_get_portfolio, market_set_stop_loss, market_get_orders, send, done
+
+Workflow:
+- Data-feed monitors prices and reports to you.
+- You ask analyst to evaluate when significant moves occur.
+- If analyst recommends a trade, you tell executor to place it.
+- Executor sets stop-losses on new positions.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "market", Command: "", Env: map[string]string{"MARKET_DATA_DIR": "{{dataDir}}"}},
+		{Name: "storage", Command: "", Env: map[string]string{"STORAGE_DATA_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		// Seed initial prices
+		writeJSONFile(t, dir, "prices.json", map[string]float64{
+			"AAPL": 185.50, "GOOGL": 142.30, "MSFT": 420.10, "TSLA": 178.90,
+		})
+		// Seed price history (simulated recent data)
+		var history []map[string]any
+		now := time.Now()
+		symbols := map[string]float64{"AAPL": 180.0, "GOOGL": 140.0, "MSFT": 415.0, "TSLA": 185.0}
+		for i := 10; i >= 1; i-- {
+			ts := now.Add(-time.Duration(i) * time.Minute).UTC().Format(time.RFC3339)
+			for sym, base := range symbols {
+				drift := (float64(10-i) / 10.0) * 5.0 // gradual increase
+				history = append(history, map[string]any{
+					"symbol": sym, "price": base + drift, "timestamp": ts,
+				})
+			}
+		}
+		writeJSONFile(t, dir, "history.json", history)
+		// Portfolio: $10k cash, no holdings
+		writeJSONFile(t, dir, "portfolio.json", map[string]any{
+			"cash": 10000.0, "holdings": map[string]any{},
+		})
+	},
+	Phases: []Phase{
+		{
+			Name:    "Startup — 3 threads spawned",
+			Timeout: 90 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				return len(threadIDs(th)) >= 3
+			},
+		},
+		{
+			Name:    "Trading — buy signal and execution",
+			Timeout: 180 * time.Second,
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("Market is open. Start monitoring prices. AAPL and GOOGL are showing upward momentum — consider buying.")
+						injected = true
+					}
+					// Check if any order was placed
+					data, err := os.ReadFile(filepath.Join(dir, "orders.json"))
+					if err != nil {
+						return false
+					}
+					return strings.Contains(string(data), "filled")
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "orders.json"))
+				if !strings.Contains(string(data), "buy") {
+					t.Error("expected at least one buy order")
+				}
+			},
+		},
+		{
+			Name:    "Stop-loss — price drop triggers sell",
+			Timeout: 180 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				// Crash TSLA price to trigger stop-loss (if they bought it)
+				// Or crash whatever they bought
+				writeJSONFile(t, dir, "prices.json", map[string]float64{
+					"AAPL": 150.00, "GOOGL": 110.00, "MSFT": 380.00, "TSLA": 120.00,
+				})
+			},
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("MARKET CRASH: All stocks dropped 15-30%. Check portfolio and stop-losses immediately.")
+						injected = true
+					}
+					// Check if portfolio was updated (stop-loss triggered or manual sell)
+					data, err := os.ReadFile(filepath.Join(dir, "orders.json"))
+					if err != nil {
+						return false
+					}
+					return strings.Contains(string(data), "sell")
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "orders.json"))
+				if !strings.Contains(string(data), "sell") {
+					t.Error("expected at least one sell order after crash")
+				}
+			},
+		},
+	},
+	Timeout:    8 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_Trading(t *testing.T) {
+	marketBin := buildMCPBinary(t, "mcps/market")
+	storageBin := buildMCPBinary(t, "mcps/storage")
+	t.Logf("built market=%s storage=%s", marketBin, storageBin)
+
+	s := tradingScenario
+	s.MCPServers[0].Command = marketBin
+	s.MCPServers[1].Command = storageBin
+	runScenario(t, s)
+}
+
+// --- Onboarding Scenario ---
+
+var onboardingScenario = Scenario{
+	Name: "Onboarding",
+	Directive: `You manage new customer onboarding for a SaaS platform.
+
+Spawn and maintain 3 threads:
+1. "intake" — monitors for new signup files, validates the data, reports to you.
+   Tools: files_fetch_file, files_read_csv, files_list_files, files_file_status, send, done
+2. "provisioner" — creates accounts by writing config files, stores account details.
+   Tools: codebase_write_file, codebase_list_files, storage_store, storage_get, send, done
+3. "welcome" — sends personalized onboarding messages to new customers.
+   Tools: pushover_send_notification, storage_get, send, done
+
+Workflow:
+- You receive a signup file URL via console and tell intake to process it.
+- Intake reads the CSV (name, email, plan), validates, and reports to you.
+- You tell provisioner to create accounts (write config files per customer).
+- After provisioning, you tell welcome to send onboarding messages.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "files", Command: "", Env: map[string]string{"FILES_DATA_DIR": "{{dataDir}}"}},
+		{Name: "codebase", Command: "", Env: map[string]string{"CODEBASE_DIR": "{{dataDir}}"}},
+		{Name: "storage", Command: "", Env: map[string]string{"STORAGE_DATA_DIR": "{{dataDir}}"}},
+		{Name: "pushover", Command: "", Env: map[string]string{"PUSHOVER_USER_KEY": "test", "PUSHOVER_API_TOKEN": "test"}},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		os.MkdirAll(filepath.Join(dir, "accounts"), 0755)
+		// Signup CSV
+		csv := "name,email,plan\nAlice Johnson,alice@startup.io,pro\nBob Chen,bob@bigcorp.com,enterprise\nCarol Davis,carol@freelance.me,starter\n"
+		os.WriteFile(filepath.Join(dir, "signups-batch-1.csv"), []byte(csv), 0644)
+	},
+	Phases: []Phase{
+		{
+			Name:    "Startup — 3 threads spawned",
+			Timeout: 90 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				return len(threadIDs(th)) >= 3
+			},
+		},
+		{
+			Name:    "Onboarding — signup to welcome message",
+			Timeout: 180 * time.Second,
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						csvPath := "file://" + filepath.Join(dir, "signups-batch-1.csv")
+						th.InjectConsole("New signups file: " + csvPath + ". Please onboard these customers.")
+						injected = true
+					}
+					// Check if account config files were created
+					entries, err := os.ReadDir(filepath.Join(dir, "accounts"))
+					if err != nil {
+						return false
+					}
+					return len(entries) >= 2
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				entries, _ := os.ReadDir(filepath.Join(dir, "accounts"))
+				if len(entries) < 2 {
+					t.Errorf("expected at least 2 account config files, got %d", len(entries))
+				}
+				// Check storage has account records
+				data, _ := os.ReadFile(filepath.Join(dir, "store.json"))
+				if len(data) == 0 {
+					t.Error("expected account data in storage")
+				}
+			},
+		},
+	},
+	Timeout:    6 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_Onboarding(t *testing.T) {
+	filesBin := buildMCPBinary(t, "mcps/files")
+	codebaseBin := buildMCPBinary(t, "mcps/codebase")
+	storageBin := buildMCPBinary(t, "mcps/storage")
+	pushoverBin := buildMCPBinary(t, "mcps/pushover")
+	t.Logf("built files=%s codebase=%s storage=%s pushover=%s", filesBin, codebaseBin, storageBin, pushoverBin)
+
+	s := onboardingScenario
+	s.MCPServers[0].Command = filesBin
+	s.MCPServers[1].Command = codebaseBin
+	s.MCPServers[2].Command = storageBin
+	s.MCPServers[3].Command = pushoverBin
+	runScenario(t, s)
+}
