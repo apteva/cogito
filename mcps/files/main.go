@@ -196,14 +196,25 @@ func handleToolCall(id int64, name string, args map[string]string) {
 			respondError(id, -32602, "url and status are required")
 			return
 		}
-		rec, ok := files[url]
-		if !ok {
+		// Match by URL or by local path
+		var rec *FileRecord
+		if r, ok := files[url]; ok {
+			rec = r
+		} else {
+			for _, r := range files {
+				if r.LocalPath == url {
+					rec = r
+					break
+				}
+			}
+		}
+		if rec == nil {
 			textResult(id, fmt.Sprintf("ERROR: file not found: %s", url))
 			return
 		}
 		rec.Status = status
 		save()
-		textResult(id, fmt.Sprintf("OK: %s → %s", url, status))
+		textResult(id, fmt.Sprintf("OK: %s → %s", rec.URL, status))
 
 	default:
 		respondError(id, -32601, fmt.Sprintf("unknown tool: %s", name))
