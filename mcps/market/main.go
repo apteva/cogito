@@ -163,12 +163,17 @@ func checkStopLosses() []string {
 func handleToolCall(id int64, name string, args map[string]string) {
 	switch name {
 	case "get_prices":
+		// Reload prices from disk (external test phases may update prices.json)
+		loadJSON("prices.json", &prices)
+
 		symbols := args["symbols"] // comma-separated or empty for all
 		result := make(map[string]float64)
 		if symbols == "" {
-			result = prices
+			for k, v := range prices {
+				result[k] = v
+			}
 		} else {
-			for _, s := range splitCSV(symbols) {
+			for _, s := range splitSymbols(symbols) {
 				if p, ok := prices[s]; ok {
 					result[s] = p
 				}
@@ -310,38 +315,24 @@ func handleToolCall(id int64, name string, args map[string]string) {
 	}
 }
 
-func splitCSV(s string) []string {
+// splitSymbols splits on commas, spaces, or both.
+func splitSymbols(s string) []string {
 	var result []string
-	for _, p := range splitOn(s, ',') {
-		p = trim(p)
-		if p != "" {
-			result = append(result, p)
+	var current []byte
+	for i := 0; i < len(s); i++ {
+		if s[i] == ',' || s[i] == ' ' || s[i] == '\t' {
+			if len(current) > 0 {
+				result = append(result, string(current))
+				current = nil
+			}
+		} else {
+			current = append(current, s[i])
 		}
+	}
+	if len(current) > 0 {
+		result = append(result, string(current))
 	}
 	return result
-}
-
-func splitOn(s string, sep byte) []string {
-	var parts []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep {
-			parts = append(parts, s[start:i])
-			start = i + 1
-		}
-	}
-	parts = append(parts, s[start:])
-	return parts
-}
-
-func trim(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
-		s = s[:len(s)-1]
-	}
-	return s
 }
 
 func main() {

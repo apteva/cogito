@@ -37,6 +37,7 @@ type Phase struct {
 // runScenario executes a scenario end-to-end.
 func runScenario(t *testing.T, s Scenario) {
 	t.Helper()
+	scenarioStart := time.Now()
 	apiKey := getAPIKey(t)
 
 	if s.Timeout == 0 {
@@ -75,6 +76,10 @@ func runScenario(t *testing.T, s Scenario) {
 	var peakThreads atomic.Int32
 	var stopped atomic.Bool
 
+	// Token/cost tracking
+	var totalPrompt, totalCached, totalCompletion atomic.Int64
+	var iterCount atomic.Int64
+
 	// Observer: log events
 	obs := thinker.bus.SubscribeAll("test-observer", 500)
 	go func() {
@@ -83,8 +88,15 @@ func runScenario(t *testing.T, s Scenario) {
 			case ev := <-obs.C:
 				switch ev.Type {
 				case EventThinkDone:
-					t.Logf("[%s iter %d] threads=%d rate=%s tools=%v events=%d",
-						ev.From, ev.Iteration, ev.ThreadCount, ev.Rate, ev.ToolCalls, len(ev.ConsumedEvents))
+					totalPrompt.Add(int64(ev.Usage.PromptTokens))
+					totalCached.Add(int64(ev.Usage.CachedTokens))
+					totalCompletion.Add(int64(ev.Usage.CompletionTokens))
+					iterCount.Add(1)
+					cost := calculateCostForProvider(thinker.provider, ev.Usage)
+					t.Logf("[%s iter %d] threads=%d rate=%s tok=%d/%d/$%.4f tools=%v events=%d",
+						ev.From, ev.Iteration, ev.ThreadCount, ev.Rate,
+						ev.Usage.PromptTokens, ev.Usage.CompletionTokens, cost,
+						ev.ToolCalls, len(ev.ConsumedEvents))
 				case EventThreadStart, EventThreadDone:
 					t.Logf("[%s] %s %s", ev.From, ev.Type, ev.Text)
 				case EventInbox:
@@ -148,7 +160,25 @@ func runScenario(t *testing.T, s Scenario) {
 
 	// Check peak threads
 	peak := int(peakThreads.Load())
-	t.Logf("Peak threads: %d, final threads: %d", peak, thinker.threads.Count())
+
+	// Token/cost summary
+	prompt := totalPrompt.Load()
+	cached := totalCached.Load()
+	completion := totalCompletion.Load()
+	iters := iterCount.Load()
+	totalTok := prompt + completion
+	totalCost := calculateCostForProvider(thinker.provider, TokenUsage{
+		PromptTokens: int(prompt), CachedTokens: int(cached), CompletionTokens: int(completion),
+	})
+	elapsed := time.Since(scenarioStart)
+
+	t.Logf("────────────────────────────────────────")
+	t.Logf("Scenario: %s", s.Name)
+	t.Logf("Duration: %s | Iterations: %d | Peak threads: %d", elapsed.Round(time.Second), iters, peak)
+	t.Logf("Tokens:   %d total (in:%d cached:%d out:%d)", totalTok, prompt, cached, completion)
+	t.Logf("Cost:     $%.4f | Provider: %s", totalCost, thinker.provider.Name())
+	t.Logf("────────────────────────────────────────")
+
 	if s.MaxThreads > 0 && peak > s.MaxThreads {
 		t.Errorf("peak thread count %d exceeded limit of %d", peak, s.MaxThreads)
 	}
@@ -1922,8 +1952,10 @@ Spawn and maintain 3 threads:
 Workflow:
 - Data-feed monitors prices and reports to you.
 - You ask analyst to evaluate when significant moves occur.
-- If analyst recommends a trade, you tell executor to place it.
-- Executor sets stop-losses on new positions.`,
+- If analyst recommends a trade, you tell executor to place it with exact symbol, side, qty.
+- Executor sets stop-losses on new positions (10% below buy price).
+
+IMPORTANT: Act decisively. When told to consider buying, have analyst check history, make a concrete recommendation, and have executor place the trade. Do not just observe — trade.`,
 	MCPServers: []MCPServerConfig{
 		{Name: "market", Command: "", Env: map[string]string{"MARKET_DATA_DIR": "{{dataDir}}"}},
 		{Name: "storage", Command: "", Env: map[string]string{"STORAGE_DATA_DIR": "{{dataDir}}"}},
@@ -1967,7 +1999,7 @@ Workflow:
 				injected := false
 				return func(t *testing.T, dir string, th *Thinker) bool {
 					if !injected {
-						th.InjectConsole("Market is open. Start monitoring prices. AAPL and GOOGL are showing upward momentum — consider buying.")
+						th.InjectConsole("Market is open. AAPL shows strong upward trend from $180 to $185.50 over the last 10 periods. Buy 10 shares of AAPL now and set a stop-loss at $170.")
 						injected = true
 					}
 					// Check if any order was placed
@@ -1999,7 +2031,7 @@ Workflow:
 				injected := false
 				return func(t *testing.T, dir string, th *Thinker) bool {
 					if !injected {
-						th.InjectConsole("MARKET CRASH: All stocks dropped 15-30%. Check portfolio and stop-losses immediately.")
+						th.InjectConsole("MARKET CRASH: Prices just dropped hard. AAPL is now $150. Sell all AAPL positions immediately to limit losses.")
 						injected = true
 					}
 					// Check if portfolio was updated (stop-loss triggered or manual sell)
