@@ -679,7 +679,7 @@ func (t *Thinker) Run() {
 		var calls []toolCall
 		if len(chatResp.ToolCalls) > 0 {
 			for _, ntc := range chatResp.ToolCalls {
-				calls = append(calls, toolCall{Name: ntc.Name, Args: ntc.Args, Raw: fmt.Sprintf("[[%s]]", ntc.Name), NativeID: ntc.ID})
+				calls = append(calls, toolCall{Name: ntc.Name, Args: ntc.Args, Raw: ntc.Name, NativeID: ntc.ID})
 			}
 		} else {
 			calls = parseToolCalls(reply)

@@ -202,7 +202,7 @@ func executeTool(t *Thinker, call toolCall) {
 		if len(resultPreviewForTUI) > 120 {
 			resultPreviewForTUI = resultPreviewForTUI[:120] + "..."
 		}
-		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: "\n← " + call.Name + ": " + resultPreviewForTUI, Iteration: t.iteration})
+		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: "\n← " + call.Name + ": " + resultPreviewForTUI + "\n", Iteration: t.iteration})
 
 		t.Inject(fmt.Sprintf("[tool:%s] %s", call.Name, result))
 	}()

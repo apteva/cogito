@@ -123,14 +123,20 @@ type geminiContent struct {
 }
 
 type geminiPart struct {
-	Text         string              `json:"text,omitempty"`
-	InlineData   *geminiInline       `json:"inlineData,omitempty"`
-	FunctionCall *geminiFunctionCall `json:"functionCall,omitempty"`
+	Text             string                  `json:"text,omitempty"`
+	InlineData       *geminiInline           `json:"inlineData,omitempty"`
+	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
 }
 
 type geminiFunctionCall struct {
 	Name string         `json:"name"`
 	Args map[string]any `json:"args"`
+}
+
+type geminiFunctionResponse struct {
+	Name     string         `json:"name"`
+	Response map[string]any `json:"response"`
 }
 
 type geminiInline struct {
@@ -182,6 +188,48 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 			}
 			continue
 		}
+		// Handle tool result messages (user → functionResponse)
+		if len(m.ToolResults) > 0 {
+			var parts []geminiPart
+			for _, tr := range m.ToolResults {
+				parts = append(parts, geminiPart{
+					FunctionResponse: &geminiFunctionResponse{
+						Name:     tr.CallID, // Gemini uses the function name, but we store callID
+						Response: map[string]any{"result": tr.Content},
+					},
+				})
+			}
+			if len(contents) > 0 && contents[len(contents)-1].Role == "user" {
+				contents[len(contents)-1].Parts = append(contents[len(contents)-1].Parts, parts...)
+			} else {
+				contents = append(contents, geminiContent{Role: "user", Parts: parts})
+			}
+			continue
+		}
+
+		// Handle assistant messages with tool calls (model → functionCall)
+		if len(m.ToolCalls) > 0 {
+			var parts []geminiPart
+			if m.Content != "" {
+				parts = append(parts, geminiPart{Text: m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				args := make(map[string]any)
+				for k, v := range tc.Args {
+					args[k] = v
+				}
+				parts = append(parts, geminiPart{
+					FunctionCall: &geminiFunctionCall{Name: tc.Name, Args: args},
+				})
+			}
+			if len(contents) > 0 && contents[len(contents)-1].Role == "model" {
+				contents[len(contents)-1].Parts = append(contents[len(contents)-1].Parts, parts...)
+			} else {
+				contents = append(contents, geminiContent{Role: "model", Parts: parts})
+			}
+			continue
+		}
+
 		role := "user"
 		if m.Role == "assistant" {
 			role = "model"
@@ -190,8 +238,11 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 		var parts []geminiPart
 		if m.HasParts() {
 			parts = toGeminiParts(m.Parts)
-		} else {
+		} else if m.Content != "" {
 			parts = []geminiPart{{Text: m.Content}}
+		} else {
+			// Skip empty messages
+			continue
 		}
 
 		// Merge consecutive same-role messages (Gemini requirement)

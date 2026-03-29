@@ -29,6 +29,13 @@ var (
 	thoughtStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("252"))
 
+	toolCallStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("49")).
+			Bold(true)
+
+	toolResultStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("141"))
+
 	statusBarStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("235")).
 			Background(lipgloss.Color("39")).
@@ -1028,18 +1035,38 @@ func (m model) renderThoughts(maxWidth int) string {
 			header += statsStyle.Render(fmt.Sprintf(" (%s)", t.duration.Round(time.Millisecond)))
 		}
 		sb.WriteString(header + "\n")
-		sb.WriteString(thoughtStyle.Render(wrapText(t.content, contentWidth)) + "\n\n")
+		sb.WriteString(styleThoughtContent(t.content, contentWidth) + "\n\n")
 	}
 
 	if v.currentChunk.Len() > 0 {
 		header := thoughtHeaderStyle.Render(fmt.Sprintf("━━━ Thought #%d", v.iteration))
 		sb.WriteString(header + " ▍\n")
-		sb.WriteString(thoughtStyle.Render(wrapText(v.currentChunk.String(), contentWidth)))
+		sb.WriteString(styleThoughtContent(v.currentChunk.String(), contentWidth))
 	}
 
 	return sb.String()
 }
 
+
+// styleThoughtContent applies different colors to tool calls (→) and results (←).
+func styleThoughtContent(content string, width int) string {
+	lines := strings.Split(content, "\n")
+	var sb strings.Builder
+	for i, line := range lines {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "→ ") {
+			sb.WriteString(toolCallStyle.Render(wrapText(line, width)))
+		} else if strings.HasPrefix(trimmed, "← ") {
+			sb.WriteString(toolResultStyle.Render(wrapText(line, width)))
+		} else {
+			sb.WriteString(thoughtStyle.Render(wrapText(line, width)))
+		}
+	}
+	return sb.String()
+}
 
 func (m model) renderMemoryPanel(width, height int) string {
 	if width <= 0 {
