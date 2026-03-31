@@ -9,6 +9,9 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// Version is set at build time via -ldflags.
+var Version = "dev"
+
 // ContentPart represents a multimodal content block (OpenAI Chat Completions format).
 type ContentPart struct {
 	Type       string      `json:"type"`                  // "text", "image_url", "input_audio", "audio_url"

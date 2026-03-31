@@ -93,6 +93,14 @@ func (tr *ToolRegistry) registerDefaults() {
 		MainOnly:    true,
 	})
 	tr.Register(&ToolDef{
+		Name:        "update",
+		Description: "Update a running thread's directive and/or tools. The thread's system prompt is rebuilt immediately.",
+		Syntax:      `[[update id="name" directive="New directive" tools="tool1,tool2"]]`,
+		Rules:       `Provide directive, tools, or both. The thread is notified of directive changes. Tools replace the full set (builtins are always included).`,
+		Core:        true,
+		MainOnly:    true,
+	})
+	tr.Register(&ToolDef{
 		Name:        "connect",
 		Description: "Connect to an MCP server at runtime. Supports stdio (command) or Streamable HTTP (url) transport. Discovers and registers all tools from the server.",
 		Syntax:      `[[connect name="server-name" url="http://host:port/mcp/1" transport="http"]]`,

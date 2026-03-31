@@ -941,8 +941,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					var d ToolCallData
 					if json.Unmarshal(ev.Data, &d) == nil {
 						m.pendingApproval = &d
+						args := toolArgsSummary(toolCall{Args: d.Args})
 						line = fmt.Sprintf("%s %s %s %s(%s)",
-							ts, telemetryToolStyle.Render("APPROVE?"), ev.ThreadID, d.Name, d.Args)
+							ts, telemetryToolStyle.Render("APPROVE?"), ev.ThreadID, d.Name, args)
 					}
 				case ev.Type == "tool.approved":
 					var d ToolCallData
@@ -1749,7 +1750,7 @@ func (m model) View() string {
 
 	var footer string
 	if m.pendingApproval != nil {
-		args := m.pendingApproval.Args
+		args := toolArgsSummary(toolCall{Args: m.pendingApproval.Args})
 		if len(args) > 60 {
 			args = args[:60] + "..."
 		}

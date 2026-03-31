@@ -105,11 +105,25 @@ func toOpenAIMessages(messages []Message) []any {
 		// Tool result messages
 		if len(m.ToolResults) > 0 {
 			for _, tr := range m.ToolResults {
-				out = append(out, openaiToolResultMsg{
-					Role:       "tool",
-					Content:    tr.Content,
-					ToolCallID: tr.CallID,
-				})
+				if tr.Image != nil {
+					// Tool result with image — send as multimodal content
+					out = append(out, map[string]any{
+						"role":         "tool",
+						"tool_call_id": tr.CallID,
+						"content": []map[string]any{
+							{"type": "text", "text": tr.Content},
+							{"type": "image_url", "image_url": map[string]string{
+								"url": "data:image/png;base64," + base64Encode(tr.Image),
+							}},
+						},
+					})
+				} else {
+					out = append(out, openaiToolResultMsg{
+						Role:       "tool",
+						Content:    tr.Content,
+						ToolCallID: tr.CallID,
+					})
+				}
 			}
 			continue
 		}
@@ -179,6 +193,18 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 		return ChatResponse{}, err
 	}
 
+	// Log message count and types for debugging
+	if msgs, ok := reqMap["messages"].([]any); ok {
+		for i, m := range msgs {
+			switch v := m.(type) {
+			case map[string]any:
+				if v["role"] == "tool" {
+					logMsg("OPENAI", fmt.Sprintf("msg[%d] role=tool call_id=%v content_type=%T", i, v["tool_call_id"], v["content"]))
+				}
+			}
+		}
+	}
+
 	req, err := http.NewRequest("POST", p.url, bytes.NewReader(body))
 	if err != nil {
 		return ChatResponse{}, err
@@ -188,7 +214,7 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 		req.Header.Set("Authorization", p.authHeader+" "+p.apiKey)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := llmHTTPClient.Do(req)
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -309,7 +335,7 @@ func NewFireworksProvider(apiKey string) LLMProvider {
 		authHeader: "Bearer",
 		models: map[ModelTier]string{
 			ModelLarge: "accounts/fireworks/models/kimi-k2p5",
-			ModelSmall: "accounts/fireworks/models/kimi-k2p5",
+			ModelSmall: "accounts/fireworks/routers/kimi-k2p5-turbo",
 		},
 		inputCost:  0.60,
 		cachedCost: 0.10,

@@ -192,10 +192,14 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 		if len(m.ToolResults) > 0 {
 			var parts []geminiPart
 			for _, tr := range m.ToolResults {
+				response := map[string]any{"result": tr.Content}
+				if tr.Image != nil {
+					response["screenshot"] = base64Encode(tr.Image)
+				}
 				parts = append(parts, geminiPart{
 					FunctionResponse: &geminiFunctionResponse{
-						Name:     tr.CallID, // Gemini uses the function name, but we store callID
-						Response: map[string]any{"result": tr.Content},
+						Name:     tr.CallID,
+						Response: response,
 					},
 				})
 			}
@@ -330,7 +334,7 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := llmHTTPClient.Do(req)
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -423,7 +427,7 @@ func fetchMediaAsBase64(url string) (string, string, error) {
 		return "", "", fmt.Errorf("fetch failed: %w", err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; AptevaCore/1.0)")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := llmHTTPClient.Do(req)
 	if err != nil {
 		return "", "", fmt.Errorf("fetch failed: %w", err)
 	}

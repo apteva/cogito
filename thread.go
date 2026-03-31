@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -182,7 +183,8 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, med
 	go thinker.Run()
 
 	tm.parent.bus.Publish(Event{Type: EventThreadStart, From: id, Text: fmt.Sprintf("Thread %q spawned", id)})
-	tm.parent.Inject(fmt.Sprintf("[thread:%s] started", id))
+	toolList := toolSetToSlice(thread.Tools)
+	tm.parent.Inject(fmt.Sprintf("[thread:%s] started (tools: %s)", id, strings.Join(toolList, ", ")))
 	tm.parent.logAPI(APIEvent{Type: "thread_started", ThreadID: id})
 
 	// Telemetry: thread.spawn
@@ -371,6 +373,77 @@ func (tm *ThreadManager) Count() int {
 	return len(tm.threads)
 }
 
+// Update changes a thread's directive and/or tools. Rebuilds the system prompt immediately.
+func (tm *ThreadManager) Update(id, directive string, tools []string) error {
+	tm.mu.RLock()
+	thread, exists := tm.threads[id]
+	tm.mu.RUnlock()
+	if !exists {
+		return fmt.Errorf("thread %q not found", id)
+	}
+
+	if directive != "" {
+		thread.Directive = directive
+	}
+	if len(tools) > 0 {
+		toolSet := make(map[string]bool)
+		for _, t := range tools {
+			toolSet[strings.TrimSpace(t)] = true
+		}
+		// Always include builtins
+		for _, b := range []string{"send", "done", "pace", "evolve", "remember"} {
+			toolSet[b] = true
+		}
+		thread.Tools = toolSet
+		thread.Thinker.toolAllowlist = toolSet
+	}
+
+	// Rebuild system prompt
+	if thread.Thinker.rebuildPrompt != nil {
+		thread.Thinker.messages[0] = Message{Role: "system", Content: thread.Thinker.rebuildPrompt("")}
+	}
+
+	// Persist
+	tm.parent.config.SaveThread(PersistentThread{
+		ID: id, Directive: thread.Directive, Tools: toolSetToSlice(thread.Tools),
+	})
+
+	return nil
+}
+
+// FindPendingApproval checks all child threads for a pending tool call.
+func (tm *ThreadManager) FindPendingApproval() *toolCall {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	for _, thread := range tm.threads {
+		thread.Thinker.pendingMu.Lock()
+		if thread.Thinker.pendingTool != nil {
+			tc := thread.Thinker.pendingTool
+			thread.Thinker.pendingMu.Unlock()
+			return tc
+		}
+		thread.Thinker.pendingMu.Unlock()
+	}
+	return nil
+}
+
+// PauseAll pauses or resumes all child threads.
+func (tm *ThreadManager) PauseAll(paused bool) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	for _, thread := range tm.threads {
+		t := thread.Thinker
+		if t.paused != paused {
+			select {
+			case <-t.pause:
+			default:
+			}
+			t.pause <- paused
+			t.paused = paused
+		}
+	}
+}
+
 func (tm *ThreadManager) cleanupThread(id string) {
 	logMsg("THREAD", fmt.Sprintf("%s cleanupThread start", id))
 	tm.mu.Lock()
@@ -396,5 +469,6 @@ func toolSetToSlice(m map[string]bool) []string {
 	for k := range m {
 		out = append(out, k)
 	}
+	sort.Strings(out)
 	return out
 }

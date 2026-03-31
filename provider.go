@@ -2,8 +2,24 @@ package main
 
 import (
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"time"
 )
+
+// llmHTTPClient is a shared HTTP client for all LLM provider calls.
+// It uses a response header timeout (30s to get first byte) but no overall
+// timeout since streaming responses can legitimately take minutes.
+var llmHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		ResponseHeaderTimeout: 30 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout: 10 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+	},
+}
 
 // NativeTool defines a tool sent to the provider API.
 type NativeTool struct {

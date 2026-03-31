@@ -1653,7 +1653,7 @@ Workflow:
 	},
 	DataSetup: func(t *testing.T, dir string) {
 		writeJSONFile(t, dir, "stock.json", map[string]int{
-			"flour": 50, "sugar": 30, "butter": 20, "eggs": 100, "chocolate": 5,
+			"chocolate cake": 10, "croissant": 50, "baguette": 30, "muffin": 25, "chocolate truffle": 8,
 		})
 		writeJSONFile(t, dir, "orders.json", []map[string]any{})
 	},
@@ -1702,7 +1702,7 @@ Workflow:
 			Timeout: 180 * time.Second,
 			Setup: func(t *testing.T, dir string) {
 				writeJSONFile(t, dir, "stock.json", map[string]int{
-					"flour": 50, "sugar": 30, "butter": 20, "eggs": 100, "chocolate": 0,
+					"chocolate cake": 10, "croissant": 50, "baguette": 30, "muffin": 25, "chocolate truffle": 0,
 				})
 				writeJSONFile(t, dir, "orders.json", []map[string]string{
 					{"id": "ORD-003", "item": "chocolate truffle", "qty": "5", "status": "pending"},
@@ -1712,17 +1712,14 @@ Workflow:
 				injected := false
 				return func(t *testing.T, dir string, th *Thinker) bool {
 					if !injected {
-						th.InjectConsole("New order: ORD-003 (chocolate truffle x5). Please process.")
+						th.InjectConsole("New order: ORD-003 (chocolate truffle x5). Please process. If out of stock, mark the order as cancelled.")
 						injected = true
 					}
 					data, err := os.ReadFile(filepath.Join(dir, "orders.json"))
 					if err != nil {
 						return false
 					}
-					// Warehouse should report out-of-stock or backorder
-					return strings.Contains(string(data), "backorder") ||
-						strings.Contains(string(data), "out_of_stock") ||
-						strings.Contains(string(data), "cancelled")
+					return strings.Contains(string(data), "cancelled")
 				}
 			}(),
 		},

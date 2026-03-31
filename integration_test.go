@@ -14,15 +14,12 @@ import (
 //   All tests:            go test -v -count=1
 //   Integration only:     go test -v -run TestIntegration
 
-func init() {
-	godotenv.Load() // auto-load .env from project root
-}
-
 func getAPIKey(t *testing.T) string {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
+	godotenv.Load() // load .env only when integration tests actually need it
 	key := os.Getenv("FIREWORKS_API_KEY")
 	if key == "" {
 		t.Skip("FIREWORKS_API_KEY not set, skipping integration test")

@@ -366,9 +366,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				if id != "" && directive != "" {
 					var err error
 					if len(mediaParts) > 0 {
-						err = t.threads.SpawnWithMedia(id, directive, tools, mediaParts, consumed...)
+						err = t.threads.SpawnWithMedia(id, directive, tools, mediaParts)
 					} else {
-						err = t.threads.Spawn(id, directive, tools, consumed...)
+						err = t.threads.Spawn(id, directive, tools)
 					}
 					if err != nil {
 						t.Inject(fmt.Sprintf("[error] spawn %q: %v", id, err))
@@ -385,6 +385,25 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					t.config.RemoveThread(id)
 				}
 				toolNames = append(toolNames, call.Raw)
+			case "update":
+				id := call.Args["id"]
+				directive := call.Args["directive"]
+				toolsStr := call.Args["tools"]
+				if id != "" {
+					var tools []string
+					if toolsStr != "" {
+						tools = strings.Split(toolsStr, ",")
+					}
+					if err := t.threads.Update(id, directive, tools); err != nil {
+						t.Inject(fmt.Sprintf("[error] update %q: %v", id, err))
+					} else {
+						// Notify the thread about the change
+						if directive != "" {
+							t.threads.Send(id, fmt.Sprintf("[directive updated] %s", directive))
+						}
+					}
+				}
+				toolNames = append(toolNames, call.Raw)
 			case "send":
 				id := call.Args["id"]
 				msg := call.Args["message"]
@@ -393,6 +412,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					parts := parseMediaURLs(mediaStr)
 					if !t.threads.SendWithParts(id, msg, parts) {
 						t.Inject(fmt.Sprintf("[error] thread %q not found", id))
+					} else if t.telemetry != nil {
+						t.telemetry.Emit("thread.message", "main", ThreadMessageData{
+							From: "main", To: id, Message: msg,
+						})
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -543,12 +566,16 @@ func (t *Thinker) Run() {
 		// Drain events from bus, optionally filter/route
 		drained := t.drainEvents()
 
-		// Extract text strings and collect media parts
+		// Extract text strings, collect media parts, and separate tool results
 		var consumed []string
 		var mediaParts []ContentPart
+		var toolResults []ToolResult
 		for _, de := range drained {
 			consumed = append(consumed, de.Text)
 			mediaParts = append(mediaParts, de.Parts...)
+			if de.ToolResult != nil {
+				toolResults = append(toolResults, *de.ToolResult)
+			}
 		}
 
 		if len(consumed) > 0 {
@@ -559,6 +586,22 @@ func (t *Thinker) Run() {
 					preview = preview[:100] + "..."
 				}
 				logMsg("RUN", fmt.Sprintf("[%s]   event[%d]: %s", t.threadID, i, preview))
+
+				// Telemetry: emit each drained event (skip tool results — those have their own telemetry)
+				if t.telemetry != nil && !strings.HasPrefix(ev, "[tool:") {
+					source := "bus"
+					if strings.HasPrefix(ev, "[console]") {
+						source = "console"
+					} else if strings.HasPrefix(ev, "[from:") {
+						source = "thread"
+					} else if strings.HasPrefix(ev, "[webhook:") || strings.HasPrefix(ev, "[subscription:") {
+						source = "webhook"
+					}
+					t.telemetry.Emit("event.received", t.threadID, map[string]string{
+						"source":  source,
+						"message": preview,
+					})
+				}
 			}
 		}
 		// Only go reactive for non-tool events (user messages, console, thread sends)
@@ -580,18 +623,38 @@ func (t *Thinker) Run() {
 		}
 
 		now := time.Now().Format("2006-01-02 15:04:05")
+
+		// If we have tool results, add them as a proper tool_result message first
+		if len(toolResults) > 0 {
+			t.messages = append(t.messages, Message{Role: "user", ToolResults: toolResults})
+		}
+
 		if hadEvents {
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
+			// Filter out tool result text from the events text (they're already in ToolResults)
+			var textEvents []string
 			for _, ev := range consumed {
-				sb.WriteString("• " + ev + "\n")
+				if len(toolResults) > 0 && strings.HasPrefix(ev, "[tool:computer_use]") {
+					continue // skip, already handled as ToolResult
+				}
+				textEvents = append(textEvents, ev)
 			}
-			msg := Message{Role: "user", Content: sb.String()}
-			if len(mediaParts) > 0 {
-				msg.Parts = append([]ContentPart{{Type: "text", Text: sb.String()}}, mediaParts...)
+
+			var sb strings.Builder
+			if len(textEvents) > 0 {
+				sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
+				for _, ev := range textEvents {
+					sb.WriteString("• " + ev + "\n")
+				}
 			}
-			t.messages = append(t.messages, msg)
-		} else {
+			if sb.Len() > 0 || len(mediaParts) > 0 {
+				msg := Message{Role: "user", Content: sb.String()}
+				if len(mediaParts) > 0 {
+					msg.Parts = append([]ContentPart{{Type: "text", Text: sb.String()}}, mediaParts...)
+				}
+				t.messages = append(t.messages, msg)
+			}
+		} else if len(toolResults) == 0 {
+			// Only add "no events" if we also have no tool results
 			t.messages = append(t.messages, Message{Role: "user", Content: fmt.Sprintf("[%s] (no events)", now)})
 		}
 
@@ -819,15 +882,15 @@ func (t *Thinker) think() (ChatResponse, error) {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"action":    map[string]string{"type": "string", "description": "Action: click, double_click, type, key, scroll, screenshot, navigate, wait"},
-					"x":         map[string]string{"type": "integer", "description": "X coordinate for click/scroll"},
-					"y":         map[string]string{"type": "integer", "description": "Y coordinate for click/scroll"},
-					"text":      map[string]string{"type": "string", "description": "Text to type"},
-					"key":       map[string]string{"type": "string", "description": "Key to press (Enter, Escape, etc.)"},
-					"direction": map[string]string{"type": "string", "description": "Scroll direction: up, down, left, right"},
-					"url":       map[string]string{"type": "string", "description": "URL to navigate to"},
+					"action":     map[string]string{"type": "string", "description": "Action: click, double_click, type, key, scroll, screenshot, navigate, wait"},
+					"coordinate": map[string]string{"type": "array", "description": "[x, y] coordinate for click/scroll"},
+					"text":       map[string]string{"type": "string", "description": "Text to type"},
+					"key":        map[string]string{"type": "string", "description": "Key to press (Enter, Escape, etc.)"},
+					"url":        map[string]string{"type": "string", "description": "URL to navigate to"},
 				},
-				"required": []string{"action"},
+				"required":       []string{"action"},
+				"_display_width":  display.Width,
+				"_display_height": display.Height,
 			},
 		})
 	}
@@ -837,8 +900,9 @@ func (t *Thinker) think() (ChatResponse, error) {
 
 // drainEvents reads all pending events and wake signals from this thinker's bus subscription.
 type drainedEvent struct {
-	Text  string
-	Parts []ContentPart
+	Text       string
+	Parts      []ContentPart
+	ToolResult *ToolResult
 }
 
 // drainEventTexts is a convenience for tests — returns just the text strings.
@@ -857,7 +921,7 @@ func (t *Thinker) drainEvents() []drainedEvent {
 		select {
 		case ev := <-t.sub.C:
 			if ev.Type == EventInbox {
-				items = append(items, drainedEvent{Text: ev.Text, Parts: ev.Parts})
+				items = append(items, drainedEvent{Text: ev.Text, Parts: ev.Parts, ToolResult: ev.ToolResult})
 			}
 		case <-t.sub.Wake:
 			continue
@@ -969,6 +1033,10 @@ func (t *Thinker) TogglePause() {
 	}
 	t.pause <- newState
 	t.paused = newState
+	// Pause/resume all child threads too
+	if t.threads != nil {
+		t.threads.PauseAll(newState)
+	}
 }
 
 // SetComputer attaches a computer use environment to this thinker.
@@ -1031,7 +1099,7 @@ func normalizeComputerAction(args map[string]string) computer.Action {
 	return action
 }
 
-// executeComputerAction runs a computer_use action and injects the result.
+// executeComputerAction runs a computer_use action and injects the result as a proper ToolResult.
 func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 	logMsg("COMPUTER", fmt.Sprintf("action=%s args=%v", ntc.Args["action"], ntc.Args))
 	start := time.Now()
@@ -1040,11 +1108,19 @@ func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 	screenshot, err := t.computer.Execute(action)
 
 	duration := time.Since(start)
+
 	if err != nil {
 		logMsg("COMPUTER", fmt.Sprintf("error (%dms): %v", duration.Milliseconds(), err))
-		t.Inject(fmt.Sprintf("[tool:computer_use] error: %v", err))
-
-		// Emit TUI chunk
+		// Inject as tool result with error
+		t.bus.Publish(Event{
+			Type: EventInbox, To: t.threadID,
+			Text: fmt.Sprintf("[tool:computer_use] error: %v", err),
+			ToolResult: &ToolResult{
+				CallID:  ntc.ID,
+				Content: fmt.Sprintf("Error: %v", err),
+				IsError: true,
+			},
+		})
 		t.bus.Publish(Event{Type: EventChunk, From: t.threadID,
 			Text: "\n← computer_use: error: " + err.Error() + "\n", Iteration: t.iteration})
 		return
@@ -1052,19 +1128,17 @@ func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 
 	logMsg("COMPUTER", fmt.Sprintf("done (%dms) screenshot=%d bytes", duration.Milliseconds(), len(screenshot)))
 
-	// Inject screenshot as a multimodal event (image part)
-	imgPart := ContentPart{
-		Type:     "image_url",
-		ImageURL: &ImageURL{URL: "data:image/png;base64," + encodeBase64(screenshot)},
-	}
+	// Inject as tool result with screenshot image
 	t.bus.Publish(Event{
-		Type:  EventInbox,
-		To:    t.threadID,
-		Text:  fmt.Sprintf("[tool:computer_use] screenshot (%d bytes, %dms)", len(screenshot), duration.Milliseconds()),
-		Parts: []ContentPart{imgPart},
+		Type: EventInbox, To: t.threadID,
+		Text: fmt.Sprintf("[tool:computer_use] screenshot (%d bytes, %dms)", len(screenshot), duration.Milliseconds()),
+		ToolResult: &ToolResult{
+			CallID: ntc.ID,
+			Content: fmt.Sprintf("Screenshot taken after %s action (%dms)", action.Type, duration.Milliseconds()),
+			Image:  screenshot,
+		},
 	})
 
-	// Emit TUI chunk
 	t.bus.Publish(Event{Type: EventChunk, From: t.threadID,
 		Text: fmt.Sprintf("\n← computer_use: screenshot (%d bytes, %dms)\n", len(screenshot), duration.Milliseconds()),
 		Iteration: t.iteration})

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -48,8 +49,11 @@ func NewTelemetry() *Telemetry {
 	// Configure server URL for fire-and-forget
 	if url := os.Getenv("SERVER_URL"); url != "" {
 		t.serverURL = url
+		logMsg("TELEMETRY", fmt.Sprintf("server URL configured: %s, instanceID=%d", url, t.instanceID))
 		go t.forwardLoop()
 		go t.liveForwardLoop() // serialized live event forwarding
+	} else {
+		logMsg("TELEMETRY", "no SERVER_URL set — forwarding disabled")
 	}
 
 	return t
@@ -89,9 +93,12 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 	t.mu.Lock()
 	if store {
 		t.log = append(t.log, ev)
+		logMsg("TELEMETRY", fmt.Sprintf("emit STORED %s (log=%d, serverURL=%s)", eventType, len(t.log), t.serverURL))
 		if len(t.log) > 2000 {
 			t.log = t.log[len(t.log)-1000:]
 		}
+	} else {
+		logMsg("TELEMETRY", fmt.Sprintf("emit LIVE-ONLY %s", eventType))
 	}
 	t.liveLog = append(t.liveLog, ev)
 	if len(t.liveLog) > 2000 {
@@ -105,12 +112,12 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 	default:
 	}
 
-	// Queue for ordered forwarding (async goroutines cause chunk reordering)
-	if !store && t.serverURL != "" {
+	// Forward ALL events to server for broadcast (live display on dashboard/console)
+	if t.serverURL != "" {
 		select {
 		case t.forwardCh <- ev:
 		default:
-			// Drop if queue full (back-pressure)
+			logMsg("TELEMETRY", fmt.Sprintf("forwardCh FULL, dropping %s", eventType))
 		}
 	}
 }
@@ -139,16 +146,23 @@ func (t *Telemetry) forwardLive(ev TelemetryEvent) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 2 * time.Second}
-	if resp, err := client.Do(req); err == nil {
-		resp.Body.Close()
+	resp, err := client.Do(req)
+	if err != nil {
+		logMsg("TELEMETRY", fmt.Sprintf("forwardLive: POST error for %s: %v", ev.Type, err))
+		return
 	}
+	resp.Body.Close()
 }
 
 // Events returns all events (including live-only) since the given index. Used by SSE.
+// If the log was truncated (since > len), reset to return everything available.
 func (t *Telemetry) Events(since int) ([]TelemetryEvent, int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if since >= len(t.liveLog) {
+	if since > len(t.liveLog) {
+		since = 0
+	}
+	if since == len(t.liveLog) {
 		return nil, len(t.liveLog)
 	}
 	events := make([]TelemetryEvent, len(t.liveLog)-since)
@@ -157,10 +171,15 @@ func (t *Telemetry) Events(since int) ([]TelemetryEvent, int) {
 }
 
 // StoredEvents returns only stored events since the given index. Used by forwardLoop.
+// If the log was truncated (since > len), reset to return everything available.
 func (t *Telemetry) StoredEvents(since int) ([]TelemetryEvent, int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if since >= len(t.log) {
+	if since > len(t.log) {
+		// Log was truncated — reset to drain everything remaining
+		since = 0
+	}
+	if since == len(t.log) {
 		return nil, len(t.log)
 	}
 	events := make([]TelemetryEvent, len(t.log)-since)
@@ -168,13 +187,15 @@ func (t *Telemetry) StoredEvents(since int) ([]TelemetryEvent, int) {
 	return events, len(t.log)
 }
 
-// forwardLoop batches events and POSTs them to the server every second.
+// forwardLoop batches stored events and POSTs them to the server for DB persistence.
 func (t *Telemetry) forwardLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	var lastSent int
 	client := &http.Client{Timeout: 5 * time.Second}
+
+	logMsg("TELEMETRY", fmt.Sprintf("forwardLoop started, server=%s", t.serverURL))
 
 	for {
 		select {
@@ -184,24 +205,36 @@ func (t *Telemetry) forwardLoop() {
 				continue
 			}
 
+			types := make([]string, len(events))
+			for i, e := range events {
+				types[i] = e.Type
+			}
+			logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: sending %d events to /telemetry: %v", len(events), types))
+
 			body, err := json.Marshal(events)
 			if err != nil {
+				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: marshal error: %v", err))
 				continue
 			}
 
 			req, err := http.NewRequest("POST", t.serverURL+"/telemetry", bytes.NewReader(body))
 			if err != nil {
+				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: request error: %v", err))
 				continue
 			}
 			req.Header.Set("Content-Type", "application/json")
 
-			// Fire and forget — don't block on response
 			resp, err := client.Do(req)
-			if err == nil {
-				resp.Body.Close()
+			if err != nil {
+				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST error: %v", err))
+				continue
+			}
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST /telemetry status=%d body=%s", resp.StatusCode, string(respBody)))
+			if resp.StatusCode == 200 {
 				lastSent = total
 			}
-			// On error, we'll retry next tick with the same events
 
 		case <-t.quit:
 			return
@@ -256,11 +289,13 @@ type ThreadMessageData struct {
 }
 
 type ToolCallData struct {
-	Name string `json:"name"`
-	Args string `json:"args,omitempty"`
+	ID   string            `json:"id,omitempty"`
+	Name string            `json:"name"`
+	Args map[string]string `json:"args,omitempty"`
 }
 
 type ToolResultData struct {
+	ID         string `json:"id,omitempty"`
 	Name       string `json:"name"`
 	DurationMs int64  `json:"duration_ms"`
 	Success    bool   `json:"success"`

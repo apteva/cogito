@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	aptcomputer "github.com/apteva/computer"
 )
 
 type APIServer struct {
@@ -31,18 +33,33 @@ func (a *APIServer) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
-	elapsed := time.Since(a.startTime)
-	// Check for pending approval
+// findPendingApproval checks main and all child threads for a pending tool.
+func (a *APIServer) findPendingApproval() *ToolCallData {
+	// Check main
 	a.thinker.pendingMu.Lock()
-	var pending *ToolCallData
 	if a.thinker.pendingTool != nil {
-		pending = &ToolCallData{
+		tc := &ToolCallData{
+			ID:   a.thinker.pendingTool.NativeID,
 			Name: a.thinker.pendingTool.Name,
-			Args: toolArgsSummary(*a.thinker.pendingTool),
+			Args: a.thinker.pendingTool.Args,
 		}
+		a.thinker.pendingMu.Unlock()
+		return tc
 	}
 	a.thinker.pendingMu.Unlock()
+
+	// Check child threads
+	if a.thinker.threads != nil {
+		if tc := a.thinker.threads.FindPendingApproval(); tc != nil {
+			return &ToolCallData{ID: tc.NativeID, Name: tc.Name, Args: tc.Args}
+		}
+	}
+	return nil
+}
+
+func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
+	elapsed := time.Since(a.startTime)
+	pending := a.findPendingApproval()
 
 	writeJSON(w, map[string]any{
 		"uptime_seconds":   int(elapsed.Seconds()),
@@ -71,6 +88,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	// Always include main
 	out := []threadJSON{{
 		ID:        "main",
+		Directive: a.thinker.config.GetDirective(),
 		Iteration: a.thinker.iteration,
 		Rate:      a.thinker.rate.String(),
 		Model:     a.thinker.model.String(),
@@ -209,18 +227,32 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				},
 			}
 		}
+		// Build live computer info
+		var computerInfo map[string]any
+		if a.thinker.computer != nil {
+			d := a.thinker.computer.DisplaySize()
+			computerInfo = map[string]any{
+				"connected": true,
+				"display":   map[string]int{"width": d.Width, "height": d.Height},
+			}
+			if a.thinker.config.Computer != nil {
+				computerInfo["type"] = a.thinker.config.Computer.Type
+			}
+		}
 		writeJSON(w, map[string]any{
 			"directive":    a.thinker.config.GetDirective(),
 			"mode":         a.thinker.config.GetMode(),
 			"auto_approve": a.thinker.config.AutoApprove,
 			"provider":     providerInfo,
+			"computer":     computerInfo,
 		})
 	case http.MethodPut:
 		var body struct {
-			Directive   string          `json:"directive,omitempty"`
-			Mode        RunMode         `json:"mode,omitempty"`
-			AutoApprove []string        `json:"auto_approve,omitempty"`
-			Provider    *ProviderConfig `json:"provider,omitempty"`
+			Directive   string           `json:"directive,omitempty"`
+			Mode        RunMode          `json:"mode,omitempty"`
+			AutoApprove []string         `json:"auto_approve,omitempty"`
+			Provider    *ProviderConfig  `json:"provider,omitempty"`
+			Computer    *ComputerConfig  `json:"computer,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -265,6 +297,43 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		if body.Computer != nil {
+			// Hot-connect or disconnect computer environment
+			if body.Computer.Type == "" {
+				// Disconnect
+				if a.thinker.computer != nil {
+					a.thinker.computer.Close()
+					a.thinker.computer = nil
+				}
+				a.thinker.config.mu.Lock()
+				a.thinker.config.Computer = nil
+				a.thinker.config.mu.Unlock()
+				a.thinker.config.Save()
+			} else {
+				// Connect new computer
+				comp, err := aptcomputer.New(aptcomputer.Config{
+					Type:      body.Computer.Type,
+					URL:       body.Computer.URL,
+					APIKey:    body.Computer.APIKey,
+					ProjectID: body.Computer.ProjectID,
+					Width:     body.Computer.Width,
+					Height:    body.Computer.Height,
+				})
+				if err != nil {
+					http.Error(w, fmt.Sprintf("computer: %v", err), http.StatusBadRequest)
+					return
+				}
+				// Close old session if any
+				if a.thinker.computer != nil {
+					a.thinker.computer.Close()
+				}
+				a.thinker.SetComputer(comp)
+				a.thinker.config.mu.Lock()
+				a.thinker.config.Computer = body.Computer
+				a.thinker.config.mu.Unlock()
+				a.thinker.config.Save()
+			}
+		}
 		writeJSON(w, map[string]string{"status": "updated"})
 	default:
 		http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
@@ -284,12 +353,8 @@ func (a *APIServer) approve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check there's actually a pending tool
-	a.thinker.pendingMu.Lock()
-	hasPending := a.thinker.pendingTool != nil
-	a.thinker.pendingMu.Unlock()
-
-	if !hasPending {
+	// Check there's actually a pending tool (main or any child thread)
+	if a.findPendingApproval() == nil {
 		http.Error(w, "no pending approval", http.StatusConflict)
 		return
 	}

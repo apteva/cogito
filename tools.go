@@ -71,7 +71,6 @@ func waitForApproval(t *Thinker, call toolCall) bool {
 		return true
 	}
 
-	argsSummary := toolArgsSummary(call)
 	logMsg("APPROVAL", fmt.Sprintf("waiting for approval: %s args=%v", call.Name, call.Args))
 
 	// Set pending tool so API/TUI can see what's waiting
@@ -82,7 +81,7 @@ func waitForApproval(t *Thinker, call toolCall) bool {
 	// Emit pending event for dashboard/TUI
 	if t.telemetry != nil {
 		t.telemetry.Emit("tool.pending", t.threadID, ToolCallData{
-			Name: call.Name, Args: argsSummary,
+			ID: call.NativeID, Name: call.Name, Args: call.Args,
 		})
 	}
 
@@ -115,7 +114,7 @@ func waitForApproval(t *Thinker, call toolCall) bool {
 		logMsg("APPROVAL", fmt.Sprintf("rejected: %s", call.Name))
 		if t.telemetry != nil {
 			t.telemetry.Emit("tool.rejected", t.threadID, ToolCallData{
-				Name: call.Name, Args: argsSummary,
+				ID: call.NativeID, Name: call.Name, Args: call.Args,
 			})
 		}
 		return false
@@ -124,19 +123,17 @@ func waitForApproval(t *Thinker, call toolCall) bool {
 	logMsg("APPROVAL", fmt.Sprintf("approved: %s", call.Name))
 	if t.telemetry != nil {
 		t.telemetry.Emit("tool.approved", t.threadID, ToolCallData{
-			Name: call.Name, Args: argsSummary,
+			ID: call.NativeID, Name: call.Name, Args: call.Args,
 		})
 	}
 	return true
 }
 
 func executeTool(t *Thinker, call toolCall) {
-	argsSummary := toolArgsSummary(call)
-
 	// Telemetry: tool.call
 	if t.telemetry != nil {
 		t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
-			Name: call.Name, Args: argsSummary,
+			ID: call.NativeID, Name: call.Name, Args: call.Args,
 		})
 	}
 
@@ -149,7 +146,7 @@ func executeTool(t *Thinker, call toolCall) {
 				t.Inject(fmt.Sprintf("[tool:%s] error: panic: %v", call.Name, r))
 				if t.telemetry != nil {
 					t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
-						Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
+						ID: call.NativeID, Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
 						Success: false, Result: fmt.Sprintf("panic: %v", r),
 					})
 				}
@@ -187,11 +184,11 @@ func executeTool(t *Thinker, call toolCall) {
 		// Telemetry: tool.result
 		if t.telemetry != nil {
 			resultSummary := result
-			if len(resultSummary) > 200 {
-				resultSummary = resultSummary[:200] + "..."
+			if len(resultSummary) > 1000 {
+				resultSummary = resultSummary[:1000] + "..."
 			}
 			t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
-				Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
+				ID: call.NativeID, Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
 				Success: !strings.HasPrefix(result, "error") && !strings.HasPrefix(result, "unknown"),
 				Result: resultSummary,
 			})

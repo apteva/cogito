@@ -39,13 +39,21 @@ type anthropicRequest struct {
 	Stream    bool               `json:"stream"`
 	System    string             `json:"system,omitempty"`
 	Messages  []anthropicMessage `json:"messages"`
-	Tools     []anthropicTool    `json:"tools,omitempty"`
+	Tools     []any              `json:"tools,omitempty"` // mixed: anthropicTool or anthropicBuiltinTool
 }
 
 type anthropicTool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"input_schema"`
+}
+
+// anthropicBuiltinTool is for Anthropic-specific tool types (computer_use, text_editor, bash).
+type anthropicBuiltinTool struct {
+	Type           string `json:"type"`                      // "computer_20250124"
+	Name           string `json:"name"`                      // "computer"
+	DisplayWidthPx  int   `json:"display_width_px,omitempty"`
+	DisplayHeightPx int   `json:"display_height_px,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -185,14 +193,33 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 		anthropicMsgs = append(anthropicMsgs, anthropicMessage{Role: "user", Content: "Begin."})
 	}
 
-	// Convert tools
-	var anthropicTools []anthropicTool
+	// Convert tools — separate computer_use (builtin) from regular tools
+	var anthropicTools []any
+	hasComputerUse := false
 	for _, t := range tools {
-		anthropicTools = append(anthropicTools, anthropicTool{
-			Name:        t.Name,
-			Description: t.Description,
-			InputSchema: t.Parameters,
-		})
+		if t.Name == "computer_use" {
+			// Parse display dimensions from description or parameters
+			width, height := 1280, 800
+			if params, ok := t.Parameters["_display_width"].(int); ok {
+				width = params
+			}
+			if params, ok := t.Parameters["_display_height"].(int); ok {
+				height = params
+			}
+			anthropicTools = append(anthropicTools, anthropicBuiltinTool{
+				Type:            "computer_20250124",
+				Name:            "computer",
+				DisplayWidthPx:  width,
+				DisplayHeightPx: height,
+			})
+			hasComputerUse = true
+		} else {
+			anthropicTools = append(anthropicTools, anthropicTool{
+				Name:        t.Name,
+				Description: t.Description,
+				InputSchema: t.Parameters,
+			})
+		}
 	}
 
 	reqBody := anthropicRequest{
@@ -216,8 +243,11 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", p.apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	if hasComputerUse {
+		req.Header.Set("anthropic-beta", "computer-use-2025-01-24")
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := llmHTTPClient.Do(req)
 	if err != nil {
 		return ChatResponse{}, err
 	}

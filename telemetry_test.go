@@ -130,7 +130,7 @@ func TestTelemetry_AllEventTypes(t *testing.T) {
 
 	// Tool events
 	tel.Emit("tool.call", "main", ToolCallData{
-		Name: "web", Args: "url=https://example.com",
+		Name: "web", Args: map[string]string{"url": "https://example.com"},
 	})
 	tel.Emit("tool.result", "main", ToolResultData{
 		Name: "web", DurationMs: 500, Success: true, Result: "page content",
