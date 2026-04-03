@@ -116,7 +116,7 @@ type anthropicBlockStart struct {
 
 // --- Chat implementation ---
 
-func (p *AnthropicProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string)) (ChatResponse, error) {
+func (p *AnthropicProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onToolChunk func(string, string)) (ChatResponse, error) {
 	// Convert messages: extract system prompt, convert rest to Anthropic format
 	var system string
 	var anthropicMsgs []anthropicMessage
@@ -305,6 +305,9 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 				}
 				if event.Delta.Type == "input_json_delta" && currentTool != nil {
 					currentTool.json.WriteString(event.Delta.PartialJSON)
+					if onToolChunk != nil {
+						onToolChunk(currentTool.name, event.Delta.PartialJSON)
+					}
 				}
 			}
 		case "content_block_stop":

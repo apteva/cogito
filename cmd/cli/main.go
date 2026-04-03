@@ -13,7 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-const mcpName = "cli"
+const mcpName = "channels"
 
 func main() {
 	addr := flag.String("addr", "localhost:3210", "core API address")
@@ -65,8 +65,19 @@ func main() {
 		}
 	}
 
-	// Start local MCP server
-	mcp, err := newMCPServer()
+	// Channel registry — CLI is always the first channel
+	registry := NewChannelRegistry()
+
+	// CLI channel: TUI communication pipes
+	cliRespond := make(chan string, 64)
+	cliAskCh := make(chan string, 1)
+	cliAskReply := make(chan string, 1)
+	cliStatusCh := make(chan statusUpdate, 16)
+	cliChannel := NewCLIChannel(cliRespond, cliAskCh, cliAskReply, cliStatusCh)
+	registry.Register(cliChannel)
+
+	// Start unified MCP server
+	mcp, err := newMCPServer(registry)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mcp server: %v\n", err)
 		os.Exit(1)
@@ -80,11 +91,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Notify core that root user is here — core should greet via cli_respond
-	client.sendEvent("[cli] root user connected to terminal. Use cli_respond to communicate with them. Greet them.", "main")
+	// Notify core
+	client.sendEvent("[cli] root user connected. RULES: 1) Reply to ALL [cli] messages using channels_respond(channel=\"cli\"). 2) When the user asks you to do something, IMMEDIATELY acknowledge what you will do BEFORE doing it, then follow up with the result. 3) Never leave a message unanswered. Greet them now.", "main")
+
+	// SSE done signal
+	sseDone := make(chan struct{})
 
 	// Cleanup on exit
 	cleanup := func() {
+		close(sseDone)
+		registry.CloseAll()
 		client.sendEvent("[cli] root user disconnected from terminal", "main")
 		client.disconnectMCP(mcpName)
 		mcp.close()
@@ -109,9 +125,18 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Run TUI
-	m := newTUI(th, mcp, client)
+	// Run TUI — pass CLI channels directly for the TUI to listen on
+	m := newTUI(th, mcp, client, registry)
+	// Inject CLI channel pipes into the TUI model
+	m.cliRespond = cliRespond
+	m.cliAskCh = cliAskCh
+	m.cliAskReply = cliAskReply
+	m.cliStatusCh = cliStatusCh
+
 	p := tea.NewProgram(m, tea.WithAltScreen())
+
+	// Start SSE listener for tool chunk streaming
+	go streamToolChunks(client, p, sseDone)
 
 	go func() {
 		p.Send(connectedMsg{})
@@ -139,7 +164,6 @@ func findCoreBinary(explicit string) string {
 	self, err := os.Executable()
 	if err == nil {
 		dir := filepath.Dir(self)
-		// If cli is in cmd/cli/, core is two levels up
 		candidates := []string{
 			filepath.Join(dir, "apteva-core"),
 			filepath.Join(dir, "..", "..", "apteva-core"),

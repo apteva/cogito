@@ -6,22 +6,18 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 )
 
-// mcpServer is a minimal MCP HTTP server exposing tools for the core to call.
+// mcpServer is a minimal MCP HTTP server exposing unified channel tools for the core.
 type mcpServer struct {
 	port     int
 	listener net.Listener
+	registry *ChannelRegistry
 
-	// Channels for TUI communication
-	respond chan string          // cli_respond: core sends text to display
-	askCh   chan string          // cli_ask: core sends a question
-	askReply chan string         // cli_ask: user sends answer back
-	statusCh chan statusUpdate   // cli_status: core updates status line
-
-	mu       sync.Mutex
-	closed   bool
+	mu     sync.Mutex
+	closed bool
 }
 
 type statusUpdate struct {
@@ -29,7 +25,7 @@ type statusUpdate struct {
 	Level string // "info", "warn", "alert"
 }
 
-func newMCPServer() (*mcpServer, error) {
+func newMCPServer(registry *ChannelRegistry) (*mcpServer, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -37,10 +33,7 @@ func newMCPServer() (*mcpServer, error) {
 	s := &mcpServer{
 		port:     ln.Addr().(*net.TCPAddr).Port,
 		listener: ln,
-		respond:  make(chan string, 64),
-		askCh:    make(chan string, 1),
-		askReply: make(chan string, 1),
-		statusCh: make(chan statusUpdate, 16),
+		registry: registry,
 	}
 	return s, nil
 }
@@ -65,17 +58,17 @@ func (s *mcpServer) close() {
 }
 
 type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
+	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params,omitempty"`
+	Method  string           `json:"method"`
+	Params  json.RawMessage  `json:"params,omitempty"`
 }
 
 type rpcResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
+	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id,omitempty"`
-	Result  any         `json:"result,omitempty"`
-	Error   *rpcError   `json:"error,omitempty"`
+	Result  any              `json:"result,omitempty"`
+	Error   *rpcError        `json:"error,omitempty"`
 }
 
 type rpcError struct {
@@ -116,63 +109,13 @@ func (s *mcpServer) handle(w http.ResponseWriter, r *http.Request) {
 			"protocolVersion": "2025-03-26",
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo": map[string]string{
-				"name":    "apteva-cli",
+				"name":    "apteva-channels",
 				"version": "1.0.0",
 			},
 		}
 
 	case "tools/list":
-		result = map[string]any{
-			"tools": []map[string]any{
-				{
-					"name":        "respond",
-					"description": "Send a message to the root user's terminal. You MUST use this tool to reply to any message from [cli]. This is the ONLY way to communicate back to the root user. When a root user connects (you receive '[cli] operator connected'), always greet them with a short welcome message using this tool.",
-					"inputSchema": map[string]any{
-						"type":     "object",
-						"required": []string{"text"},
-						"properties": map[string]any{
-							"text": map[string]any{
-								"type":        "string",
-								"description": "The message to display on the root user's terminal",
-							},
-						},
-					},
-				},
-				{
-					"name":        "ask",
-					"description": "Ask the root user a question and wait for their typed response. Use this when you need input or clarification from the operator. Blocks until they reply.",
-					"inputSchema": map[string]any{
-						"type":     "object",
-						"required": []string{"question"},
-						"properties": map[string]any{
-							"question": map[string]any{
-								"type":        "string",
-								"description": "The question to ask the root user",
-							},
-						},
-					},
-				},
-				{
-					"name":        "status",
-					"description": "Update the status line on the root user's terminal. Use for brief state indicators.",
-					"inputSchema": map[string]any{
-						"type":     "object",
-						"required": []string{"line"},
-						"properties": map[string]any{
-							"line": map[string]any{
-								"type":        "string",
-								"description": "Status text to display",
-							},
-							"level": map[string]any{
-								"type":        "string",
-								"description": "Severity: info, warn, or alert",
-								"enum":        []string{"info", "warn", "alert"},
-							},
-						},
-					},
-				},
-			},
-		}
+		result = s.toolsList()
 
 	case "tools/call":
 		result, rpcErr = s.handleToolCall(req.Params)
@@ -190,6 +133,101 @@ func (s *mcpServer) handle(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *mcpServer) toolsList() map[string]any {
+	// Build channel list for descriptions
+	var channelIDs []string
+	for _, ch := range s.registry.List() {
+		channelIDs = append(channelIDs, ch.ID())
+	}
+	channelList := strings.Join(channelIDs, ", ")
+	if channelList == "" {
+		channelList = "cli"
+	}
+
+	return map[string]any{
+		"tools": []map[string]any{
+			{
+				"name": "respond",
+				"description": fmt.Sprintf(
+					"CRITICAL: Send a message to a user on a channel. Every message from a user on ANY channel MUST receive a response via this tool. "+
+						"Never ignore user messages. When a user asks you to do something, FIRST respond acknowledging what you will do, THEN do it, THEN follow up with the result. "+
+						"When a user connects, always greet them immediately. "+
+						"Connected channels: [%s]. "+
+						"Match the channel from the event prefix: [cli] → channel=\"cli\", [telegram:@john:12345] → channel=\"telegram:12345\".",
+					channelList,
+				),
+				"inputSchema": map[string]any{
+					"type":     "object",
+					"required": []string{"text", "channel"},
+					"properties": map[string]any{
+						"text": map[string]any{
+							"type":        "string",
+							"description": "The message to send",
+						},
+						"channel": map[string]any{
+							"type":        "string",
+							"description": "Target channel ID, e.g. \"cli\", \"telegram:12345\"",
+						},
+					},
+				},
+			},
+			{
+				"name": "ask",
+				"description": fmt.Sprintf(
+					"Ask a user a question on a specific channel and wait for their reply. Blocks until they respond. "+
+						"Connected channels: [%s].",
+					channelList,
+				),
+				"inputSchema": map[string]any{
+					"type":     "object",
+					"required": []string{"question", "channel"},
+					"properties": map[string]any{
+						"question": map[string]any{
+							"type":        "string",
+							"description": "The question to ask",
+						},
+						"channel": map[string]any{
+							"type":        "string",
+							"description": "Target channel ID",
+						},
+					},
+				},
+			},
+			{
+				"name": "status",
+				"description": "Send a status update to a specific channel.",
+				"inputSchema": map[string]any{
+					"type":     "object",
+					"required": []string{"line", "channel"},
+					"properties": map[string]any{
+						"line": map[string]any{
+							"type":        "string",
+							"description": "Status text",
+						},
+						"channel": map[string]any{
+							"type":        "string",
+							"description": "Target channel ID",
+						},
+						"level": map[string]any{
+							"type":        "string",
+							"description": "Severity: info, warn, or alert",
+							"enum":        []string{"info", "warn", "alert"},
+						},
+					},
+				},
+			},
+			{
+				"name":        "list_channels",
+				"description": "List all currently connected communication channels.",
+				"inputSchema": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+				},
+			},
+		},
+	}
 }
 
 func (s *mcpServer) handleToolCall(params json.RawMessage) (any, *rpcError) {
@@ -210,30 +248,56 @@ func (s *mcpServer) handleToolCall(params json.RawMessage) (any, *rpcError) {
 	switch call.Name {
 	case "respond":
 		text, _ := call.Arguments["text"].(string)
+		channel, _ := call.Arguments["channel"].(string)
 		if text == "" {
 			return nil, &rpcError{Code: -32602, Message: "text required"}
 		}
-		s.respond <- text
-		return textResult("delivered"), nil
+		if channel == "" {
+			channel = "cli" // default
+		}
+		if err := s.registry.Send(channel, text); err != nil {
+			return nil, &rpcError{Code: -32602, Message: err.Error()}
+		}
+		return textResult("delivered to " + channel), nil
 
 	case "ask":
 		question, _ := call.Arguments["question"].(string)
+		channel, _ := call.Arguments["channel"].(string)
 		if question == "" {
 			return nil, &rpcError{Code: -32602, Message: "question required"}
 		}
-		s.askCh <- question
-		// Block until user replies
-		answer := <-s.askReply
+		if channel == "" {
+			channel = "cli"
+		}
+		answer, err := s.registry.Ask(channel, question)
+		if err != nil {
+			return nil, &rpcError{Code: -32602, Message: err.Error()}
+		}
 		return textResult(answer), nil
 
 	case "status":
 		line, _ := call.Arguments["line"].(string)
+		channel, _ := call.Arguments["channel"].(string)
 		level, _ := call.Arguments["level"].(string)
+		if channel == "" {
+			channel = "cli"
+		}
 		if level == "" {
 			level = "info"
 		}
-		s.statusCh <- statusUpdate{Line: line, Level: level}
+		ch := s.registry.Get(channel)
+		if ch == nil {
+			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("channel %q not found", channel)}
+		}
+		ch.Status(line, level)
 		return textResult("ok"), nil
+
+	case "list_channels":
+		var ids []string
+		for _, ch := range s.registry.List() {
+			ids = append(ids, ch.ID())
+		}
+		return textResult(fmt.Sprintf("Connected channels: %s", strings.Join(ids, ", "))), nil
 
 	default:
 		return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("unknown tool: %s", call.Name)}

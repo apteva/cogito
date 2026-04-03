@@ -923,7 +923,16 @@ func (t *Thinker) think() (ChatResponse, error) {
 		})
 	}
 
-	return t.provider.Chat(t.messages, t.modelID(), nativeTools, onChunk)
+	onToolChunk := func(toolName, chunk string) {
+		t.bus.Publish(Event{Type: EventToolChunk, From: t.threadID, Text: chunk, ToolName: toolName, Iteration: t.iteration})
+		if t.telemetry != nil {
+			t.telemetry.EmitLive("llm.tool_chunk", t.threadID, map[string]any{
+				"tool": toolName, "chunk": chunk, "iteration": t.iteration,
+			})
+		}
+	}
+
+	return t.provider.Chat(t.messages, t.modelID(), nativeTools, onChunk, onToolChunk)
 }
 
 // drainEvents reads all pending events and wake signals from this thinker's bus subscription.

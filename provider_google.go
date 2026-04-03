@@ -158,7 +158,7 @@ type geminiStreamResponse struct {
 	} `json:"usageMetadata"`
 }
 
-func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string)) (ChatResponse, error) {
+func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onToolChunk func(string, string)) (ChatResponse, error) {
 	// Track active model for cost calculation
 	p.activeModel = model
 
@@ -392,6 +392,11 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 						Name: part.FunctionCall.Name,
 						Args: args,
 					})
+					// Gemini delivers complete tool calls, emit the full args as one chunk
+					if onToolChunk != nil {
+						argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+						onToolChunk(part.FunctionCall.Name, string(argsJSON))
+					}
 				}
 			}
 		}

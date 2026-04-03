@@ -146,6 +146,13 @@ func (tr *ToolRegistry) registerDefaults() {
 		Rules:       `Only parameter is url. Results arrive as events in your next thought.`,
 		Handler:     webTool,
 	})
+	tr.Register(&ToolDef{
+		Name:        "exec",
+		Description: "Execute a shell command on the host machine and return stdout+stderr. Use for system administration, checking logs, running scripts, managing containers, inspecting files, git operations, deployments.",
+		Syntax:      `[[exec command="ls -la /app" timeout="30" dir="/home"]]`,
+		Rules:       `command: the shell command to run. timeout: seconds (default 30, max 300). dir: optional working directory. No interactive commands (no vim, top, less). Output truncated to 4000 chars.`,
+		Handler:     execTool,
+	})
 }
 
 func (tr *ToolRegistry) Register(tool *ToolDef) {

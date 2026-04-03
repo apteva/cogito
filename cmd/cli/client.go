@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 type coreClient struct {
@@ -184,6 +187,17 @@ func (c *coreClient) disconnectMCP(name string) error {
 	return nil
 }
 
+// setDirective updates the core directive via PUT /config.
+func (c *coreClient) setDirective(directive string) error {
+	body, _ := json.Marshal(map[string]string{"directive": directive})
+	resp, err := c.client.Do(c.putRequest("/config", body))
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
 func (c *coreClient) putRequest(path string, body []byte) *http.Request {
 	req, _ := http.NewRequest("PUT", c.base+path, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -233,4 +247,164 @@ func (c *coreClient) streamEvents(ch chan<- map[string]any, done <-chan struct{}
 			return
 		}
 	}
+}
+
+// streamToolChunks listens to SSE events and extracts streaming text from
+// cli_respond tool argument chunks, sending them to the TUI as streamChunkMsg.
+func streamToolChunks(client *coreClient, p *tea.Program, done <-chan struct{}) {
+	evCh := make(chan map[string]any, 256)
+	go client.streamEvents(evCh, done)
+
+	ext := &textExtractor{}
+
+	for {
+		select {
+		case <-done:
+			return
+		case ev, ok := <-evCh:
+			if !ok {
+				return
+			}
+			typ, _ := ev["type"].(string)
+			data, _ := ev["data"].(map[string]any)
+
+			switch typ {
+			case "llm.done":
+				if data != nil {
+					threadID, _ := ev["thread_id"].(string)
+					if threadID == "" {
+						threadID = "main"
+					}
+					msg, _ := data["message"].(string)
+					if msg != "" {
+						// Truncate to first 200 chars
+						if len(msg) > 200 {
+							msg = msg[:200] + "..."
+						}
+						p.Send(thoughtMsg{ThreadID: threadID, Text: msg})
+					}
+				}
+			case "llm.tool_chunk":
+				if data == nil {
+					continue
+				}
+				tool, _ := data["tool"].(string)
+				chunk, _ := data["chunk"].(string)
+				if tool != "channels_respond" || chunk == "" {
+					continue
+				}
+
+				// Extract new text from the incremental JSON
+				newText := ext.feed(chunk)
+				if newText != "" {
+					p.Send(streamChunkMsg(newText))
+				}
+			}
+		}
+	}
+}
+
+// textExtractor incrementally extracts the "text" value from streaming JSON
+// fragments like: {"te  →  xt": "H  →  ello  →  "}
+// Once it finds "text":" it emits everything after that as text,
+// handling escaped characters. Handles escape sequences split across chunks.
+type textExtractor struct {
+	buf        strings.Builder
+	inText     bool // we've found "text":" and are extracting
+	emitted    int  // how many bytes of the text value we've already emitted
+	pendingEsc bool // previous chunk ended with a backslash
+}
+
+func (e *textExtractor) feed(chunk string) string {
+	e.buf.WriteString(chunk)
+	s := e.buf.String()
+
+	if !e.inText {
+		// Look for "text":"  or  "text": " in accumulated buffer
+		idx := strings.Index(s, `"text":"`)
+		start := 0
+		if idx >= 0 {
+			start = idx + 8 // len(`"text":"`)
+		} else {
+			idx = strings.Index(s, `"text": "`)
+			if idx >= 0 {
+				start = idx + 9 // len(`"text": "`)
+			}
+		}
+		if idx < 0 {
+			return ""
+		}
+		e.inText = true
+		e.emitted = start
+	}
+
+	// Extract text from emitted position, handling escape sequences
+	var result strings.Builder
+	i := e.emitted
+	for i < len(s) {
+		ch := s[i]
+		if e.pendingEsc {
+			e.pendingEsc = false
+			switch ch {
+			case '"':
+				result.WriteByte('"')
+			case '\\':
+				result.WriteByte('\\')
+			case 'n':
+				result.WriteByte('\n')
+			case 'r':
+				result.WriteByte('\r')
+			case 't':
+				result.WriteByte('\t')
+			case '/':
+				result.WriteByte('/')
+			default:
+				result.WriteByte('\\')
+				result.WriteByte(ch)
+			}
+			i++
+			continue
+		}
+		if ch == '\\' {
+			if i+1 >= len(s) {
+				// Backslash at end of buffer — wait for next chunk
+				e.pendingEsc = true
+				i++
+				continue
+			}
+			next := s[i+1]
+			switch next {
+			case '"':
+				result.WriteByte('"')
+			case '\\':
+				result.WriteByte('\\')
+			case 'n':
+				result.WriteByte('\n')
+			case 'r':
+				result.WriteByte('\r')
+			case 't':
+				result.WriteByte('\t')
+			case '/':
+				result.WriteByte('/')
+			default:
+				result.WriteByte('\\')
+				result.WriteByte(next)
+			}
+			i += 2
+			continue
+		}
+		if ch == '"' {
+			// End of string value — reset for next tool call
+			e.buf.Reset()
+			e.inText = false
+			e.emitted = 0
+			e.pendingEsc = false
+			break
+		}
+		result.WriteByte(ch)
+		i++
+	}
+	e.emitted = i
+
+	return result.String()
 }

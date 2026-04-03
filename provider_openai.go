@@ -163,7 +163,7 @@ func toOpenAIMessages(messages []Message) []any {
 	return out
 }
 
-func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string)) (ChatResponse, error) {
+func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onToolChunk func(string, string)) (ChatResponse, error) {
 	// Build request
 	reqMap := map[string]any{
 		"model":    model,
@@ -284,6 +284,9 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 					}
 					if tc.Function.Arguments != "" {
 						pt.argsJSON.WriteString(tc.Function.Arguments)
+						if onToolChunk != nil && pt.name != "" {
+							onToolChunk(pt.name, tc.Function.Arguments)
+						}
 					}
 				}
 			}

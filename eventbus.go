@@ -9,6 +9,7 @@ import (
 const (
 	EventInbox       = "inbox"        // message addressed to a thinker (replaces inbox chan string)
 	EventChunk       = "chunk"        // streaming token from LLM
+	EventToolChunk   = "tool_chunk"   // streaming tool argument chunk from LLM
 	EventThinkDone   = "think_done"   // completed a think cycle
 	EventThinkError  = "think_error"  // error during think
 	EventThreadStart = "thread_start" // thread spawned
@@ -22,6 +23,7 @@ type Event struct {
 	To   string // target subscriber ID; "" = broadcast
 
 	Text       string        // message payload
+	ToolName   string        // tool name (for EventToolChunk)
 	Parts      []ContentPart // optional media (images, audio) attached to this event
 	ToolResult *ToolResult   // optional: structured tool result (for computer_use etc.)
 
