@@ -207,6 +207,8 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 		var doneMsg *string // defer done until all tools processed
 
 		for _, call := range calls {
+			// Extract _reason (observability, not passed to handlers)
+			delete(call.Args, "_reason")
 			if !thread.Tools[call.Name] {
 				continue
 			}

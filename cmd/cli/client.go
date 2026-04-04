@@ -269,6 +269,16 @@ func streamToolChunks(client *coreClient, p *tea.Program, done <-chan struct{}) 
 			data, _ := ev["data"].(map[string]any)
 
 			switch typ {
+			case "tool.call":
+				if data != nil {
+					reason, _ := data["reason"].(string)
+					name, _ := data["name"].(string)
+					if reason != "" {
+						p.Send(toolReasonMsg(reason))
+					} else if name != "" {
+						p.Send(toolReasonMsg(name))
+					}
+				}
 			case "llm.done":
 				if data != nil {
 					threadID, _ := ev["thread_id"].(string)

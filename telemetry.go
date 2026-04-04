@@ -289,9 +289,10 @@ type ThreadMessageData struct {
 }
 
 type ToolCallData struct {
-	ID   string            `json:"id,omitempty"`
-	Name string            `json:"name"`
-	Args map[string]string `json:"args,omitempty"`
+	ID     string            `json:"id,omitempty"`
+	Name   string            `json:"name"`
+	Args   map[string]string `json:"args,omitempty"`
+	Reason string            `json:"reason,omitempty"`
 }
 
 type ToolResultData struct {

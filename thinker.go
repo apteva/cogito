@@ -365,6 +365,8 @@ func mainToolHandler(t *Thinker) ToolHandler {
 		var replies []string
 		var toolNames []string
 		for _, call := range calls {
+			// Extract _reason (observability, not passed to handlers)
+			delete(call.Args, "_reason")
 			// Supervised mode gate — applies to all tools
 			if !waitForApproval(t, call) {
 				t.Inject(fmt.Sprintf("[rejected] %s was rejected by the user. Do NOT retry the same call. Ask the user what they want instead, or try a different approach.", call.Name))

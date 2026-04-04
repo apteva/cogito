@@ -16,7 +16,8 @@ type askMsg string
 type statusMsg statusUpdate
 type connectedMsg struct{}
 type tickMsg time.Time
-type streamChunkMsg string // incremental text from tool arg streaming
+type streamChunkMsg string  // incremental text from tool arg streaming
+type toolReasonMsg string   // _reason from a tool call, for spinner display
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -35,7 +36,8 @@ type tuiModel struct {
 	asking      bool // core asked a question via cli_ask
 	streaming   bool // currently receiving streamed tool chunks
 	streamLine  int  // index into lines for the active streaming line
-	spinnerTick  int // animation frame counter
+	spinnerTick  int    // animation frame counter
+	toolReason   string // latest _reason from tool call, shown in spinner
 	statusLine   string
 	statusLevel  string
 	startTime    time.Time
@@ -55,16 +57,14 @@ type tuiModel struct {
 	// Gateways
 	telegramGW *TelegramGateway
 
-	// Modal overlay for command results
-	modal       bool
-	modalTitle  string
-	modalLines  []string
-	modalScroll int
-
-	// Token input mode (for /connect)
-	tokenInput    bool
-	tokenTarget   string // "telegram", etc.
-	tokenPrompt   string
+	// Modal overlay — display or input
+	modal        bool
+	modalTitle   string
+	modalLines   []string
+	modalScroll  int
+	modalInput   bool                        // modal has an input field
+	modalPrompt  string                      // input label
+	modalOnSubmit func(value string) tea.Cmd // callback when input submitted
 }
 
 // sideData holds live data for the side panel.
@@ -102,6 +102,7 @@ type connectResultMsg struct {
 	gateway string
 	botName string
 	err     error
+	gw      *TelegramGateway
 }
 
 type modalMsg struct {
@@ -218,45 +219,46 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		// Token input mode — Esc cancels, Enter submits
-		if m.tokenInput {
-			switch msg.String() {
-			case "esc":
-				m.tokenInput = false
-				m.tokenTarget = ""
-				m.input.Placeholder = ""
-				return m, nil
-			case "enter":
-				token := strings.TrimSpace(m.input.Value())
-				m.input.SetValue("")
-				m.input.Placeholder = ""
-				m.tokenInput = false
-				target := m.tokenTarget
-				m.tokenTarget = ""
-				if token != "" {
-					return m.connectGateway(target, token)
-				}
-				return m, nil
-			}
-			// Fall through to input handling for typing
-			var inputCmd tea.Cmd
-			m.input, inputCmd = m.input.Update(msg)
-			return m, inputCmd
-		}
-
-		// Modal mode — Esc or q dismisses, pgup/pgdown scrolls
+		// Modal mode
 		if m.modal {
 			switch msg.String() {
-			case "esc", "q":
-				m.modal = false
-				m.modalLines = nil
-				m.modalScroll = 0
+			case "esc":
+				m.closeModal()
+				return m, nil
+			case "enter":
+				if m.modalInput && m.modalOnSubmit != nil {
+					value := strings.TrimSpace(m.input.Value())
+					m.input.SetValue("")
+					m.input.Placeholder = ""
+					cb := m.modalOnSubmit
+					m.closeModal()
+					if value != "" {
+						return m, cb(value)
+					}
+					return m, nil
+				}
+			case "q":
+				if !m.modalInput {
+					m.closeModal()
+					return m, nil
+				}
 			case "pgup", "up", "k":
-				if m.modalScroll > 0 {
-					m.modalScroll--
+				if !m.modalInput {
+					if m.modalScroll > 0 {
+						m.modalScroll--
+					}
+					return m, nil
 				}
 			case "pgdown", "down", "j":
-				m.modalScroll++
+				if !m.modalInput {
+					m.modalScroll++
+					return m, nil
+				}
+			}
+			if m.modalInput {
+				var inputCmd tea.Cmd
+				m.input, inputCmd = m.input.Update(msg)
+				return m, inputCmd
 			}
 			return m, nil
 		}
@@ -293,6 +295,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Start a new streaming line — add spacing if there's content above
 			m.streaming = true
 			m.waiting = false
+			m.toolReason = ""
 			if len(m.lines) > 0 && m.lines[len(m.lines)-1].text != "" {
 				m.addLine("", "dim")
 			}
@@ -323,6 +326,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.addLine(string(msg), "output")
 		}
 		m.waiting = false
+		m.toolReason = ""
 		m.scrollOff = 0
 		cmds = append(cmds, listenRespond(m.cliRespond))
 
@@ -343,19 +347,20 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case connectResultMsg:
 		if msg.err != nil {
-			m.modal = true
-			m.modalTitle = "CONNECT ERROR"
-			m.modalLines = []string{"", "  " + msg.err.Error(), "", "  Press Esc to close."}
-			m.modalScroll = 0
+			m.openModal("CONNECT ERROR", []string{"", "  " + msg.err.Error(), "", "  Press Esc to close."})
 		} else {
-			m.modal = true
-			m.modalTitle = strings.ToUpper(msg.gateway) + " CONNECTED"
-			m.modalLines = []string{"", fmt.Sprintf("  Bot @%s online.", msg.botName), "", "  Press Esc to close."}
-			m.modalScroll = 0
-			// Notify core
-			m.client.sendEvent(fmt.Sprintf("[%s] gateway connected. Bot @%s online. Use channels_respond with channel=\"%s:<chat_id>\" to reply to %s users.",
-				msg.gateway, msg.botName, msg.gateway, msg.gateway), "main")
+			if msg.gw != nil {
+				m.telegramGW = msg.gw
+				m.registry.AddFactory(msg.gw.ChannelFactory())
+			}
+			m.openModal(strings.ToUpper(msg.gateway)+" CONNECTED", []string{"", fmt.Sprintf("  Bot @%s online.", msg.botName), "", "  Press Esc to close."})
+			m.client.sendEvent(fmt.Sprintf("[%s] gateway connected. Bot @%s online. The agent can send messages to any telegram user who has started this bot using channels_respond(channel=\"%s:<chat_id>\"). When a user messages the bot, their chat_id appears in the event prefix.",
+				msg.gateway, msg.botName, msg.gateway), "main")
 		}
+		return m, nil
+
+	case toolReasonMsg:
+		m.toolReason = string(msg)
 		return m, nil
 
 	case sideDataMsg:
@@ -562,14 +567,34 @@ func (m *tuiModel) handleCommand(text string) (tuiModel, tea.Cmd) {
 		}
 		switch rest {
 		case "telegram":
-			m.tokenInput = true
-			m.tokenTarget = "telegram"
-			m.tokenPrompt = "Telegram bot token (from @BotFather)"
-			m.input.Placeholder = "paste bot token..."
-			m.input.SetValue("")
+			if m.telegramGW != nil {
+				m.openModal("CONNECT", []string{"", "  Telegram already connected.", "", "  Press Esc to close."})
+				return *m, nil
+			}
+			reg := m.registry
+			cli := m.client
+			m.openInputModal(
+				"CONNECT TELEGRAM",
+				[]string{
+					"",
+					"  Get a bot token from @BotFather on Telegram.",
+					"  Paste it below and press Enter.",
+					"",
+				},
+				"Bot token",
+				func(token string) tea.Cmd {
+					return func() tea.Msg {
+						gw := NewTelegramGateway(token, reg, cli)
+						botName, err := gw.Start()
+						if err != nil {
+							return connectResultMsg{gateway: "telegram", err: err}
+						}
+						return connectResultMsg{gateway: "telegram", botName: botName, gw: gw}
+					}
+				},
+			)
 		default:
-			m.addLine(fmt.Sprintf("Unknown gateway: %s", rest), "warn")
-			m.addLine("Available: telegram", "dim")
+			m.openModal("CONNECT", []string{"", fmt.Sprintf("  Unknown gateway: %s", rest), "", "  Available: telegram", "", "  Press Esc to close."})
 		}
 
 	case "/disconnect":
@@ -631,6 +656,37 @@ func (m *tuiModel) handleCommand(text string) (tuiModel, tea.Cmd) {
 	}
 
 	return *m, nil
+}
+
+func (m *tuiModel) closeModal() {
+	m.modal = false
+	m.modalLines = nil
+	m.modalScroll = 0
+	m.modalInput = false
+	m.modalPrompt = ""
+	m.modalOnSubmit = nil
+	m.input.SetValue("")
+	m.input.Placeholder = ""
+}
+
+func (m *tuiModel) openModal(title string, lines []string) {
+	m.modal = true
+	m.modalTitle = title
+	m.modalLines = lines
+	m.modalScroll = 0
+	m.modalInput = false
+}
+
+func (m *tuiModel) openInputModal(title string, lines []string, prompt string, onSubmit func(string) tea.Cmd) {
+	m.modal = true
+	m.modalTitle = title
+	m.modalLines = lines
+	m.modalScroll = 0
+	m.modalInput = true
+	m.modalPrompt = prompt
+	m.modalOnSubmit = onSubmit
+	m.input.SetValue("")
+	m.input.Placeholder = ""
 }
 
 func (m *tuiModel) connectGateway(target, token string) (tuiModel, tea.Cmd) {
@@ -848,14 +904,8 @@ func (m tuiModel) View() string {
 	}
 
 	// Input line
-	var inputLine string
-	if m.tokenInput {
-		label := warn.Render(m.tokenPrompt + ": ")
-		inputLine = label + m.input.View()
-	} else {
-		prompt := primary.Bold(true).Render("> ")
-		inputLine = prompt + m.input.View()
-	}
+	prompt := primary.Bold(true).Render("> ")
+	inputLine := prompt + m.input.View()
 
 	// Build chat column
 	chatLines = append(chatLines, dim.Render(strings.Repeat("─", innerChat)))
@@ -907,7 +957,12 @@ func (m tuiModel) renderModal() string {
 	if boxH < 5 {
 		boxH = m.height - 2
 	}
-	innerH := boxH - 4 // top border + title + bottom border + footer
+	// Reserve space for input row if needed
+	extraRows := 0
+	if m.modalInput {
+		extraRows = 2 // separator + input line
+	}
+	innerH := boxH - 4 - extraRows // top border + title + bottom border + footer
 
 	// Title bar
 	titleText := " " + m.modalTitle + " "
@@ -946,9 +1001,26 @@ func (m tuiModel) renderModal() string {
 		contentLines = append(contentLines, dim.Render("│ ")+strings.Repeat(" ", innerW)+dim.Render(" │"))
 	}
 
+	// Input row inside modal
+	if m.modalInput {
+		contentLines = append(contentLines, dim.Render("│ ")+dim.Render(strings.Repeat("─", innerW))+dim.Render(" │"))
+		label := accent.Render("  " + m.modalPrompt + ": ")
+		inputView := m.input.View()
+		inputLine := label + inputView
+		inputW := lipgloss.Width(m.modalPrompt+": ") + 2 + lipgloss.Width(m.input.Value()) + 1
+		inputPad := innerW - inputW
+		if inputPad < 0 {
+			inputPad = 0
+		}
+		_ = inputPad
+		contentLines = append(contentLines, dim.Render("│ ")+inputLine+dim.Render(" │"))
+	}
+
 	// Footer
 	footer := dim.Render("  esc to close")
-	if totalLines > innerH {
+	if m.modalInput {
+		footer = dim.Render("  enter to submit · esc to cancel")
+	} else if totalLines > innerH {
 		footer += dim.Render(fmt.Sprintf("  ↑↓ to scroll (%d/%d)", scroll+1, totalLines))
 	}
 	bottomBorder := dim.Render("└"+strings.Repeat("─", innerW+2)+"┘")

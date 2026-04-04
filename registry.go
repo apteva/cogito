@@ -458,12 +458,34 @@ func (tr *ToolRegistry) NativeTools(allowlist map[string]bool) []NativeTool {
 
 		// Use explicit schema if provided, otherwise generate from syntax
 		if tool.InputSchema != nil {
-			nt.Parameters = tool.InputSchema
+			nt.Parameters = copyAndInjectReason(tool.InputSchema)
 		} else {
-			nt.Parameters = schemaFromSyntax(tool.Syntax)
+			nt.Parameters = copyAndInjectReason(schemaFromSyntax(tool.Syntax))
 		}
 		out = append(out, nt)
 	}
+	return out
+}
+
+// copyAndInjectReason adds the _reason field to a tool's JSON Schema.
+// Returns a shallow copy so the original schema is not modified.
+func copyAndInjectReason(schema map[string]any) map[string]any {
+	out := make(map[string]any, len(schema)+1)
+	for k, v := range schema {
+		out[k] = v
+	}
+	// Copy properties map and add _reason
+	props := make(map[string]any)
+	if existing, ok := schema["properties"].(map[string]any); ok {
+		for k, v := range existing {
+			props[k] = v
+		}
+	}
+	props["_reason"] = map[string]any{
+		"type":        "string",
+		"description": "Brief reason for this tool call — what you're doing and why (for observability)",
+	}
+	out["properties"] = props
 	return out
 }
 

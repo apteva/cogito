@@ -130,15 +130,19 @@ func waitForApproval(t *Thinker, call toolCall) bool {
 }
 
 func executeTool(t *Thinker, call toolCall) {
+	// Extract _reason before dispatch (observability field, not passed to handler)
+	reason := call.Args["_reason"]
+	delete(call.Args, "_reason")
+
 	// Telemetry: tool.call
 	if t.telemetry != nil {
 		t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
-			ID: call.NativeID, Name: call.Name, Args: call.Args,
+			ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
 		})
 	}
 
 	go func() {
-		logMsg("TOOL", fmt.Sprintf("dispatch %s args=%v", call.Name, call.Args))
+		logMsg("TOOL", fmt.Sprintf("dispatch %s reason=%q args=%v", call.Name, reason, call.Args))
 		start := time.Now()
 		defer func() {
 			if r := recover(); r != nil {

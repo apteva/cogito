@@ -28,7 +28,7 @@ type TelegramGateway struct {
 func NewTelegramGateway(token string, registry *ChannelRegistry, core *coreClient) *TelegramGateway {
 	return &TelegramGateway{
 		token:    token,
-		client:   &http.Client{Timeout: 60 * time.Second},
+		client:   &http.Client{Timeout: 10 * time.Second},
 		registry: registry,
 		core:     core,
 		chats:    make(map[string]*TelegramChannel),
@@ -49,9 +49,12 @@ func (g *TelegramGateway) Start() (string, error) {
 		return "", fmt.Errorf("invalid token: %w", err)
 	}
 	if !me.OK {
-		return "", fmt.Errorf("telegram getMe failed")
+		return "", fmt.Errorf("telegram rejected the token")
 	}
 	g.botName = me.Result.Username
+
+	// Switch to longer timeout for long-polling
+	g.client.Timeout = 60 * time.Second
 
 	go g.pollLoop()
 	return g.botName, nil
@@ -76,6 +79,32 @@ func (g *TelegramGateway) Stop() {
 
 func (g *TelegramGateway) BotName() string {
 	return g.botName
+}
+
+// ChannelFactory returns a factory that creates Telegram channels on demand
+// for any "telegram:<chat_id>" channel ID.
+func (g *TelegramGateway) ChannelFactory() ChannelFactory {
+	return func(id string) Channel {
+		if !strings.HasPrefix(id, "telegram:") {
+			return nil
+		}
+		chatID := strings.TrimPrefix(id, "telegram:")
+		if chatID == "" {
+			return nil
+		}
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if ch, ok := g.chats[chatID]; ok {
+			return ch
+		}
+		ch := &TelegramChannel{
+			chatID:  chatID,
+			gateway: g,
+			askWait: make(map[string]chan string),
+		}
+		g.chats[chatID] = ch
+		return ch
+	}
 }
 
 func (g *TelegramGateway) pollLoop() {
