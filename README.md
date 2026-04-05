@@ -1,14 +1,16 @@
-# Core
+# Apteva Core
 
-A continuous thinking engine that runs autonomous AI agent teams. Agents coordinate through an event bus, use external tool servers, and manage themselves via natural language directives.
+The continuous thinking engine. Runs autonomous AI agents that observe, reason, act, and evolve — around the clock.
+
+Core is a standalone Go binary. It can run headless, with its own TUI, or managed by [apteva-server](https://github.com/apteva/server).
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│  Main Thread (coordinator)              │
-│  Observes events, spawns/kills threads  │
-└──────────┬──────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│  Main Thread (coordinator)                  │
+│  Observes events, spawns/kills threads      │
+└──────────┬──────────────────────────────────┘
            │
      ┌─────┴─────┐
      │  EventBus  │ ← never blocks, pub/sub
@@ -19,7 +21,7 @@ A continuous thinking engine that runs autonomous AI agent teams. Agents coordin
  Thread  Thread  Thread   ← permanent or temporary workers
     │      │      │
     ▼      ▼      ▼
- Server  Server  Server   ← external tools (any stdio JSON-RPC server)
+  MCP    MCP    MCP       ← external tools (stdio or HTTP)
 ```
 
 ## Quick Start
@@ -29,10 +31,16 @@ A continuous thinking engine that runs autonomous AI agent teams. Agents coordin
 echo "FIREWORKS_API_KEY=your-key" > .env
 
 # Build and run with TUI
-go build -o core . && ./core
+go build -o apteva-core . && ./apteva-core
 
 # Or run headless (API only)
-./core --headless
+./apteva-core --headless
+```
+
+Or use the [apteva CLI](https://github.com/apteva/apteva) which manages everything:
+
+```bash
+cd ../apteva && ./apteva   # spawns server + core + TUI
 ```
 
 ## API
@@ -42,27 +50,13 @@ Default port: `3210` (set with `API_PORT` env var)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
-| `/status` | GET | Uptime, iteration count, threads, memory |
+| `/status` | GET | Uptime, iteration, rate, model, mode, threads, memory |
 | `/threads` | GET | List all threads with state |
-| `/events` | GET | SSE stream of all events |
-| `/event` | POST | Inject a console command |
-| `/config` | GET/PUT | Read/update directive |
-
-## TUI Keys
-
-| Key | Action |
-|-----|--------|
-| `i` | Chat input |
-| `c` | Console command |
-| `e` | Edit directive |
-| `b` | Event bus viewer |
-| `t` | Thread panel |
-| `m` | Memory panel |
-| `o` | Tools panel |
-| `]` / `[` | Switch tabs |
-| `j` / `k` | Scroll |
-| `space` | Pause/resume |
-| `q` | Quit |
+| `/threads/{id}` | DELETE | Kill a thread |
+| `/events` | GET | SSE stream of telemetry events |
+| `/event` | POST | Inject a message to a thread |
+| `/config` | GET/PUT | Read/update config (directive, mode, MCP servers, computer) |
+| `/pause` | POST | Toggle pause/resume |
 
 ## Core Tools
 
@@ -70,64 +64,99 @@ Always available to all threads:
 
 | Tool | Description |
 |------|-------------|
-| `pace` | Set thinking speed (fast/normal/slow/sleep) and model size |
+| `pace` | Set thinking speed and model size |
 | `send` | Send message to another thread |
 | `done` | Terminate this thread |
 | `evolve` | Rewrite own directive |
 | `remember` | Store to persistent memory |
-| `spawn` | Create new thread (coordinator only) |
-| `kill` | Stop a thread (coordinator only) |
 
-Additional tools are provided by external servers and discovered automatically.
+Coordinator-only:
+
+| Tool | Description |
+|------|-------------|
+| `spawn` | Create new thread with directive and tools |
+| `kill` | Stop a thread |
+| `update` | Change a thread's directive/tools |
+| `connect` | Attach an MCP server at runtime |
+| `disconnect` | Detach an MCP server |
+
+Discoverable (RAG-retrieved when relevant):
+
+| Tool | Description |
+|------|-------------|
+| `web` | Fetch a URL |
+| `exec` | Run a shell command |
+| `computer_use` | Screen interaction (click, type, scroll, screenshot) |
+| `browser_session` | Navigate URLs, manage browser sessions |
+
+All tools support `_reason` — an optional observability field for explaining why the tool is being called.
+
+## Safety Modes
+
+No forced approval gates. The agent decides, learns, asks when unsure.
+
+| Mode | Behavior |
+|------|----------|
+| `autonomous` | Acts freely. Learns from feedback. |
+| `cautious` | Asks before risky actions. Learns from answers. |
+| `learn` | Asks about every new tool type. Builds safety profile. |
+
+Set via `PUT /config {"mode": "cautious"}` or the CLI `/mode` command.
+
+## Session Persistence
+
+Conversation history persists across restarts:
+
+- JSONL files per thread: `history/main.jsonl`, `history/<thread>.jsonl`
+- Last 50 messages loaded on startup
+- Auto-compaction at 500 messages (keeps 100 recent + summaries)
+- Thread history deleted on `[[done]]` or `[[kill]]`
+
+## Providers
+
+| Provider | Env Var | Native Tool Calling |
+|----------|---------|-------------------|
+| Fireworks (Kimi K2.5) | `FIREWORKS_API_KEY` | Yes |
+| Anthropic (Claude) | `ANTHROPIC_API_KEY` | Yes + native computer use |
+| OpenAI (GPT-4) | `OPENAI_API_KEY` | Yes |
+| Google (Gemini) | `GOOGLE_API_KEY` | Yes |
 
 ## Configuration
 
 ```json
 {
   "directive": "Your mission here",
+  "mode": "autonomous",
+  "provider": {
+    "name": "fireworks",
+    "models": { "large": "accounts/fireworks/models/kimi-k2p5", "small": "accounts/fireworks/models/kimi-k2p5" }
+  },
+  "computer": { "type": "local", "width": 1280, "height": 800 },
   "mcp_servers": [
-    {
-      "name": "myservice",
-      "command": "./my-server-binary",
-      "env": {"API_KEY": "..."}
-    }
+    { "name": "myservice", "command": "./my-server", "main_access": true }
   ]
 }
 ```
 
-## Tool Servers
+## Browser / Computer Use
 
-External tools connect via [MCP](https://modelcontextprotocol.io/) (stdio JSON-RPC). The `mcps/` directory contains examples:
-
-| Server | Purpose |
-|--------|---------|
-| `helpdesk` | Support ticket management |
-| `chat` | User conversations |
-| `orders` | Order management |
-| `inventory` | Stock tracking |
-| `schedule` | Content calendar |
-| `creative` | AI content generation |
-| `social` | Social media publishing |
-| `sensors` | Robot sensor readings |
-| `motors` | Robot motor control |
-| `pushover` | Push notifications |
-
-## Scenarios
-
-Integration tests that validate full agent team behavior:
-
-```bash
-# Run all scenarios
-go test -v -run TestScenario -timeout=600s
+```json
+{ "computer": { "type": "local" } }
 ```
 
-| Scenario | What it tests |
-|----------|---------------|
-| Helpdesk | Ticket monitoring, KB lookup, reply/close |
-| Chat | Multi-user conversation, factual Q&A |
-| Bakery | Multi-service coordination, stock management, failure handling |
-| Social Team | 3-stage content pipeline with 3 permanent workers |
-| Robot | Sensor-motor loop, obstacle avoidance, camera scanning |
+Two tools registered when a computer is connected:
+- `browser_session` — open URLs, close, status (no screenshots)
+- `computer_use` — click, type, scroll, screenshot (returns images)
+
+Implementations: local Chrome (auto-launched), Browserbase (cloud), custom HTTP service.
+
+## Testing
+
+```bash
+go test ./... -short              # unit tests
+RUN_COMPUTER_TESTS=1 go test -run TestComputerUse_Local  # browser tests
+go test -v -run TestScenario      # full agent scenarios
+```
 
 ## License
 
