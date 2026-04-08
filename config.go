@@ -23,10 +23,12 @@ const (
 	ModeLearn      RunMode = "learn"      // agent actively asks about new tool types, builds safety profile
 )
 
-// ProviderConfig persists the active provider and model selections.
+// ProviderConfig persists a provider and its model selections.
 type ProviderConfig struct {
-	Name   string            `json:"name"`             // "google", "openai", "anthropic", "fireworks", "ollama"
-	Models map[string]string `json:"models,omitempty"` // "large" → model ID, "small" → model ID
+	Name         string            `json:"name"`                    // "google", "openai", "anthropic", "fireworks", "ollama"
+	Default      bool              `json:"default,omitempty"`       // true = default provider (first match wins)
+	Models       map[string]string `json:"models,omitempty"`        // "large" → model ID, "medium" → ..., "small" → ...
+	BuiltinTools []string          `json:"builtin_tools,omitempty"` // e.g. ["code_execution"]
 }
 
 // ComputerConfig holds the configuration for a computer use environment.
@@ -44,7 +46,8 @@ type Config struct {
 	path        string
 	Directive   string             `json:"directive"`
 	Mode        RunMode            `json:"mode,omitempty"`
-	Provider    *ProviderConfig    `json:"provider,omitempty"`
+	Providers   []ProviderConfig   `json:"providers,omitempty"`   // multi-provider pool
+	Provider    *ProviderConfig    `json:"provider,omitempty"`    // legacy single-provider (auto-migrated to Providers on load)
 	Computer    *ComputerConfig    `json:"computer,omitempty"`
 	Threads     []PersistentThread `json:"threads,omitempty"`
 	MCPServers  []MCPServerConfig  `json:"mcp_servers,omitempty"`
@@ -67,6 +70,13 @@ func (c *Config) load() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	json.Unmarshal(data, c)
+
+	// Migrate legacy single Provider → Providers array
+	if c.Provider != nil && c.Provider.Name != "" && len(c.Providers) == 0 {
+		c.Provider.Default = true
+		c.Providers = []ProviderConfig{*c.Provider}
+		c.Provider = nil
+	}
 }
 
 func (c *Config) Save() error {
@@ -182,53 +192,146 @@ func (c *Config) SetMode(m RunMode) {
 	c.Save()
 }
 
-// GetProvider returns the persisted provider config, or nil.
-func (c *Config) GetProvider() *ProviderConfig {
+// GetProviders returns a copy of the providers list.
+func (c *Config) GetProviders() []ProviderConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.Provider == nil {
-		return nil
+	out := make([]ProviderConfig, len(c.Providers))
+	for i, p := range c.Providers {
+		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: p.BuiltinTools}
+		if p.Models != nil {
+			cp.Models = make(map[string]string)
+			for k, v := range p.Models {
+				cp.Models[k] = v
+			}
+		}
+		out[i] = cp
 	}
-	// Return a copy
-	cp := &ProviderConfig{Name: c.Provider.Name}
-	if c.Provider.Models != nil {
-		cp.Models = make(map[string]string)
-		for k, v := range c.Provider.Models {
-			cp.Models[k] = v
+	return out
+}
+
+// GetDefaultProvider returns the default provider config, or nil.
+func (c *Config) GetDefaultProvider() *ProviderConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, p := range c.Providers {
+		if p.Default {
+			cp := p
+			return &cp
 		}
 	}
-	return cp
+	if len(c.Providers) > 0 {
+		cp := c.Providers[0]
+		return &cp
+	}
+	return nil
 }
 
-// SetProvider persists the provider and model selection to config.json.
+// GetProvider returns the persisted default provider config, or nil.
+// Backward-compatible wrapper around GetDefaultProvider.
+func (c *Config) GetProvider() *ProviderConfig {
+	return c.GetDefaultProvider()
+}
+
+// GetProviderByName returns a provider config by name, or nil.
+func (c *Config) GetProviderByName(name string) *ProviderConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, p := range c.Providers {
+		if p.Name == name {
+			cp := p
+			return &cp
+		}
+	}
+	return nil
+}
+
+// SetProvider adds or updates a provider in the list. If it's the only one, marks it default.
 func (c *Config) SetProvider(pc *ProviderConfig) {
 	c.mu.Lock()
-	c.Provider = pc
+	found := false
+	for i, p := range c.Providers {
+		if p.Name == pc.Name {
+			c.Providers[i] = *pc
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.Providers = append(c.Providers, *pc)
+	}
+	// If only one provider, make it default
+	if len(c.Providers) == 1 {
+		c.Providers[0].Default = true
+	}
+	c.Provider = nil // clear legacy field
 	c.mu.Unlock()
 	c.Save()
 }
 
-// SetProviderName updates just the provider name, preserving models.
+// SetProviderName adds or updates a provider by name with default flag.
 func (c *Config) SetProviderName(name string) {
 	c.mu.Lock()
-	if c.Provider == nil {
-		c.Provider = &ProviderConfig{}
+	found := false
+	for i, p := range c.Providers {
+		if p.Name == name {
+			found = true
+			_ = i
+			break
+		}
 	}
-	c.Provider.Name = name
+	if !found {
+		pc := ProviderConfig{Name: name}
+		if len(c.Providers) == 0 {
+			pc.Default = true
+		}
+		c.Providers = append(c.Providers, pc)
+	}
+	c.Provider = nil
 	c.mu.Unlock()
 	c.Save()
 }
 
-// SetProviderModel updates a single model tier in the config.
+// SetProviderModel updates a single model tier for a provider (default if not specified).
 func (c *Config) SetProviderModel(tier string, modelID string) {
 	c.mu.Lock()
-	if c.Provider == nil {
-		c.Provider = &ProviderConfig{}
+	if len(c.Providers) == 0 {
+		c.Providers = []ProviderConfig{{Name: "unknown", Default: true}}
 	}
-	if c.Provider.Models == nil {
-		c.Provider.Models = make(map[string]string)
+	// Update the default provider
+	for i, p := range c.Providers {
+		if p.Default || i == 0 {
+			if c.Providers[i].Models == nil {
+				c.Providers[i].Models = make(map[string]string)
+			}
+			c.Providers[i].Models[tier] = modelID
+			break
+		}
 	}
-	c.Provider.Models[tier] = modelID
+	c.Provider = nil
+	c.mu.Unlock()
+	c.Save()
+}
+
+// SetDefaultProvider marks a provider as default (clears default on others).
+func (c *Config) SetDefaultProvider(name string) {
+	c.mu.Lock()
+	for i := range c.Providers {
+		c.Providers[i].Default = c.Providers[i].Name == name
+	}
+	c.mu.Unlock()
+	c.Save()
+}
+
+// RemoveProvider removes a provider by name.
+func (c *Config) RemoveProvider(name string) {
+	c.mu.Lock()
+	for i, p := range c.Providers {
+		if p.Name == name {
+			c.Providers = append(c.Providers[:i], c.Providers[i+1:]...)
+			break
+		}
+	}
 	c.mu.Unlock()
 	c.Save()
 }

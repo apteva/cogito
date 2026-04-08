@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -13,19 +14,42 @@ import (
 type APIServer struct {
 	thinker   *Thinker
 	startTime time.Time
+	apiKey    string // if set, all endpoints except /health require auth
+}
+
+// apiAuth wraps a handler with API key authentication.
+func (a *APIServer) apiAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if a.apiKey != "" {
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer "+a.apiKey {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
 }
 
 func startAPI(thinker *Thinker, addr string) error {
-	api := &APIServer{thinker: thinker, startTime: time.Now()}
+	api := &APIServer{
+		thinker:   thinker,
+		startTime: time.Now(),
+		apiKey:    os.Getenv("APTEVA_API_KEY"),
+	}
+	if api.apiKey != "" {
+		logMsg("API", "API key auth enabled")
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", api.health)
-	mux.HandleFunc("/status", api.status)
-	mux.HandleFunc("/threads", api.threads)
-	mux.HandleFunc("/threads/", api.threadAction)
-	mux.HandleFunc("/events", api.events)
-	mux.HandleFunc("/pause", api.pause)
-	mux.HandleFunc("/event", api.postEvent)
-	mux.HandleFunc("/config", api.config)
+	mux.HandleFunc("/health", api.health) // always open
+	mux.HandleFunc("/status", api.apiAuth(api.status))
+	mux.HandleFunc("/threads", api.apiAuth(api.threads))
+	mux.HandleFunc("/threads/", api.apiAuth(api.threadAction))
+	mux.HandleFunc("/events", api.apiAuth(api.events))
+	mux.HandleFunc("/pause", api.apiAuth(api.pause))
+	mux.HandleFunc("/event", api.apiAuth(api.postEvent))
+	mux.HandleFunc("/config", api.apiAuth(api.config))
 	mux.Handle("/", http.FileServer(http.Dir("web")))
 	return http.ListenAndServe(addr, mux)
 }

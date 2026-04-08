@@ -14,16 +14,18 @@ import (
 )
 
 type AnthropicProvider struct {
-	apiKey string
-	models map[ModelTier]string
+	apiKey       string
+	models       map[ModelTier]string
+	builtinTools []string // enabled built-in tools: "code_execution", "web_search"
 }
 
 func NewAnthropicProvider(apiKey string) LLMProvider {
 	return &AnthropicProvider{
 		apiKey: apiKey,
 		models: map[ModelTier]string{
-			ModelLarge: "claude-sonnet-4-20250514",
-			ModelSmall: "claude-haiku-4-20250414",
+			ModelLarge:  "claude-opus-4-6",
+			ModelMedium: "claude-sonnet-4-20250514",
+			ModelSmall:  "claude-haiku-4-5-20251001",
 		},
 	}
 }
@@ -32,6 +34,17 @@ func (p *AnthropicProvider) Name() string                            { return "a
 func (p *AnthropicProvider) Models() map[ModelTier]string            { return p.models }
 func (p *AnthropicProvider) CostPer1M() (float64, float64, float64) { return 3.00, 0.30, 15.00 }
 func (p *AnthropicProvider) SupportsNativeTools() bool               { return true }
+
+func (p *AnthropicProvider) AvailableBuiltinTools() []BuiltinTool {
+	return []BuiltinTool{
+		{Type: "code_execution_20250825", Name: "code_execution"},
+		{Type: "web_search_20250305", Name: "web_search"},
+	}
+}
+
+func (p *AnthropicProvider) SetBuiltinTools(tools []string) {
+	p.builtinTools = tools
+}
 
 // --- Request types ---
 
@@ -109,11 +122,21 @@ type anthropicDelta struct {
 }
 
 type anthropicBlockStart struct {
-	Type  string `json:"type"` // "text", "tool_use"
+	Type  string `json:"type"` // "text", "tool_use", "server_tool_use", "code_execution_tool_result"
 	Text  string `json:"text,omitempty"`
 	ID    string `json:"id,omitempty"`    // tool_use
-	Name  string `json:"name,omitempty"`  // tool_use
+	Name  string `json:"name,omitempty"`  // tool_use / server_tool_use
 	Input map[string]any `json:"input,omitempty"` // tool_use (may be empty at start)
+	// code_execution_tool_result fields
+	Content []struct {
+		Type   string `json:"type"`
+		Text   string `json:"text,omitempty"`
+		Output struct {
+			Stdout     string `json:"stdout,omitempty"`
+			Stderr     string `json:"stderr,omitempty"`
+			ReturnCode int    `json:"return_code"`
+		} `json:"output,omitempty"`
+	} `json:"content,omitempty"`
 }
 
 // --- Chat implementation ---
@@ -225,6 +248,19 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 		}
 	}
 
+	// Add enabled built-in tools
+	for _, btName := range p.builtinTools {
+		for _, available := range p.AvailableBuiltinTools() {
+			if available.Name == btName {
+				anthropicTools = append(anthropicTools, map[string]string{
+					"type": available.Type,
+					"name": available.Name,
+				})
+				break
+			}
+		}
+	}
+
 	reqBody := anthropicRequest{
 		Model:     model,
 		MaxTokens: 4096,
@@ -264,6 +300,8 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 	var full strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
+	var serverResults []ServerToolResult
+	var currentServerTool string // name of server tool being executed
 
 	// Track current tool_use block being streamed
 	type pendingTool struct {
@@ -291,11 +329,46 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 		switch event.Type {
 		case "content_block_start":
 			if event.ContentBlock != nil {
-				if event.ContentBlock.Type == "tool_use" {
+				switch event.ContentBlock.Type {
+				case "tool_use":
 					currentTool = &pendingTool{
 						id:   event.ContentBlock.ID,
 						name: event.ContentBlock.Name,
 					}
+				case "server_tool_use":
+					// Built-in tool being executed server-side
+					currentServerTool = event.ContentBlock.Name
+					code, _ := event.ContentBlock.Input["code"].(string)
+					if code != "" && onChunk != nil {
+						onChunk("\n→ " + currentServerTool + ": executing...\n")
+					}
+				case "code_execution_tool_result":
+					// Server tool result
+					var output, stderr string
+					for _, c := range event.ContentBlock.Content {
+						if c.Type == "text" {
+							output += c.Text
+						}
+						if c.Output.Stdout != "" {
+							output += c.Output.Stdout
+						}
+						if c.Output.Stderr != "" {
+							stderr += c.Output.Stderr
+						}
+					}
+					serverResults = append(serverResults, ServerToolResult{
+						ToolName: currentServerTool,
+						Output:   output,
+						Error:    stderr,
+					})
+					if onChunk != nil {
+						preview := output
+						if len(preview) > 200 {
+							preview = preview[:200] + "..."
+						}
+						onChunk("\n← " + currentServerTool + ": " + preview + "\n")
+					}
+					currentServerTool = ""
 				}
 			}
 		case "content_block_delta":
@@ -349,9 +422,10 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 	}
 
 	return ChatResponse{
-		Text:      full.String(),
-		ToolCalls: toolCalls,
-		Usage:     usage,
+		Text:          full.String(),
+		ToolCalls:     toolCalls,
+		ServerResults: serverResults,
+		Usage:         usage,
 	}, nil
 }
 

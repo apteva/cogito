@@ -294,14 +294,25 @@ func main() {
 			})
 		case "tools/call":
 			var params struct {
-				Name      string            `json:"name"`
-				Arguments map[string]string `json:"arguments"`
+				Name      string         `json:"name"`
+				Arguments map[string]any `json:"arguments"`
 			}
 			if err := json.Unmarshal(req.Params, &params); err != nil {
 				respondError(id, -32602, "invalid params")
 				continue
 			}
-			handleToolCall(id, params.Name, params.Arguments)
+			// Convert all argument values to strings
+			args := make(map[string]string)
+			for k, v := range params.Arguments {
+				switch val := v.(type) {
+				case string:
+					args[k] = val
+				default:
+					data, _ := json.Marshal(val)
+					args[k] = string(data)
+				}
+			}
+			handleToolCall(id, params.Name, args)
 		default:
 			respondError(id, -32601, fmt.Sprintf("unknown method: %s", req.Method))
 		}

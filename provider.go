@@ -43,11 +43,26 @@ type ToolResult struct {
 	IsError bool   `json:"is_error,omitempty"`
 }
 
+// BuiltinTool defines a provider-side tool (executed by the LLM provider, not by us).
+type BuiltinTool struct {
+	Type string `json:"type"` // e.g. "code_execution_20250825", "code_interpreter"
+	Name string `json:"name"` // e.g. "code_execution", "code_interpreter"
+}
+
+// ServerToolResult is the result of a built-in tool executed server-side.
+type ServerToolResult struct {
+	ToolName string `json:"tool_name"`
+	Code     string `json:"code,omitempty"`   // code that was executed
+	Output   string `json:"output,omitempty"` // stdout/result
+	Error    string `json:"error,omitempty"`  // stderr if any
+}
+
 // ChatResponse is the structured return from Chat().
 type ChatResponse struct {
-	Text      string           // streamed text content
-	ToolCalls []NativeToolCall // structured tool calls (empty if none)
-	Usage     TokenUsage
+	Text          string             // streamed text content
+	ToolCalls     []NativeToolCall   // structured tool calls WE need to execute
+	ServerResults []ServerToolResult // tools the PROVIDER already executed
+	Usage         TokenUsage
 }
 
 // LLMProvider abstracts the LLM API call.
@@ -72,6 +87,12 @@ type LLMProvider interface {
 
 	// SupportsNativeTools returns true if this provider handles structured tool calling.
 	SupportsNativeTools() bool
+
+	// AvailableBuiltinTools returns built-in tools this provider supports.
+	AvailableBuiltinTools() []BuiltinTool
+
+	// SetBuiltinTools enables specific built-in tools.
+	SetBuiltinTools(tools []string)
 }
 
 // createProviderByName creates a provider by name, returning nil if the required API key is missing.
@@ -109,12 +130,16 @@ func applyModelOverrides(provider LLMProvider, models map[string]string) {
 		return
 	}
 	large := models["large"]
+	medium := models["medium"]
 	small := models["small"]
 
 	switch p := provider.(type) {
 	case *GoogleProvider:
 		if large != "" {
-			p.SetModel(large) // sets both large+small + active
+			p.SetModel(large)
+		}
+		if medium != "" {
+			p.models[ModelMedium] = medium
 		}
 		if small != "" {
 			p.models[ModelSmall] = small
@@ -123,6 +148,9 @@ func applyModelOverrides(provider LLMProvider, models map[string]string) {
 		if large != "" {
 			p.models[ModelLarge] = large
 		}
+		if medium != "" {
+			p.models[ModelMedium] = medium
+		}
 		if small != "" {
 			p.models[ModelSmall] = small
 		}
@@ -130,64 +158,194 @@ func applyModelOverrides(provider LLMProvider, models map[string]string) {
 		if large != "" {
 			p.models[ModelLarge] = large
 		}
+		if medium != "" {
+			p.models[ModelMedium] = medium
+		}
 		if small != "" {
 			p.models[ModelSmall] = small
 		}
 	}
 }
 
-// selectProvider picks the best available LLM provider.
-// Priority: CORE_PROVIDER env → config.json provider → auto-detect from API keys.
-// Model overrides: CORE_MODEL_LARGE/CORE_MODEL_SMALL env → config.json provider.models → provider defaults.
-func selectProvider(cfg *Config) (LLMProvider, error) {
-	var provider LLMProvider
+// ProviderPool holds multiple LLM providers keyed by name.
+// Supports default selection and fallback on error.
+type ProviderPool struct {
+	providers map[string]LLMProvider // "fireworks" → instance
+	order     []string              // provider names in config order (fallback order)
+	default_  string                // default provider name
+}
 
-	// 1. Explicit env var (highest priority)
-	if explicit := os.Getenv("CORE_PROVIDER"); explicit != "" {
-		provider = createProviderByName(explicit)
-		if provider == nil {
-			return nil, fmt.Errorf("provider %q requested via CORE_PROVIDER but required API key not set", explicit)
-		}
+// Get returns a provider by name, or nil if not found.
+func (pp *ProviderPool) Get(name string) LLMProvider {
+	if pp == nil {
+		return nil
 	}
+	return pp.providers[name]
+}
 
-	// 2. Config file
-	if provider == nil {
-		if pc := cfg.GetProvider(); pc != nil && pc.Name != "" {
-			provider = createProviderByName(pc.Name)
-			// Apply config model overrides
-			if provider != nil {
-				applyModelOverrides(provider, pc.Models)
+// Default returns the default provider.
+func (pp *ProviderPool) Default() LLMProvider {
+	if pp == nil {
+		return nil
+	}
+	if p, ok := pp.providers[pp.default_]; ok {
+		return p
+	}
+	// Fallback: first available
+	if len(pp.order) > 0 {
+		return pp.providers[pp.order[0]]
+	}
+	return nil
+}
+
+// DefaultName returns the name of the default provider.
+func (pp *ProviderPool) DefaultName() string {
+	if pp == nil {
+		return ""
+	}
+	return pp.default_
+}
+
+// Names returns all provider names in config order.
+func (pp *ProviderPool) Names() []string {
+	if pp == nil {
+		return nil
+	}
+	return pp.order
+}
+
+// Fallback returns the next provider in the fallback chain after the excluded one.
+func (pp *ProviderPool) Fallback(exclude string) LLMProvider {
+	if pp == nil {
+		return nil
+	}
+	for _, name := range pp.order {
+		if name != exclude {
+			if p, ok := pp.providers[name]; ok {
+				return p
 			}
 		}
 	}
+	return nil
+}
 
-	// 3. Auto-detect from API keys
-	if provider == nil {
+// Count returns the number of providers in the pool.
+func (pp *ProviderPool) Count() int {
+	if pp == nil {
+		return 0
+	}
+	return len(pp.providers)
+}
+
+// ProviderSummary returns a description of a provider for system prompt injection.
+func (pp *ProviderPool) ProviderSummary(name string) string {
+	p, ok := pp.providers[name]
+	if !ok {
+		return ""
+	}
+	models := p.Models()
+	summary := name
+	if name == pp.default_ {
+		summary += " (default)"
+	}
+	summary += " — models:"
+	for _, tier := range []ModelTier{ModelLarge, ModelMedium, ModelSmall} {
+		if m, ok := models[tier]; ok && m != "" {
+			summary += " " + tier.String() + "=" + m
+		}
+	}
+	builtins := p.AvailableBuiltinTools()
+	if len(builtins) > 0 {
+		summary += "\n    built-in:"
+		for _, bt := range builtins {
+			summary += " " + bt.Name
+		}
+	}
+	return summary
+}
+
+// buildProviderPool creates a ProviderPool from config + env vars.
+// Priority: CORE_PROVIDER env → config.json providers → auto-detect from API keys.
+func buildProviderPool(cfg *Config) (*ProviderPool, error) {
+	pool := &ProviderPool{providers: map[string]LLMProvider{}}
+
+	// 1. Config providers array
+	configs := cfg.GetProviders()
+	for _, pc := range configs {
+		p := createProviderByName(pc.Name)
+		if p == nil {
+			continue
+		}
+		applyModelOverrides(p, pc.Models)
+		if len(pc.BuiltinTools) > 0 {
+			p.SetBuiltinTools(pc.BuiltinTools)
+		}
+		pool.providers[pc.Name] = p
+		pool.order = append(pool.order, pc.Name)
+		if pc.Default {
+			pool.default_ = pc.Name
+		}
+	}
+
+	// 2. CORE_PROVIDER env override (force default)
+	if explicit := os.Getenv("CORE_PROVIDER"); explicit != "" {
+		if _, ok := pool.providers[explicit]; !ok {
+			p := createProviderByName(explicit)
+			if p == nil {
+				return nil, fmt.Errorf("provider %q requested via CORE_PROVIDER but required API key not set", explicit)
+			}
+			pool.providers[explicit] = p
+			pool.order = append([]string{explicit}, pool.order...)
+		}
+		pool.default_ = explicit
+	}
+
+	// 3. Auto-detect from API keys if nothing configured
+	if len(pool.providers) == 0 {
 		for _, name := range []string{"fireworks", "openai", "anthropic", "google", "ollama"} {
 			if p := createProviderByName(name); p != nil {
-				provider = p
-				break
+				pool.providers[name] = p
+				pool.order = append(pool.order, name)
 			}
 		}
 	}
 
-	if provider == nil {
+	if len(pool.providers) == 0 {
 		return nil, fmt.Errorf("no LLM provider configured — set FIREWORKS_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, or OLLAMA_HOST")
 	}
 
-	// 4. Env model overrides (highest priority for models)
+	// Default = first with Default flag, or first in order
+	if pool.default_ == "" && len(pool.order) > 0 {
+		pool.default_ = pool.order[0]
+	}
+
+	// 4. Env model overrides (highest priority for models, applied to default)
 	envModels := map[string]string{}
 	if v := os.Getenv("CORE_MODEL_LARGE"); v != "" {
 		envModels["large"] = v
+	}
+	if v := os.Getenv("CORE_MODEL_MEDIUM"); v != "" {
+		envModels["medium"] = v
 	}
 	if v := os.Getenv("CORE_MODEL_SMALL"); v != "" {
 		envModels["small"] = v
 	}
 	if len(envModels) > 0 {
-		applyModelOverrides(provider, envModels)
+		if def := pool.Default(); def != nil {
+			applyModelOverrides(def, envModels)
+		}
 	}
 
-	return provider, nil
+	return pool, nil
+}
+
+// selectProvider picks the default provider from a pool. Backward-compatible wrapper.
+func selectProvider(cfg *Config) (LLMProvider, error) {
+	pool, err := buildProviderPool(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return pool.Default(), nil
 }
 
 // availableProviders returns all providers that have credentials configured.

@@ -18,7 +18,8 @@ import (
 type Scenario struct {
 	Name       string
 	Directive  string
-	MCPServers []MCPServerConfig // {{dataDir}} in Env values is replaced at runtime
+	MCPServers []MCPServerConfig  // {{dataDir}} in Env values is replaced at runtime
+	Providers  []ProviderConfig   // multi-provider pool config (optional)
 	DataSetup  func(t *testing.T, dir string)
 	Phases     []Phase
 	Timeout    time.Duration // hard cap for entire scenario
@@ -70,7 +71,7 @@ func runScenario(t *testing.T, s Scenario) {
 	}
 
 	// Create thinker
-	thinker := newScenarioThinker(t, apiKey, s.Directive, mcpServers)
+	thinker := newScenarioThinker(t, apiKey, s.Directive, mcpServers, s.Providers)
 
 	// Track peak thread count
 	var peakThreads atomic.Int32
@@ -199,7 +200,7 @@ func buildMCPBinary(t *testing.T, dir string) string {
 	return bin
 }
 
-func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCPServerConfig) *Thinker {
+func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCPServerConfig, providerConfigs ...[]ProviderConfig) *Thinker {
 	t.Helper()
 
 	tmpDir := t.TempDir()
@@ -209,6 +210,10 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 		Directive:  directive,
 		MCPServers: mcpServers,
 	}
+	// Apply provider configs if provided
+	if len(providerConfigs) > 0 && len(providerConfigs[0]) > 0 {
+		cfg.Providers = providerConfigs[0]
+	}
 	cfg.Save()
 
 	memStore := &MemoryStore{
@@ -216,16 +221,17 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 		path:   filepath.Join(tmpDir, "memory.jsonl"),
 	}
 
-	// Use a clean config (no persisted provider) so env vars control provider selection
-	cleanCfg := &Config{path: filepath.Join(tmpDir, "provider.json")}
-	provider, err := selectProvider(cleanCfg)
+	// Build provider pool from config + env vars
+	pool, err := buildProviderPool(cfg)
 	if err != nil {
 		t.Fatalf("no LLM provider: %v", err)
 	}
+	provider := pool.Default()
 
 	bus := NewEventBus()
 	thinker := &Thinker{
 		apiKey:   apiKey,
+		pool:     pool,
 		provider: provider,
 		messages: []Message{
 			{Role: "system", Content: ""},
@@ -247,13 +253,13 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 	thinker.threads = NewThreadManager(thinker)
 	thinker.registry = NewToolRegistry(apiKey)
 
-	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", nil, nil)}
+	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", nil, nil, pool)}
 
 	go thinker.registry.EmbedAll(memStore)
 
 	thinker.handleTools = mainToolHandler(thinker)
 	thinker.rebuildPrompt = func(toolDocs string) string {
-		return buildSystemPrompt(cfg.GetDirective(), ModeAutonomous, thinker.registry, toolDocs, thinker.mcpServers, nil)
+		return buildSystemPrompt(cfg.GetDirective(), ModeAutonomous, thinker.registry, toolDocs, thinker.mcpServers, nil, thinker.pool)
 	}
 
 	if len(mcpServers) > 0 {
@@ -1625,6 +1631,137 @@ func TestScenario_DevTeam(t *testing.T) {
 	runScenario(t, s)
 }
 
+// --- Multi-Provider DevTeam Scenario ---
+// Uses fireworks (default, cheap) for coordination + support + qa,
+// and openai (gpt-4.1, powerful) for the dev coding thread.
+
+var devTeamMultiProviderScenario = Scenario{
+	Name: "DevTeamMultiProvider",
+	Directive: `You manage a small development team maintaining a Todo SaaS app.
+The codebase is in the "app/" directory. It is a Go package with todo.go and todo_test.go.
+
+You have TWO providers available:
+- fireworks (default) — fast and cheap, use for coordination, support, and QA
+- openai — powerful (gpt-4.1), use for the dev thread that writes code
+
+Spawn and maintain 3 threads:
+1. "support" — monitors helpdesk tickets, triages them (bug vs feature), reports to main with recommendations.
+   Tools: helpdesk_list_tickets, helpdesk_reply_ticket, helpdesk_close_ticket, send, done
+2. "dev" — reads/writes code, implements features and fixes. MUST use provider="openai" for better code quality. Always reads existing code before modifying.
+   Tools: codebase_read_file, codebase_write_file, codebase_list_files, codebase_search, send, done
+3. "qa" — runs the test suite and reports results. Triggered by main after dev finishes.
+   Tools: codebase_run_tests, codebase_read_file, send, done
+
+Workflow:
+- Support finds a ticket and tells you what it is
+- You decide what to do and tell dev to implement it
+- After dev is done, tell qa to run tests
+- If tests fail, send dev back to fix. If pass, tell support to close the ticket.`,
+	Providers: []ProviderConfig{
+		{Name: "fireworks", Default: true},
+		{Name: "openai"},
+	},
+	MCPServers: []MCPServerConfig{
+		{Name: "helpdesk", Command: "", Env: map[string]string{"HELPDESK_DATA_DIR": "{{dataDir}}"}},
+		{Name: "codebase", Command: "", Env: map[string]string{"CODEBASE_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		seedTodoApp(t, dir)
+	},
+	Phases: []Phase{
+		{
+			Name:    "Startup — 3 threads spawned, dev on openai",
+			Timeout: 90 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				return len(threadIDs(th)) >= 3
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Verify pool has both providers
+				if th.pool == nil {
+					t.Error("expected provider pool")
+					return
+				}
+				if th.pool.Count() < 2 {
+					t.Errorf("expected 2 providers in pool, got %d", th.pool.Count())
+				}
+				if th.pool.Get("fireworks") == nil {
+					t.Error("expected fireworks in pool")
+				}
+				if th.pool.Get("openai") == nil {
+					t.Error("expected openai in pool")
+				}
+				// Log each thread's actual provider
+				threads := th.threads.List()
+				for _, thread := range threads {
+					t.Logf("thread %s: provider=%s model=%s", thread.ID, thread.Provider, thread.Model)
+				}
+				// Check if dev got openai
+				for _, thread := range threads {
+					if thread.ID == "dev" && thread.Provider == "openai" {
+						t.Logf("OK: dev thread correctly using openai")
+					} else if thread.ID == "dev" {
+						t.Logf("NOTE: dev thread using %s (directive asked for openai)", thread.Provider)
+					}
+				}
+			},
+		},
+		{
+			Name:    "Feature request — add priority field (dev uses openai)",
+			Timeout: 180 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				writeJSONFile(t, dir, "tickets.json", []map[string]string{
+					{"id": "T-101", "question": "Feature request: Please add a Priority field to todos. It should be a string with values low, medium, or high. Default to low. The Create function should accept an optional priority parameter."},
+				})
+			},
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				code, err := os.ReadFile(filepath.Join(dir, "app", "todo.go"))
+				if err != nil {
+					return false
+				}
+				if !strings.Contains(string(code), "Priority") {
+					return false
+				}
+				cmd := exec.Command("bash", "test.sh")
+				cmd.Dir = dir
+				return cmd.Run() == nil
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				code, _ := os.ReadFile(filepath.Join(dir, "app", "todo.go"))
+				if !strings.Contains(string(code), "Priority") {
+					t.Error("expected Priority field in todo.go")
+				}
+				cmd := exec.Command("bash", "test.sh")
+				cmd.Dir = dir
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Errorf("tests should pass after feature: %s", string(out))
+				}
+			},
+		},
+	},
+	Timeout:    6 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_DevTeamMultiProvider(t *testing.T) {
+	// Require both API keys
+	if os.Getenv("FIREWORKS_API_KEY") == "" {
+		t.Skip("FIREWORKS_API_KEY not set")
+	}
+	if os.Getenv("OPENAI_API_KEY") == "" {
+		t.Skip("OPENAI_API_KEY not set")
+	}
+
+	helpdeskBin := buildMCPBinary(t, "mcps/helpdesk")
+	codebaseBin := buildMCPBinary(t, "mcps/codebase")
+	t.Logf("built helpdesk=%s codebase=%s", helpdeskBin, codebaseBin)
+
+	s := devTeamMultiProviderScenario
+	s.MCPServers[0].Command = helpdeskBin
+	s.MCPServers[1].Command = codebaseBin
+	runScenario(t, s)
+}
+
 // --- Ecommerce Scenario ---
 
 var ecommerceScenario = Scenario{
@@ -2146,5 +2283,480 @@ func TestScenario_Onboarding(t *testing.T) {
 	s.MCPServers[1].Command = codebaseBin
 	s.MCPServers[2].Command = storageBin
 	s.MCPServers[3].Command = pushoverBin
+	runScenario(t, s)
+}
+
+// --- Lead Enrichment Scenario ---
+
+var leadEnrichmentScenario = Scenario{
+	Name: "LeadEnrichment",
+	Directive: `You manage a lead enrichment pipeline.
+
+Your job:
+1. Read all leads from the "Lead Pipeline" spreadsheet using the sheets tools.
+2. For each lead with status "new":
+   a. Create a contact in the CRM (crm_create_contact) with name, email, company, website.
+   b. Scrape the lead's website (webscraper_extract_info) to get company details.
+   c. Update the CRM contact (crm_update_contact) with the enrichment data (industry, employee_count, location, description) and set status to "enriched".
+   d. Update the spreadsheet row (sheets_update_cell) to set the status column to "enriched".
+3. After all leads are processed, you are done.
+
+Process all leads. Do not skip any.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "sheets", Command: "", Env: map[string]string{"SHEETS_DATA_DIR": "{{dataDir}}"}},
+		{Name: "crm", Command: "", Env: map[string]string{"CRM_DATA_DIR": "{{dataDir}}"}},
+		{Name: "webscraper", Command: "", Env: map[string]string{"SCRAPER_DATA_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		// Seed the spreadsheet with 5 leads
+		writeJSONFile(t, dir, "sheets.json", map[string]*struct {
+			Columns []string            `json:"columns"`
+			Rows    []map[string]string `json:"rows"`
+		}{
+			"Lead Pipeline": {
+				Columns: []string{"name", "email", "website", "company", "status"},
+				Rows: []map[string]string{
+					{"name": "Alice Smith", "email": "alice@acmecorp.com", "website": "https://acmecorp.com", "company": "Acme Corp", "status": "new"},
+					{"name": "Bob Chen", "email": "bob@globex.io", "website": "https://globex.io", "company": "Globex", "status": "new"},
+					{"name": "Carol Davis", "email": "carol@initech.com", "website": "https://initech.com", "company": "Initech", "status": "new"},
+					{"name": "Dan Wilson", "email": "dan@umbrella.dev", "website": "https://umbrella.dev", "company": "Umbrella Labs", "status": "new"},
+					{"name": "Eve Park", "email": "eve@northwind.co", "website": "https://northwind.co", "company": "Northwind", "status": "new"},
+				},
+			},
+		})
+
+		// Seed website data for the scraper
+		writeJSONFile(t, dir, "sites.json", map[string]*struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			Body        string `json:"body"`
+			Industry    string `json:"industry"`
+			Employees   string `json:"employees"`
+			Location    string `json:"location"`
+			Founded     string `json:"founded"`
+		}{
+			"https://acmecorp.com": {
+				Title:       "Acme Corp — Industrial Solutions",
+				Description: "Leading provider of industrial automation and robotics systems for manufacturing.",
+				Body:        "Acme Corp builds next-generation automation platforms for factories worldwide. Founded in 2015, we serve over 200 enterprise customers across North America and Europe.",
+				Industry:    "Industrial Automation",
+				Employees:   "500-1000",
+				Location:    "San Francisco, CA",
+				Founded:     "2015",
+			},
+			"https://globex.io": {
+				Title:       "Globex — AI-Powered Analytics",
+				Description: "We help businesses make data-driven decisions with real-time AI analytics.",
+				Body:        "Globex provides a unified analytics platform powered by machine learning. Our team of 80 engineers and data scientists builds tools used by Fortune 500 companies.",
+				Industry:    "SaaS / Analytics",
+				Employees:   "50-100",
+				Location:    "Austin, TX",
+				Founded:     "2020",
+			},
+			"https://initech.com": {
+				Title:       "Initech — Enterprise Software Consulting",
+				Description: "Initech delivers custom enterprise software solutions and digital transformation services.",
+				Body:        "For over a decade, Initech has helped mid-market companies modernize their technology stack. We specialize in ERP integration, cloud migration, and custom application development.",
+				Industry:    "IT Consulting",
+				Employees:   "200-500",
+				Location:    "Chicago, IL",
+				Founded:     "2012",
+			},
+			"https://umbrella.dev": {
+				Title:       "Umbrella Labs — Biotech Research Platform",
+				Description: "Umbrella Labs accelerates drug discovery with AI-powered molecular simulation.",
+				Body:        "Our computational biology platform reduces drug discovery timelines from years to months. Backed by $50M in Series B funding, we partner with 15 pharmaceutical companies.",
+				Industry:    "Biotech / Life Sciences",
+				Employees:   "100-200",
+				Location:    "Boston, MA",
+				Founded:     "2019",
+			},
+			"https://northwind.co": {
+				Title:       "Northwind — Sustainable Supply Chain",
+				Description: "Northwind optimizes global supply chains for sustainability and efficiency.",
+				Body:        "We provide end-to-end supply chain visibility with carbon footprint tracking. Our platform is used by 300+ retailers and manufacturers committed to sustainable operations.",
+				Industry:    "Supply Chain / Logistics",
+				Employees:   "150-300",
+				Location:    "Seattle, WA",
+				Founded:     "2017",
+			},
+		})
+
+		// Start with empty CRM
+		writeJSONFile(t, dir, "contacts.json", []any{})
+	},
+	Phases: []Phase{
+		{
+			Name:    "Sheet read — agent discovers 5 leads",
+			Timeout: 90 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				// Wait for the agent to have called read_sheet (check audit)
+				data, err := os.ReadFile(filepath.Join(dir, "audit.jsonl"))
+				if err != nil {
+					return false
+				}
+				return strings.Contains(string(data), "read_sheet")
+			},
+		},
+		{
+			Name:    "CRM creation — all 5 leads added",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, err := os.ReadFile(filepath.Join(dir, "contacts.json"))
+				if err != nil {
+					return false
+				}
+				var contacts []json.RawMessage
+				json.Unmarshal(data, &contacts)
+				return len(contacts) >= 5
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "contacts.json"))
+				var contacts []map[string]string
+				json.Unmarshal(data, &contacts)
+				if len(contacts) < 5 {
+					t.Errorf("expected 5 contacts, got %d", len(contacts))
+				}
+				// Verify all have emails
+				emails := map[string]bool{}
+				for _, c := range contacts {
+					emails[c["email"]] = true
+				}
+				for _, expected := range []string{"alice@acmecorp.com", "bob@globex.io", "carol@initech.com", "dan@umbrella.dev", "eve@northwind.co"} {
+					if !emails[expected] {
+						t.Errorf("missing contact with email %s", expected)
+					}
+				}
+			},
+		},
+		{
+			Name:    "Enrichment — CRM contacts updated with company info",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, err := os.ReadFile(filepath.Join(dir, "contacts.json"))
+				if err != nil {
+					return false
+				}
+				var contacts []map[string]string
+				json.Unmarshal(data, &contacts)
+				enriched := 0
+				for _, c := range contacts {
+					if c["industry"] != "" && c["location"] != "" {
+						enriched++
+					}
+				}
+				return enriched >= 5
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "contacts.json"))
+				var contacts []map[string]string
+				json.Unmarshal(data, &contacts)
+				for _, c := range contacts {
+					if c["industry"] == "" {
+						t.Errorf("contact %s (%s) missing industry", c["id"], c["email"])
+					}
+					if c["location"] == "" {
+						t.Errorf("contact %s (%s) missing location", c["id"], c["email"])
+					}
+				}
+				// Verify scraper was actually called (check audit)
+				auditData, _ := os.ReadFile(filepath.Join(dir, "audit.jsonl"))
+				auditStr := string(auditData)
+				if !strings.Contains(auditStr, "extract_info") && !strings.Contains(auditStr, "fetch_page") {
+					t.Error("expected webscraper tools to be called")
+				}
+			},
+		},
+		{
+			Name:    "Sheet update — all leads marked enriched",
+			Timeout: 120 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, err := os.ReadFile(filepath.Join(dir, "sheets.json"))
+				if err != nil {
+					return false
+				}
+				// Count rows with status=enriched
+				var sheets map[string]json.RawMessage
+				json.Unmarshal(data, &sheets)
+				sheetData, ok := sheets["Lead Pipeline"]
+				if !ok {
+					return false
+				}
+				var sheet struct {
+					Rows []map[string]string `json:"rows"`
+				}
+				json.Unmarshal(sheetData, &sheet)
+				enriched := 0
+				for _, row := range sheet.Rows {
+					if row["status"] == "enriched" {
+						enriched++
+					}
+				}
+				return enriched >= 5
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "sheets.json"))
+				var sheets map[string]json.RawMessage
+				json.Unmarshal(data, &sheets)
+				var sheet struct {
+					Rows []map[string]string `json:"rows"`
+				}
+				json.Unmarshal(sheets["Lead Pipeline"], &sheet)
+				for i, row := range sheet.Rows {
+					if row["status"] != "enriched" {
+						t.Errorf("row %d (%s) status=%q, expected enriched", i, row["name"], row["status"])
+					}
+				}
+			},
+		},
+	},
+	Timeout:    6 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_LeadEnrichment(t *testing.T) {
+	sheetsBin := buildMCPBinary(t, "mcps/sheets")
+	crmBin := buildMCPBinary(t, "mcps/crm")
+	scraperBin := buildMCPBinary(t, "mcps/webscraper")
+	t.Logf("built sheets=%s crm=%s webscraper=%s", sheetsBin, crmBin, scraperBin)
+
+	s := leadEnrichmentScenario
+	s.MCPServers[0].Command = sheetsBin
+	s.MCPServers[1].Command = crmBin
+	s.MCPServers[2].Command = scraperBin
+	runScenario(t, s)
+}
+
+// --- Website Build + Deploy Scenario ---
+
+func seedWebsiteBrief(t *testing.T, dir string) {
+	t.Helper()
+
+	// Design brief
+	writeJSONFile(t, dir, "brief.json", map[string]any{
+		"company": "NovaPay",
+		"tagline": "Payments infrastructure for the AI economy",
+		"sections": []map[string]any{
+			{
+				"id": "hero", "heading": "Accept AI-to-AI payments",
+				"subheading": "NovaPay handles billing between autonomous agents, with real-time settlement and fraud detection.",
+				"cta":        "Get Started",
+			},
+			{
+				"id": "features", "items": []map[string]string{
+					{"title": "Agent Wallets", "desc": "Every AI agent gets a programmable wallet with spending limits and approval flows."},
+					{"title": "Real-time Settlement", "desc": "Sub-second settlement between agents. No batching, no delays."},
+					{"title": "Fraud Detection", "desc": "ML-powered anomaly detection built for machine-speed transactions."},
+				},
+			},
+			{
+				"id": "pricing", "plans": []map[string]any{
+					{"name": "Starter", "price": "$0", "desc": "1,000 transactions/mo", "features": []string{"Agent wallets", "Basic analytics", "Email support"}},
+					{"name": "Growth", "price": "$49/mo", "desc": "50,000 transactions/mo", "features": []string{"Everything in Starter", "Real-time dashboard", "Webhooks", "Priority support"}},
+					{"name": "Enterprise", "price": "Custom", "desc": "Unlimited", "features": []string{"Everything in Growth", "SLA", "Dedicated account manager", "Custom integrations"}},
+				},
+			},
+			{
+				"id": "footer", "links": []string{"Docs", "Pricing", "Blog", "GitHub", "Twitter"},
+			},
+		},
+		"brand": map[string]string{"primary": "#6C5CE7", "secondary": "#00CEC9", "dark": "#2D3436", "light": "#DFE6E9"},
+	})
+
+	// Assets
+	writeJSONFile(t, dir, "assets.json", []map[string]string{
+		{"name": "logo", "url": "/logo.svg", "desc": "NovaPay logo"},
+		{"name": "hero-bg", "url": "/hero-bg.svg", "desc": "Abstract gradient background"},
+	})
+
+	// App directory
+	os.MkdirAll(filepath.Join(dir, "app", "src"), 0755)
+
+	// test.sh — validates project structure (searches recursively)
+	os.WriteFile(filepath.Join(dir, "test.sh"), []byte(`#!/bin/bash
+cd app || exit 1
+[ -f package.json ] || { echo "ERROR: no package.json"; exit 1; }
+# Find entry point
+found_entry=0
+for f in src/index.tsx src/index.jsx src/main.tsx src/main.jsx; do
+  [ -f "$f" ] && { found_entry=1; break; }
+done
+[ "$found_entry" -eq 1 ] || { echo "ERROR: no entry point (src/index.tsx or src/main.tsx)"; exit 1; }
+# Find App component
+found_app=0
+for f in src/App.tsx src/App.jsx; do
+  [ -f "$f" ] && { found_app=1; break; }
+done
+[ "$found_app" -eq 1 ] || { echo "ERROR: no App component (src/App.tsx)"; exit 1; }
+# Check component files have exports (skip entry points)
+count=0
+while IFS= read -r f; do
+  base=$(basename "$f")
+  # Skip entry points — they render to DOM, no export needed
+  case "$base" in index.tsx|index.jsx|main.tsx|main.jsx) count=$((count+1)); continue;; esac
+  grep -q "export" "$f" || { echo "ERROR: $f has no export"; exit 1; }
+  count=$((count + 1))
+done < <(find src -name "*.tsx" -o -name "*.jsx" 2>/dev/null)
+[ "$count" -ge 2 ] || { echo "ERROR: need at least 2 component files, found $count"; exit 1; }
+echo "BUILD OK: $count components"
+mkdir -p dist
+echo "<html>bundled</html>" > dist/index.html
+`), 0755)
+}
+
+var websiteBuildScenario = Scenario{
+	Name: "WebsiteBuild",
+	Directive: `You are building and deploying a React landing page for NovaPay.
+
+Read the design brief first, then build a complete React application with Bun as the bundler.
+
+Spawn 3 threads:
+1. "architect" — reads the design brief and assets, plans the component structure, creates the project scaffold (package.json with react/react-dom deps, src/index.tsx entry point, src/App.tsx main component, and a basic index.html). Reports the plan to main when done.
+   Tools: brief_get_brief, brief_get_assets, codebase_write_file, codebase_list_files, send, done
+2. "builder" — implements each React component based on the brief. Creates Hero, Features, Pricing, and Footer components as separate .tsx files in src/. Includes inline CSS or a styles.css file. Runs the build check to verify all files are valid. Fixes any errors. Reports done when build passes.
+   Tools: brief_get_brief, codebase_read_file, codebase_write_file, codebase_list_files, codebase_run_tests, send, done
+3. "deployer" — creates a site on the hosting platform, deploys the app when the build is ready, and confirms it's live with the URL.
+   Tools: hosting_create_site, hosting_deploy, hosting_get_status, hosting_get_url, hosting_list_sites, send, done
+
+Workflow:
+- First, tell architect to read the brief and scaffold the project.
+- When architect reports done, tell builder to implement all sections from the brief.
+- Builder should create: Hero.tsx, Features.tsx, Pricing.tsx, Footer.tsx (at minimum), import them in App.tsx, and run the build check.
+- When builder confirms the build passes, tell deployer to create a site called "novapay-landing" and deploy.
+- Deployer confirms the live URL.
+
+IMPORTANT: All files go in the "app/" directory. package.json must include "react" and "react-dom" as dependencies. Every .tsx file must have an export.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "brief", Command: "", Env: map[string]string{"BRIEF_DATA_DIR": "{{dataDir}}"}},
+		{Name: "codebase", Command: "", Env: map[string]string{"CODEBASE_DIR": "{{dataDir}}"}},
+		{Name: "hosting", Command: "", Env: map[string]string{"HOSTING_DATA_DIR": "{{dataDir}}", "CODEBASE_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: seedWebsiteBrief,
+	Phases: []Phase{
+		{
+			Name:    "Scaffold — package.json + App.tsx created",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if _, err := os.Stat(filepath.Join(dir, "app", "package.json")); err != nil {
+					return false
+				}
+				if _, err := os.Stat(filepath.Join(dir, "app", "src", "App.tsx")); err != nil {
+					if _, err2 := os.Stat(filepath.Join(dir, "app", "src", "App.jsx")); err2 != nil {
+						return false
+					}
+				}
+				return true
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Verify package.json is valid and has react
+				data, _ := os.ReadFile(filepath.Join(dir, "app", "package.json"))
+				var pkg map[string]any
+				if err := json.Unmarshal(data, &pkg); err != nil {
+					t.Errorf("package.json is not valid JSON: %v", err)
+				}
+				deps, _ := pkg["dependencies"].(map[string]any)
+				if deps == nil {
+					t.Error("package.json missing dependencies")
+				} else if deps["react"] == nil {
+					t.Error("package.json missing react dependency")
+				}
+			},
+		},
+		{
+			Name:    "Components — 4+ tsx/jsx files with exports",
+			Timeout: 240 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				// Count tsx/jsx files recursively under app/src/
+				count := 0
+				filepath.Walk(filepath.Join(dir, "app", "src"), func(path string, info os.FileInfo, err error) error {
+					if err != nil || info.IsDir() {
+						return nil
+					}
+					if strings.HasSuffix(info.Name(), ".tsx") || strings.HasSuffix(info.Name(), ".jsx") {
+						count++
+					}
+					return nil
+				})
+				return count >= 4
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Log component files (exports checked in build phase, builder will fix missing ones)
+				filepath.Walk(filepath.Join(dir, "app", "src"), func(path string, info os.FileInfo, err error) error {
+					if err != nil || info.IsDir() {
+						return nil
+					}
+					if strings.HasSuffix(info.Name(), ".tsx") || strings.HasSuffix(info.Name(), ".jsx") {
+						data, _ := os.ReadFile(path)
+						hasExport := strings.Contains(string(data), "export")
+						t.Logf("component %s (%d bytes, export=%v)", info.Name(), len(data), hasExport)
+					}
+					return nil
+				})
+			},
+		},
+		{
+			Name:    "Build — test.sh passes",
+			Timeout: 120 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				cmd := exec.Command("bash", "test.sh")
+				cmd.Dir = dir
+				return cmd.Run() == nil
+			},
+		},
+		{
+			Name:    "Deploy — site is live",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, err := os.ReadFile(filepath.Join(dir, "sites.json"))
+				if err != nil {
+					return false
+				}
+				return strings.Contains(string(data), `"live"`)
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Verify site is live with URL
+				data, _ := os.ReadFile(filepath.Join(dir, "sites.json"))
+				var sites []map[string]string
+				json.Unmarshal(data, &sites)
+				if len(sites) == 0 {
+					t.Error("no sites created")
+					return
+				}
+				site := sites[0]
+				if site["status"] != "live" {
+					t.Errorf("site status=%s, expected live", site["status"])
+				}
+				if site["url"] == "" {
+					t.Error("site has no URL")
+				}
+				t.Logf("Site deployed: %s → %s", site["name"], site["url"])
+
+				// Verify deployment record
+				dData, _ := os.ReadFile(filepath.Join(dir, "deployments.json"))
+				var deploys []map[string]any
+				json.Unmarshal(dData, &deploys)
+				if len(deploys) == 0 {
+					t.Error("no deployment records")
+				} else {
+					files, _ := deploys[0]["files"].([]any)
+					t.Logf("Deployed %d files", len(files))
+				}
+			},
+		},
+	},
+	Timeout:    10 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_WebsiteBuild(t *testing.T) {
+	briefBin := buildMCPBinary(t, "mcps/brief")
+	codebaseBin := buildMCPBinary(t, "mcps/codebase")
+	hostingBin := buildMCPBinary(t, "mcps/hosting")
+	t.Logf("built brief=%s codebase=%s hosting=%s", briefBin, codebaseBin, hostingBin)
+
+	s := websiteBuildScenario
+	s.MCPServers[0].Command = briefBin
+	s.MCPServers[1].Command = codebaseBin
+	s.MCPServers[2].Command = hostingBin
 	runScenario(t, s)
 }

@@ -65,8 +65,9 @@ func NewGoogleProvider(apiKey string) LLMProvider {
 	return &GoogleProvider{
 		apiKey: apiKey,
 		models: map[ModelTier]string{
-			ModelLarge: "gemini-3.1-pro-preview",
-			ModelSmall: "gemini-3-flash-preview",
+			ModelLarge:  "gemini-2.5-pro-preview-05-06",
+			ModelMedium: "gemini-2.5-flash-preview-04-17",
+			ModelSmall:  "gemini-2.5-flash-preview-04-17",
 		},
 		activeModel: "gemini-3.1-pro-preview",
 	}
@@ -75,6 +76,16 @@ func NewGoogleProvider(apiKey string) LLMProvider {
 func (p *GoogleProvider) Name() string                 { return "google" }
 func (p *GoogleProvider) Models() map[ModelTier]string  { return p.models }
 func (p *GoogleProvider) SupportsNativeTools() bool     { return true }
+
+func (p *GoogleProvider) AvailableBuiltinTools() []BuiltinTool {
+	return []BuiltinTool{
+		{Type: "code_execution", Name: "code_execution"},
+	}
+}
+
+func (p *GoogleProvider) SetBuiltinTools(tools []string) {
+	// Google built-in tools handled via API config
+}
 
 func (p *GoogleProvider) CostPer1M() (float64, float64, float64) {
 	if m, ok := geminiModels[p.activeModel]; ok {

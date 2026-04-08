@@ -27,8 +27,21 @@ func (p *OpenAICompatProvider) Name() string                            { return
 func (p *OpenAICompatProvider) Models() map[ModelTier]string            { return p.models }
 func (p *OpenAICompatProvider) CostPer1M() (float64, float64, float64) { return p.inputCost, p.cachedCost, p.outputCost }
 func (p *OpenAICompatProvider) SupportsNativeTools() bool {
-	// OpenAI and Fireworks support tools; Ollama may not
 	return p.name == "openai" || p.name == "fireworks"
+}
+
+func (p *OpenAICompatProvider) AvailableBuiltinTools() []BuiltinTool {
+	if p.name == "openai" {
+		return []BuiltinTool{
+			{Type: "code_interpreter", Name: "code_interpreter"},
+		}
+	}
+	return nil
+}
+
+func (p *OpenAICompatProvider) SetBuiltinTools(tools []string) {
+	// OpenAI built-in tools handled via Responses API, not Chat Completions
+	// Placeholder for future support
 }
 
 // openaiMessage serializes a Message for the OpenAI API.
@@ -344,8 +357,9 @@ func NewFireworksProvider(apiKey string) LLMProvider {
 		url:        "https://api.fireworks.ai/inference/v1/chat/completions",
 		authHeader: "Bearer",
 		models: map[ModelTier]string{
-			ModelLarge: "accounts/fireworks/models/kimi-k2p5",
-			ModelSmall: "accounts/fireworks/routers/kimi-k2p5-turbo",
+			ModelLarge:  "accounts/fireworks/models/kimi-k2p5",
+			ModelMedium: "accounts/fireworks/models/kimi-k2p5",
+			ModelSmall:  "accounts/fireworks/routers/kimi-k2p5-turbo",
 		},
 		inputCost:  0.60,
 		cachedCost: 0.10,
@@ -360,8 +374,9 @@ func NewOpenAIProvider(apiKey string) LLMProvider {
 		url:        "https://api.openai.com/v1/chat/completions",
 		authHeader: "Bearer",
 		models: map[ModelTier]string{
-			ModelLarge: "gpt-4o",
-			ModelSmall: "gpt-4o-mini",
+			ModelLarge:  "gpt-4.1",
+			ModelMedium: "gpt-4.1-mini",
+			ModelSmall:  "gpt-4.1-nano",
 		},
 		inputCost:  2.50,
 		cachedCost: 1.25,
@@ -377,8 +392,9 @@ func NewOllamaProvider(host string) LLMProvider {
 		url:        url,
 		authHeader: "",
 		models: map[ModelTier]string{
-			ModelLarge: "llama3.1",
-			ModelSmall: "llama3.1",
+			ModelLarge:  "llama3.1",
+			ModelMedium: "llama3.1",
+			ModelSmall:  "llama3.1",
 		},
 		inputCost:  0,
 		cachedCost: 0,

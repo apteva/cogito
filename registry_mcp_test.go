@@ -185,7 +185,7 @@ func TestActiveThreadsInjectedInSystemPrompt(t *testing.T) {
 		},
 	}
 
-	prompt := buildSystemPrompt("Test directive", ModeAutonomous, reg, "", nil, threads)
+	prompt := buildSystemPrompt("Test directive", ModeAutonomous, reg, "", nil, threads, nil)
 
 	// Should contain ACTIVE THREADS section
 	if !strings.Contains(prompt, "[ACTIVE THREADS]") {
@@ -222,12 +222,12 @@ func TestActiveThreadsInjectedInSystemPrompt(t *testing.T) {
 // TestNoActiveThreadsNoSection verifies no ACTIVE THREADS section when empty.
 func TestNoActiveThreadsNoSection(t *testing.T) {
 	reg := &ToolRegistry{tools: make(map[string]*ToolDef)}
-	prompt := buildSystemPrompt("Test", ModeAutonomous, reg, "", nil, nil)
+	prompt := buildSystemPrompt("Test", ModeAutonomous, reg, "", nil, nil, nil)
 	if strings.Contains(prompt, "[ACTIVE THREADS]") {
 		t.Error("prompt should NOT contain [ACTIVE THREADS] when no threads")
 	}
 
-	prompt2 := buildSystemPrompt("Test", ModeAutonomous, reg, "", nil, []ThreadInfo{})
+	prompt2 := buildSystemPrompt("Test", ModeAutonomous, reg, "", nil, []ThreadInfo{}, nil)
 	if strings.Contains(prompt2, "[ACTIVE THREADS]") {
 		t.Error("prompt should NOT contain [ACTIVE THREADS] when empty slice")
 	}

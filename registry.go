@@ -62,9 +62,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Core tools — always in prompt
 	tr.Register(&ToolDef{
 		Name:        "pace",
-		Description: "Control how long to sleep between iterations and which model to use. Use sleep for any duration. Events always wake you immediately.",
-		Syntax:      `[[pace sleep="5m" model="small"]]`,
-		Rules:       `sleep accepts any duration: "2s", "30s", "5m", "1h", "6h". Named aliases also work: rate="fast" (2s), rate="normal" (10s), rate="slow" (30s), rate="sleep" (2m). Models: "large", "small". Sleep long when idle — you'll be woken by events.`,
+		Description: "Control sleep duration, model tier, and provider. Events always wake you immediately.",
+		Syntax:      `[[pace sleep="5m" model="small" provider="anthropic"]]`,
+		Rules:       `sleep accepts any duration: "2s", "30s", "5m", "1h", "6h". Named aliases also work: rate="fast" (2s), rate="normal" (10s), rate="slow" (30s), rate="sleep" (2m). Models: "large", "medium", "small". provider: switch to a different LLM provider by name (optional, only when multiple providers are configured). Sleep long when idle — you'll be woken by events.`,
 		Core:        true,
 	})
 	tr.Register(&ToolDef{
@@ -100,9 +100,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Main-only tools
 	tr.Register(&ToolDef{
 		Name:        "spawn",
-		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Optionally forward media to the thread.",
-		Syntax:      `[[spawn id="name" directive="What this thread does" tools="reply,web" media="url1 url2"]]`,
-		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated. media: optional space-separated URLs forwarded as the thread's first event. Thread runs continuously and calls [[done]] when finished.`,
+		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Optionally select a provider and forward media.",
+		Syntax:      `[[spawn id="name" directive="What this thread does" tools="reply,web" provider="openai" media="url1 url2"]]`,
+		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated. provider: LLM provider name (optional — defaults to the main thread's provider). Use a more capable provider for complex tasks like coding. media: optional space-separated URLs forwarded as the thread's first event. Thread runs continuously and calls [[done]] when finished.`,
 		Core:        true,
 		MainOnly:    true,
 	})

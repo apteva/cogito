@@ -112,7 +112,7 @@ func main() {
 		os.Exit(1)
 	}
 	models := provider.Models()
-	fmt.Fprintf(os.Stderr, "LLM provider: %s (large=%s, small=%s)\n", provider.Name(), models[ModelLarge], models[ModelSmall])
+	fmt.Fprintf(os.Stderr, "LLM provider: %s (large=%s, medium=%s, small=%s)\n", provider.Name(), models[ModelLarge], models[ModelMedium], models[ModelSmall])
 
 	// Keep apiKey for backward compat (memory embeddings use it)
 	apiKey := os.Getenv("FIREWORKS_API_KEY")

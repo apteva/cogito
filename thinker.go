@@ -15,22 +15,26 @@ type ModelTier int
 
 const (
 	ModelLarge ModelTier = iota
+	ModelMedium
 	ModelSmall
 )
 
 var modelNames = map[string]ModelTier{
-	"large": ModelLarge,
-	"small": ModelSmall,
+	"large":  ModelLarge,
+	"medium": ModelMedium,
+	"small":  ModelSmall,
 }
 
 func (m ModelTier) String() string {
 	switch m {
 	case ModelLarge:
 		return "large"
+	case ModelMedium:
+		return "medium"
 	case ModelSmall:
 		return "small"
 	default:
-		return "large"
+		return "medium"
 	}
 }
 
@@ -70,6 +74,7 @@ SPAWNING THREADS — critical rules:
   The thread already receives its own tool documentation — it knows what tools it has.
   BAD:  directive="Call [[helpdesk_list_tickets]] to check for tickets"
   GOOD: directive="Check for new support tickets periodically. When you find tickets, report them to main."
+- The "provider" parameter selects which LLM provider runs the thread (optional). Use a more capable/expensive provider for complex tasks like coding, and a cheaper one for coordination. If omitted, the thread inherits your provider. See [AVAILABLE PROVIDERS] for options.
 
 PACING — critical:
 - Events ALWAYS wake you instantly, no matter how long your sleep is. There is ZERO cost to sleeping long.
@@ -87,7 +92,7 @@ CRITICAL — never hallucinate events:
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
-func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo) string {
+func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo, pool *ProviderPool) string {
 	coreDocs := ""
 	if registry != nil {
 		coreDocs = "\n" + registry.CoreDocs(true)
@@ -102,6 +107,15 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		if summary := registry.MCPToolSummary(); summary != "" {
 			prompt += summary
 		}
+	}
+
+	// Inject available providers when multiple are configured
+	if pool != nil && pool.Count() > 1 {
+		prompt += "\n\n[AVAILABLE PROVIDERS]\n"
+		for _, name := range pool.Names() {
+			prompt += "- " + pool.ProviderSummary(name) + "\n"
+		}
+		prompt += "\nUse provider=\"name\" in [[spawn]] or [[pace]] to select a specific provider. Default: " + pool.DefaultName() + ".\n"
 	}
 
 	// Inject active thread state so main always knows what's running
@@ -259,7 +273,8 @@ type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies 
 
 type Thinker struct {
 	apiKey    string
-	provider  LLMProvider
+	pool      *ProviderPool // all available providers (shared across threads)
+	provider  LLMProvider   // current active provider for this thinker
 	messages  []Message
 	bus       *EventBus
 	sub       *Subscription
@@ -307,12 +322,36 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	} else {
 		config = NewConfig()
 	}
+
+	// Build provider pool from config (provider arg becomes default if pool is empty)
+	pool, _ := buildProviderPool(config)
+	if pool == nil {
+		pool = &ProviderPool{providers: map[string]LLMProvider{}, order: []string{}}
+	}
+	// If a specific provider was passed in, ensure it's in the pool
+	if provider != nil {
+		name := provider.Name()
+		if pool.Get(name) == nil {
+			pool.providers[name] = provider
+			pool.order = append([]string{name}, pool.order...)
+		}
+		if pool.default_ == "" {
+			pool.default_ = name
+		}
+	}
+	// Resolve the active provider from pool
+	activeProvider := pool.Default()
+	if activeProvider == nil {
+		activeProvider = provider // fallback to passed-in provider
+	}
+
 	bus := NewEventBus()
 	t := &Thinker{
 		apiKey:   apiKey,
-		provider: provider,
+		pool:     pool,
+		provider: activeProvider,
 		messages: []Message{
-			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), nil, "", nil, nil)},
+			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), nil, "", nil, nil, nil)},
 		},
 		config:    config,
 		bus:       bus,
@@ -334,7 +373,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	t.registry = NewToolRegistry(apiKey)
 
 	// Rebuild system prompt now that registry exists (with core tool docs)
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", nil, nil)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", nil, nil, t.pool)}
 
 	// Embed tool descriptions in background (non-blocking)
 	go t.registry.EmbedAll(t.memory)
@@ -346,14 +385,14 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		if t.threads != nil {
 			threads = t.threads.List()
 		}
-		return buildSystemPrompt(t.config.GetDirective(), t.config.GetMode(), t.registry, toolDocs, t.mcpServers, threads)
+		return buildSystemPrompt(t.config.GetDirective(), t.config.GetMode(), t.registry, toolDocs, t.mcpServers, threads, t.pool)
 	}
 
 	// Connect MCP servers and register their tools
 	if len(config.MCPServers) > 0 {
 		t.mcpServers = connectAndRegisterMCP(config.MCPServers, t.registry, t.memory)
 		// Rebuild prompt now that servers are connected
-		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", t.mcpServers, nil)}
+		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool)}
 	}
 
 	// Load conversation history from persistent session
@@ -403,13 +442,12 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				}
 				mediaStr := call.Args["media"]
 				mediaParts := parseMediaURLs(mediaStr)
+				providerName := call.Args["provider"]
 				if id != "" && directive != "" {
-					var err error
-					if len(mediaParts) > 0 {
-						err = t.threads.SpawnWithMedia(id, directive, tools, mediaParts)
-					} else {
-						err = t.threads.Spawn(id, directive, tools)
-					}
+					err := t.threads.SpawnWithOpts(id, directive, tools, SpawnOpts{
+						MediaParts:   mediaParts,
+						ProviderName: providerName,
+					})
 					if err != nil {
 						t.Inject(fmt.Sprintf("[error] spawn %q: %v", id, err))
 					} else {
@@ -462,7 +500,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
 					t.config.SetDirective(d)
-					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil)}
+					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool)}
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 					if t.telemetry != nil {
 						t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
@@ -492,6 +530,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				}
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
+				}
+				if pn := call.Args["provider"]; pn != "" && t.pool != nil {
+					if p := t.pool.Get(pn); p != nil {
+						t.provider = p
+					}
 				}
 			case "connect":
 				name := call.Args["name"]
@@ -667,7 +710,7 @@ func (t *Thinker) Run() {
 		hadEvents := len(consumed) > 0
 		if hasExternalEvent {
 			t.rate = RateReactive
-			t.model = ModelLarge
+			t.model = ModelMedium
 		} else if hadEvents {
 			// Tool results — wake but less aggressive than external events
 			t.rate = RateFast
@@ -757,6 +800,21 @@ func (t *Thinker) Run() {
 
 		start := time.Now()
 		chatResp, err := t.think()
+
+		// Fallback: if the provider errored and we have alternatives, try next in pool
+		if err != nil && t.pool != nil && t.pool.Count() > 1 {
+			original := t.provider.Name()
+			if fb := t.pool.Fallback(original); fb != nil {
+				logMsg("FALLBACK", fmt.Sprintf("[%s] %s failed (%v), trying %s", t.threadID, original, err, fb.Name()))
+				t.provider = fb
+				chatResp, err = t.think()
+				if err != nil {
+					// Restore original provider for next iteration
+					t.provider = t.pool.Get(original)
+				}
+			}
+		}
+
 		duration := time.Since(start)
 		reply := chatResp.Text
 		usage := chatResp.Usage
@@ -783,6 +841,18 @@ func (t *Thinker) Run() {
 		// Persist to session history
 		if t.session != nil {
 			t.session.AppendMessage(assistantMsg, t.iteration, usage)
+		}
+
+		// Log server-executed built-in tool results (code execution, etc.)
+		for _, sr := range chatResp.ServerResults {
+			logMsg("BUILTIN", fmt.Sprintf("server tool %s: output=%s err=%s", sr.ToolName, truncateStr(sr.Output, 200), sr.Error))
+			if t.telemetry != nil {
+				t.telemetry.Emit("builtin.result", t.threadID, map[string]any{
+					"tool":   sr.ToolName,
+					"output": sr.Output,
+					"error":  sr.Error,
+				})
+			}
 		}
 
 		// Stream native tool calls to TUI as visual chunks
@@ -1040,7 +1110,7 @@ func (t *Thinker) allowedTools() map[string]bool {
 
 func (t *Thinker) ReloadDirective() {
 	directive := t.config.GetDirective()
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.config.GetMode(), t.registry, "", t.mcpServers, nil)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool)}
 	t.InjectConsole("Directive updated to: " + directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
 }
 

@@ -48,6 +48,7 @@ type ThreadInfo struct {
 	Iteration    int
 	Rate         ThinkRate
 	Model        ModelTier
+	Provider     string // active provider name
 	Started      time.Time
 	ContextMsgs  int
 	ContextChars int
@@ -76,16 +77,28 @@ func NewThreadManager(parent *Thinker) *ThreadManager {
 	}
 }
 
+// SpawnOpts holds optional parameters for spawning a thread.
+type SpawnOpts struct {
+	MediaParts      []ContentPart
+	ProviderName    string   // override provider from pool (empty = inherit parent)
+	InitialMessages []string
+}
+
 // SpawnWithMedia creates a thread and injects media parts before it starts thinking.
 func (tm *ThreadManager) SpawnWithMedia(id, directive string, tools []string, parts []ContentPart, initialMessages ...string) error {
-	return tm.spawnInternal(id, directive, tools, parts, initialMessages...)
+	return tm.spawnInternal(id, directive, tools, SpawnOpts{MediaParts: parts, InitialMessages: initialMessages})
 }
 
 func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMessages ...string) error {
-	return tm.spawnInternal(id, directive, tools, nil, initialMessages...)
+	return tm.spawnInternal(id, directive, tools, SpawnOpts{InitialMessages: initialMessages})
 }
 
-func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, mediaParts []ContentPart, initialMessages ...string) error {
+// SpawnWithOpts creates a thread with full options (provider, media, etc).
+func (tm *ThreadManager) SpawnWithOpts(id, directive string, tools []string, opts SpawnOpts) error {
+	return tm.spawnInternal(id, directive, tools, opts)
+}
+
+func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opts SpawnOpts) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -117,13 +130,21 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, med
 		Parent:       tm.parent,
 		Tools:        toolSet,
 		Started:      time.Now(),
-		initialParts: mediaParts,
+		initialParts: opts.MediaParts,
 	}
 
-	// Create a Thinker — same struct as main, shares the bus
+	// Create a Thinker — same struct as main, shares the bus and provider pool
+	// Default: inherit parent's provider. Override via opts.ProviderName.
+	threadProvider := tm.parent.provider
+	if opts.ProviderName != "" && tm.parent.pool != nil {
+		if p := tm.parent.pool.Get(opts.ProviderName); p != nil {
+			threadProvider = p
+		}
+	}
 	thinker := &Thinker{
 		apiKey:   tm.parent.apiKey,
-		provider: tm.parent.provider,
+		pool:     tm.parent.pool,
+		provider: threadProvider,
 		messages: []Message{
 			{Role: "system", Content: threadSystemPrompt},
 		},
@@ -164,7 +185,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, med
 	tm.threads[id] = thread
 
 	// Inject initial messages before starting so first thought picks them up
-	for _, msg := range initialMessages {
+	for _, msg := range opts.InitialMessages {
 		tm.parent.bus.Publish(Event{Type: EventInbox, To: id, Text: msg})
 	}
 
@@ -182,9 +203,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, med
 	// Same Run() as the main thinker — no duplicated loop
 	go thinker.Run()
 
-	tm.parent.bus.Publish(Event{Type: EventThreadStart, From: id, Text: fmt.Sprintf("Thread %q spawned", id)})
+	provName := threadProvider.Name()
+	tm.parent.bus.Publish(Event{Type: EventThreadStart, From: id, Text: fmt.Sprintf("Thread %q spawned (provider: %s)", id, provName)})
 	toolList := toolSetToSlice(thread.Tools)
-	tm.parent.Inject(fmt.Sprintf("[thread:%s] started (tools: %s)", id, strings.Join(toolList, ", ")))
+	tm.parent.Inject(fmt.Sprintf("[thread:%s] started (provider: %s, tools: %s)", id, provName, strings.Join(toolList, ", ")))
 	tm.parent.logAPI(APIEvent{Type: "thread_started", ThreadID: id})
 
 	// Telemetry: thread.spawn
@@ -250,6 +272,11 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				}
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
+				}
+				if pn := call.Args["provider"]; pn != "" && t.pool != nil {
+					if p := t.pool.Get(pn); p != nil {
+						t.provider = p
+					}
 				}
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
@@ -352,6 +379,10 @@ func (tm *ThreadManager) List() []ThreadInfo {
 
 	var infos []ThreadInfo
 	for _, t := range tm.threads {
+		providerName := ""
+		if t.Thinker.provider != nil {
+			providerName = t.Thinker.provider.Name()
+		}
 		infos = append(infos, ThreadInfo{
 			ID:        t.ID,
 			Directive: t.Directive,
@@ -360,6 +391,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			Iteration: t.Thinker.iteration,
 			Rate:         t.Thinker.rate,
 			Model:        t.Thinker.model,
+			Provider:     providerName,
 			Started:      t.Started,
 			ContextMsgs:  len(t.Thinker.messages),
 			ContextChars: func() int { n := 0; for _, m := range t.Thinker.messages { n += len(m.Content) }; return n }(),
