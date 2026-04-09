@@ -159,6 +159,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if _, exists := tm.threads[id]; exists {
 		return fmt.Errorf("thread %q already exists", id)
 	}
+	// Also check the entire tree — prevent duplicates across hierarchy levels
+	if threadExistsInTree(tm, id) {
+		return fmt.Errorf("thread %q already exists in tree", id)
+	}
 
 	depth := opts.Depth
 	parentID := opts.ParentID
@@ -935,6 +939,28 @@ func (tm *ThreadManager) cleanupThread(id string) {
 			ParentID: parentID,
 		})
 	}
+}
+
+// threadExistsInTree checks if a thread ID exists anywhere in the tree (all levels).
+// The caller must NOT hold tm.mu (this function locks child managers).
+func threadExistsInTree(root *ThreadManager, id string) bool {
+	// Already checked root's direct children in the caller — check children's children
+	for _, t := range root.threads {
+		if t.Children != nil {
+			t.Children.mu.RLock()
+			if _, exists := t.Children.threads[id]; exists {
+				t.Children.mu.RUnlock()
+				return true
+			}
+			// Recurse
+			if threadExistsInTree(t.Children, id) {
+				t.Children.mu.RUnlock()
+				return true
+			}
+			t.Children.mu.RUnlock()
+		}
+	}
+	return false
 }
 
 func toolSetToSlice(m map[string]bool) []string {
