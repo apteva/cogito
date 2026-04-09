@@ -476,7 +476,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 
 	// Computer use environment is injected externally via SetComputer()
 
-	// Respawn persistent threads from config, sorted by depth (parents before children)
+	// Respawn persistent threads from config, sorted by depth (parents before children).
+	// DeferRun=true so all threads are created before any starts thinking.
+	// This ensures parents see their children in [ACTIVE SUB-THREADS] on first iteration.
 	persistedThreads := config.GetThreads()
 	sort.Slice(persistedThreads, func(i, j int) bool {
 		return persistedThreads[i].Depth < persistedThreads[j].Depth
@@ -484,23 +486,27 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	for _, pt := range persistedThreads {
 		parentID := pt.ParentID
 		if parentID == "" || parentID == "main" {
-			// Direct child of main
 			t.threads.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
 				ParentID: "main",
 				Depth:    pt.Depth,
+				DeferRun: true,
 			})
 		} else {
-			// Find parent thread's Children manager
 			mgr := findThreadManager(t.threads, parentID)
 			if mgr != nil {
 				mgr.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
 					ParentID: parentID,
 					Depth:    pt.Depth,
+					DeferRun: true,
 				})
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
 			}
 		}
+	}
+	// Now start all respawned threads (parents already see their children)
+	if len(persistedThreads) > 0 {
+		t.threads.StartAll()
 	}
 
 	return t

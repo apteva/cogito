@@ -134,6 +134,7 @@ type SpawnOpts struct {
 	Depth           int      // depth in the spawn tree (0 = child of main)
 	MCPNames        []string // MCP server names to connect (thread gets own connections)
 	BuiltinTools    []string // provider builtin overrides (nil = inherit, empty = none)
+	DeferRun        bool     // if true, don't start Run() — call StartAll() later
 }
 
 // SpawnWithMedia creates a thread and injects media parts before it starts thinking.
@@ -445,8 +446,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		thread.initialParts = nil
 	}
 
-	// Same Run() as the main thinker — no duplicated loop
-	go thinker.Run()
+	// Start the thinking loop (unless deferred for batch respawn)
+	if !opts.DeferRun {
+		go thinker.Run()
+	}
 
 	provName := "unknown"
 	if threadProvider != nil {
@@ -796,6 +799,19 @@ func (tm *ThreadManager) Count() int {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	return len(tm.threads)
+}
+
+// StartAll starts Run() on all threads (and their children) that were spawned with DeferRun.
+// Used after batch-respawning persisted threads so parents see their children before thinking.
+func (tm *ThreadManager) StartAll() {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	for _, thread := range tm.threads {
+		go thread.Thinker.Run()
+		if thread.Children != nil {
+			thread.Children.StartAll()
+		}
+	}
 }
 
 // Update changes a thread's directive and/or tools. Rebuilds the system prompt immediately.
