@@ -12,6 +12,15 @@ import (
 
 const maxHistory = 50
 
+// MCPServerInfo is a lightweight catalog entry for an MCP server.
+// Main uses this to show available servers in its prompt without registering all tools.
+type MCPServerInfo struct {
+	Name      string
+	ToolCount int
+}
+
+
+
 type ModelTier int
 
 const (
@@ -93,7 +102,7 @@ CRITICAL — never hallucinate events:
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
-func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo, pool *ProviderPool) string {
+func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo, pool *ProviderPool, mcpCatalog []MCPServerInfo) string {
 	coreDocs := ""
 	if registry != nil {
 		coreDocs = "\n" + registry.CoreDocs(true)
@@ -103,8 +112,17 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		prompt += "\n" + extraToolDocs
 	}
 
-	// Inject MCP tool summary — main thread sees what's available but can't call them directly
-	if registry != nil {
+	// Inject lightweight MCP server catalog — just names and tool counts
+	if len(mcpCatalog) > 0 {
+		prompt += "\n\n[AVAILABLE MCP SERVERS]\n"
+		prompt += "These servers provide tools for sub-threads. Use mcp=\"servername\" when spawning to give the thread its own connection.\n"
+		prompt += "The thread will auto-discover all tools from that server. You do NOT need to list individual tool names.\n"
+		prompt += "Example: [[spawn id=\"ops\" directive=\"Manage inventory\" mcp=\"store\" tools=\"web\"]]\n\n"
+		for _, info := range mcpCatalog {
+			prompt += fmt.Sprintf("- %s (%d tools)\n", info.Name, info.ToolCount)
+		}
+	} else if registry != nil {
+		// Fallback: show old-style MCP summary from registry (for main_access tools still registered)
 		if summary := registry.MCPToolSummary(); summary != "" {
 			prompt += summary
 		}
@@ -315,6 +333,8 @@ type Thinker struct {
 
 	// Live MCP connections — servers connected at runtime
 	mcpServers []MCPConn
+	// MCP server catalog — lightweight metadata for prompt (name + tool count)
+	mcpCatalog []MCPServerInfo
 	computer   computer.Computer // screen-based environment (nil = no computer use)
 
 	// Multimodal — parts waiting to be attached to next message
@@ -356,7 +376,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		pool:     pool,
 		provider: activeProvider,
 		messages: []Message{
-			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), nil, "", nil, nil, nil)},
+			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), nil, "", nil, nil, nil, nil)},
 		},
 		config:    config,
 		bus:       bus,
@@ -378,7 +398,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	t.registry = NewToolRegistry(apiKey)
 
 	// Rebuild system prompt now that registry exists (with core tool docs)
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", nil, nil, t.pool)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", nil, nil, t.pool, nil)}
 
 	// Embed tool descriptions in background (non-blocking)
 	go t.registry.EmbedAll(t.memory)
@@ -390,14 +410,45 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		if t.threads != nil {
 			threads = t.threads.List()
 		}
-		return buildSystemPrompt(t.config.GetDirective(), t.config.GetMode(), t.registry, toolDocs, t.mcpServers, threads, t.pool)
+		return buildSystemPrompt(t.config.GetDirective(), t.config.GetMode(), t.registry, toolDocs, t.mcpServers, threads, t.pool, t.mcpCatalog)
 	}
 
-	// Connect MCP servers and register their tools
+	// Connect MCP servers:
+	// - main_access servers: fully registered (main can call them directly)
+	// - non-main_access servers: catalog only (name + tool count for prompt, threads connect on demand)
 	if len(config.MCPServers) > 0 {
-		t.mcpServers = connectAndRegisterMCP(config.MCPServers, t.registry, t.memory)
-		// Rebuild prompt now that servers are connected
-		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool)}
+		var mainServers []MCPServerConfig
+		var catalogServers []MCPServerConfig
+		for _, cfg := range config.MCPServers {
+			if cfg.MainAccess {
+				mainServers = append(mainServers, cfg)
+			} else {
+				catalogServers = append(catalogServers, cfg)
+			}
+		}
+		// Fully connect main_access servers (gateway, channels, etc.)
+		if len(mainServers) > 0 {
+			t.mcpServers = connectAndRegisterMCP(mainServers, t.registry, t.memory)
+		}
+		// Discover catalog servers (connect, count tools, keep connection for thread reuse)
+		for _, cfg := range catalogServers {
+			srv, err := connectAnyMCP(cfg)
+			if err != nil {
+				logMsg("MCP-CATALOG", fmt.Sprintf("%s: connect error: %v", cfg.Name, err))
+				continue
+			}
+			tools, err := srv.ListTools()
+			if err != nil {
+				logMsg("MCP-CATALOG", fmt.Sprintf("%s: list tools error: %v", cfg.Name, err))
+				srv.Close()
+				continue
+			}
+			t.mcpCatalog = append(t.mcpCatalog, MCPServerInfo{Name: cfg.Name, ToolCount: len(tools)})
+			srv.Close() // don't keep connection — threads connect on demand
+			logMsg("MCP-CATALOG", fmt.Sprintf("%s: %d tools cataloged (threads connect on demand)", cfg.Name, len(tools)))
+		}
+		// Rebuild prompt with catalog
+		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 	}
 
 	// Load conversation history from persistent session
@@ -582,7 +633,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
 					t.config.SetDirective(d)
-					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool)}
+					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 					if t.telemetry != nil {
 						t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
@@ -1221,7 +1272,7 @@ func (t *Thinker) allowedTools() map[string]bool {
 
 func (t *Thinker) ReloadDirective() {
 	directive := t.config.GetDirective()
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 	t.InjectConsole("Directive updated to: " + directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
 }
 

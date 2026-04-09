@@ -254,13 +254,13 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 	thinker.threads = NewThreadManager(thinker)
 	thinker.registry = NewToolRegistry(apiKey)
 
-	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", nil, nil, pool)}
+	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", nil, nil, pool, nil)}
 
 	go thinker.registry.EmbedAll(memStore)
 
 	thinker.handleTools = mainToolHandler(thinker)
 	thinker.rebuildPrompt = func(toolDocs string) string {
-		return buildSystemPrompt(cfg.GetDirective(), ModeAutonomous, thinker.registry, toolDocs, thinker.mcpServers, nil, thinker.pool)
+		return buildSystemPrompt(cfg.GetDirective(), ModeAutonomous, thinker.registry, toolDocs, thinker.mcpServers, nil, thinker.pool, thinker.mcpCatalog)
 	}
 
 	if len(mcpServers) > 0 {

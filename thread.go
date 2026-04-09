@@ -238,19 +238,44 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 
 	// Build thread-local registry: core tools + allowed local tools + MCP tools
-	// If MCP names are specified, the thread gets its own connections and a scoped registry.
-	// Otherwise, falls back to the parent's shared registry + allowlist filtering (backward compat).
+	// Auto-detect MCP server names from tool prefixes if not explicitly set.
+	// e.g. tools="store_get_inventory,web" → auto-detects "store" as MCP server needed.
+	mcpNames := opts.MCPNames
+	if len(mcpNames) == 0 && tm.parent.config != nil {
+		knownServers := map[string]bool{}
+		for _, sc := range tm.parent.config.GetMCPServers() {
+			knownServers[sc.Name] = true
+		}
+		// Also check parent's mcpCatalog
+		for _, info := range tm.parent.mcpCatalog {
+			knownServers[info.Name] = true
+		}
+		detected := map[string]bool{}
+		for toolName := range toolSet {
+			// Check if tool name has a known MCP server prefix (e.g. "store_get_inventory" → "store")
+			for srv := range knownServers {
+				if strings.HasPrefix(toolName, srv+"_") {
+					detected[srv] = true
+					break
+				}
+			}
+		}
+		for srv := range detected {
+			mcpNames = append(mcpNames, srv)
+		}
+	}
+
 	threadRegistry := tm.parent.registry
 	threadAllowlist := toolSet
 	var threadMCPServers []MCPConn
 
-	if len(opts.MCPNames) > 0 && tm.parent.registry != nil {
+	if len(mcpNames) > 0 && tm.parent.registry != nil {
 		// Create scoped registry with only core + allowed local tools
 		threadRegistry = tm.parent.registry.NewScopedRegistry(toolSet)
 		threadAllowlist = nil // not needed — registry IS the scope
 
 		// Connect to each specified MCP server
-		for _, mcpName := range opts.MCPNames {
+		for _, mcpName := range mcpNames {
 			// Look up MCP config from parent's config
 			var cfg *MCPServerConfig
 			for _, sc := range tm.parent.config.GetMCPServers() {
