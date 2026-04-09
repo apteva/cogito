@@ -131,6 +131,8 @@ type SpawnOpts struct {
 	InitialMessages []string
 	ParentID        string   // "main" or parent thread ID (empty = "main")
 	Depth           int      // depth in the spawn tree (0 = child of main)
+	MCPNames        []string // MCP server names to connect (thread gets own connections)
+	BuiltinTools    []string // provider builtin overrides (nil = inherit, empty = none)
 }
 
 // SpawnWithMedia creates a thread and injects media parts before it starts thinking.
@@ -229,6 +231,88 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			threadProvider = p
 		}
 	}
+
+	// Scope provider builtins if overridden (nil = inherit all, empty = none)
+	if opts.BuiltinTools != nil && threadProvider != nil {
+		threadProvider = threadProvider.WithBuiltins(opts.BuiltinTools)
+	}
+
+	// Build thread-local registry: core tools + allowed local tools + MCP tools
+	// If MCP names are specified, the thread gets its own connections and a scoped registry.
+	// Otherwise, falls back to the parent's shared registry + allowlist filtering (backward compat).
+	threadRegistry := tm.parent.registry
+	threadAllowlist := toolSet
+	var threadMCPServers []MCPConn
+
+	if len(opts.MCPNames) > 0 && tm.parent.registry != nil {
+		// Create scoped registry with only core + allowed local tools
+		threadRegistry = tm.parent.registry.NewScopedRegistry(toolSet)
+		threadAllowlist = nil // not needed — registry IS the scope
+
+		// Connect to each specified MCP server
+		for _, mcpName := range opts.MCPNames {
+			// Look up MCP config from parent's config
+			var cfg *MCPServerConfig
+			for _, sc := range tm.parent.config.GetMCPServers() {
+				if sc.Name == mcpName {
+					c := sc
+					cfg = &c
+					break
+				}
+			}
+			// Also check parent's live MCP connections for runtime-connected servers
+			if cfg == nil {
+				for _, srv := range tm.parent.mcpServers {
+					if srv.GetName() == mcpName {
+						// Already connected on parent — look up config
+						for _, sc := range tm.parent.config.MCPServers {
+							if sc.Name == mcpName {
+								c := sc
+								cfg = &c
+								break
+							}
+						}
+						break
+					}
+				}
+			}
+			if cfg == nil {
+				logMsg("THREAD-MCP", fmt.Sprintf("%s: MCP server %q not found in config", id, mcpName))
+				continue
+			}
+
+			srv, err := connectAnyMCP(*cfg)
+			if err != nil {
+				logMsg("THREAD-MCP", fmt.Sprintf("%s: connect %q: %v", id, mcpName, err))
+				continue
+			}
+			mcpTools, err := srv.ListTools()
+			if err != nil {
+				logMsg("THREAD-MCP", fmt.Sprintf("%s: list tools %q: %v", id, mcpName, err))
+				srv.Close()
+				continue
+			}
+			// Register MCP tools into the thread's scoped registry
+			for _, tool := range mcpTools {
+				fullName := mcpName + "_" + tool.Name
+				threadRegistry.Register(&ToolDef{
+					Name:        fullName,
+					Description: fmt.Sprintf("[%s] %s", mcpName, tool.Description),
+					Syntax:      buildMCPSyntax(fullName, tool.InputSchema),
+					Rules:       fmt.Sprintf("Provided by MCP server '%s'.", mcpName),
+					Handler:     mcpProxyHandler(srv, tool.Name),
+					InputSchema: tool.InputSchema,
+					MCP:         false, // not filtered — this IS the thread's registry
+					MCPServer:   mcpName,
+				})
+				// Add to tool set so spawn/allowlist tracking sees it
+				toolSet[fullName] = true
+			}
+			threadMCPServers = append(threadMCPServers, srv)
+			logMsg("THREAD-MCP", fmt.Sprintf("%s: connected %q (%d tools)", id, mcpName, len(mcpTools)))
+		}
+	}
+
 	thinker := &Thinker{
 		apiKey:   tm.parent.apiKey,
 		pool:     tm.parent.pool,
@@ -250,13 +334,14 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		apiLog:        tm.parent.apiLog,
 		apiMu:         tm.parent.apiMu,
 		apiNotify:     tm.parent.apiNotify,
-		registry:      tm.parent.registry,
-		toolAllowlist: toolSet,
+		registry:      threadRegistry,
+		toolAllowlist: threadAllowlist,
 		config:        tm.parent.config,
+		mcpServers:    threadMCPServers,
 		rebuildPrompt: func(toolDocs string) string {
 			cd := ""
-			if tm.parent.registry != nil {
-				cd = "\n" + tm.parent.registry.CoreDocs(false)
+			if threadRegistry != nil {
+				cd = "\n" + threadRegistry.CoreDocs(false)
 			}
 			var bp string
 			if canSpawn {
@@ -431,11 +516,35 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					spawnTools = strings.Split(toolsStr, ",")
 				}
 				providerName := call.Args["provider"]
+				// MCP scoping
+				var mcpNames []string
+				if mcpStr := call.Args["mcp"]; mcpStr != "" {
+					for _, name := range strings.Split(mcpStr, ",") {
+						if n := strings.TrimSpace(name); n != "" {
+							mcpNames = append(mcpNames, n)
+						}
+					}
+				}
+				// Provider builtin scoping
+				var builtinTools []string
+				if btStr, hasBuiltins := call.Args["builtins"]; hasBuiltins {
+					if btStr == "" {
+						builtinTools = []string{}
+					} else {
+						for _, bt := range strings.Split(btStr, ",") {
+							if b := strings.TrimSpace(bt); b != "" {
+								builtinTools = append(builtinTools, b)
+							}
+						}
+					}
+				}
 				if sid != "" && directive != "" {
 					err := thread.Children.SpawnWithOpts(sid, directive, spawnTools, SpawnOpts{
 						ProviderName: providerName,
 						ParentID:     thread.ID,
 						Depth:        thread.Depth + 1,
+						MCPNames:     mcpNames,
+						BuiltinTools: builtinTools,
 					})
 					if err != nil {
 						addResult(call.NativeID, fmt.Sprintf("error: %v", err))
@@ -708,6 +817,15 @@ func (tm *ThreadManager) cleanupThread(id string) {
 	if thread != nil && thread.Children != nil {
 		logMsg("THREAD", fmt.Sprintf("%s killing %d children", id, thread.Children.Count()))
 		thread.Children.KillAll()
+	}
+
+	// Close thread-local MCP connections
+	if thread != nil && thread.Thinker != nil {
+		for _, srv := range thread.Thinker.mcpServers {
+			logMsg("THREAD-MCP", fmt.Sprintf("%s closing MCP %s", id, srv.GetName()))
+			srv.Close()
+		}
+		thread.Thinker.mcpServers = nil
 	}
 
 	// Delete thread session history

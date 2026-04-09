@@ -44,6 +44,10 @@ func (p *OpenAICompatProvider) SetBuiltinTools(tools []string) {
 	// Placeholder for future support
 }
 
+func (p *OpenAICompatProvider) WithBuiltins(builtins []string) LLMProvider {
+	return p // OpenAI compat providers don't use builtins in Chat Completions
+}
+
 // openaiMessage serializes a Message for the OpenAI API.
 // When Parts is set, content becomes the array (native format).
 type openaiMessage struct {

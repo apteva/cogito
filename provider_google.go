@@ -87,6 +87,10 @@ func (p *GoogleProvider) SetBuiltinTools(tools []string) {
 	// Google built-in tools handled via API config
 }
 
+func (p *GoogleProvider) WithBuiltins(builtins []string) LLMProvider {
+	return p // Google builtins handled separately
+}
+
 func (p *GoogleProvider) CostPer1M() (float64, float64, float64) {
 	if m, ok := geminiModels[p.activeModel]; ok {
 		return m.InputPer1M, m.CachedPer1M, m.OutputPer1M

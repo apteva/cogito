@@ -100,9 +100,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Main-only tools
 	tr.Register(&ToolDef{
 		Name:        "spawn",
-		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Optionally select a provider and forward media.",
-		Syntax:      `[[spawn id="name" directive="What this thread does" tools="reply,web" provider="openai" media="url1 url2"]]`,
-		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated. provider: LLM provider name (optional — defaults to the main thread's provider). Use a more capable provider for complex tasks like coding. media: optional space-separated URLs forwarded as the thread's first event. Thread runs continuously and calls [[done]] when finished.`,
+		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Optionally select a provider, MCP servers, and forward media.",
+		Syntax:      `[[spawn id="name" directive="What this thread does" tools="web,exec" mcp="store,stripe" builtins="" provider="openai" media="url1 url2"]]`,
+		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated local tools (web, exec, read_file, etc). mcp: comma-separated MCP server names — thread gets its own connection and only sees those tools (efficient, auto-cleanup). builtins: provider builtins like "code_execution" (omit to inherit, empty string "" to disable all). provider: LLM provider name (optional). media: optional space-separated URLs forwarded as the thread's first event.`,
 		Core:        true,
 		MainOnly:    true,
 	})
@@ -159,6 +159,32 @@ func (tr *ToolRegistry) registerDefaults() {
 		Rules:       `command: the shell command to run. timeout: seconds (default 30, max 300). dir: optional working directory. No interactive commands (no vim, top, less). Output truncated to 4000 chars.`,
 		Handler:     func(args map[string]string) ToolResponse { return ToolResponse{Text: execTool(args)} },
 	})
+}
+
+// NewScopedRegistry creates a minimal registry containing only the specified tools
+// copied from the parent. Core tools are always included. Local tools (web, exec, etc.)
+// are included if they appear in localTools. MCP tools are NOT copied — they should be
+// registered separately from thread-local MCP connections.
+func (tr *ToolRegistry) NewScopedRegistry(localTools map[string]bool) *ToolRegistry {
+	scoped := &ToolRegistry{
+		tools:  make(map[string]*ToolDef),
+		apiKey: tr.apiKey,
+	}
+
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+
+	for name, tool := range tr.tools {
+		if tool.Core {
+			// Always include core tools
+			scoped.tools[name] = tool
+		} else if !tool.MCP && localTools[name] {
+			// Include allowed local tools (web, exec, read_file, etc.)
+			scoped.tools[name] = tool
+		}
+	}
+	scoped.embedded = tr.embedded // inherit embedding state
+	return scoped
 }
 
 func (tr *ToolRegistry) Register(tool *ToolDef) {

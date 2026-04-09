@@ -178,6 +178,14 @@ func (c *Config) GetThreads() []PersistentThread {
 	return out
 }
 
+func (c *Config) GetMCPServers() []MCPServerConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]MCPServerConfig, len(c.MCPServers))
+	copy(out, c.MCPServers)
+	return out
+}
+
 func (c *Config) GetMode() RunMode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

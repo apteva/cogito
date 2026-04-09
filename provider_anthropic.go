@@ -63,6 +63,15 @@ func (p *AnthropicProvider) SetBuiltinTools(tools []string) {
 	p.builtinTools = tools
 }
 
+func (p *AnthropicProvider) WithBuiltins(builtins []string) LLMProvider {
+	if builtins == nil {
+		return p // nil = inherit all
+	}
+	clone := *p // shallow copy — shares apiKey, models, httpClient
+	clone.builtinTools = builtins
+	return &clone
+}
+
 // --- Request types ---
 
 type anthropicRequest struct {

@@ -93,6 +93,10 @@ type LLMProvider interface {
 
 	// SetBuiltinTools enables specific built-in tools.
 	SetBuiltinTools(tools []string)
+
+	// WithBuiltins returns a shallow clone of this provider with only the specified builtins enabled.
+	// If builtins is nil, returns the provider unchanged (inherit all).
+	WithBuiltins(builtins []string) LLMProvider
 }
 
 // createProviderByName creates a provider by name, returning nil if the required API key is missing.

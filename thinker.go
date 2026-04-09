@@ -497,12 +497,36 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				mediaStr := call.Args["media"]
 				mediaParts := parseMediaURLs(mediaStr)
 				providerName := call.Args["provider"]
+				// MCP scoping: thread connects only to listed servers
+				var mcpNames []string
+				if mcpStr := call.Args["mcp"]; mcpStr != "" {
+					for _, name := range strings.Split(mcpStr, ",") {
+						if n := strings.TrimSpace(name); n != "" {
+							mcpNames = append(mcpNames, n)
+						}
+					}
+				}
+				// Provider builtin scoping
+				var builtinTools []string
+				if btStr, hasBuiltins := call.Args["builtins"]; hasBuiltins {
+					if btStr == "" {
+						builtinTools = []string{} // explicit empty = no builtins
+					} else {
+						for _, bt := range strings.Split(btStr, ",") {
+							if b := strings.TrimSpace(bt); b != "" {
+								builtinTools = append(builtinTools, b)
+							}
+						}
+					}
+				}
 				if id != "" && directive != "" {
 					err := t.threads.SpawnWithOpts(id, directive, tools, SpawnOpts{
 						MediaParts:   mediaParts,
 						ProviderName: providerName,
 						ParentID:     "main",
 						Depth:        0,
+						MCPNames:     mcpNames,
+						BuiltinTools: builtinTools,
 					})
 					if err != nil {
 						addResult(fmt.Sprintf("error: %v", err))
@@ -1080,6 +1104,9 @@ func (t *Thinker) Run() {
 }
 
 func (t *Thinker) think() (ChatResponse, error) {
+	if t.provider == nil {
+		return ChatResponse{}, fmt.Errorf("no provider configured")
+	}
 	onChunk := func(chunk string) {
 		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: chunk, Iteration: t.iteration})
 		if t.telemetry != nil && chunk != "" {
