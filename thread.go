@@ -418,6 +418,21 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 					}
 				}
 			}
+			// Show available MCP servers so leaders know what to assign when spawning
+			if canSpawn {
+				var mcpList []string
+				for _, cfg := range tm.parent.config.GetMCPServers() {
+					if !cfg.MainAccess {
+						mcpList = append(mcpList, cfg.Name)
+					}
+				}
+				if len(mcpList) > 0 {
+					prompt += "\n\n[AVAILABLE MCP SERVERS — use mcp=\"name\" when spawning]\n"
+					for _, name := range mcpList {
+						prompt += "- " + name + "\n"
+					}
+				}
+			}
 			prompt += "\n\n[DIRECTIVE]\n" + thread.Directive
 			return prompt
 		},
