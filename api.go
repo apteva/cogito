@@ -78,7 +78,7 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 type threadJSON struct {
 	ID        string   `json:"id"`
 	ParentID  string   `json:"parent_id,omitempty"`
-	Depth     int      `json:"depth,omitempty"`
+	Depth     int      `json:"depth"`
 	Directive string   `json:"directive,omitempty"`
 	Tools     []string `json:"tools,omitempty"`
 	Iteration int      `json:"iteration"`
