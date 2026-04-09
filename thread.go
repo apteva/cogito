@@ -103,6 +103,7 @@ type Thread struct {
 	ParentID     string // "main" or parent thread ID
 	Depth        int    // 0 = child of main, 1 = grandchild, etc.
 	Directive    string // original directive before tool docs
+	MCPNames     []string // MCP server names this thread connected to
 	Thinker      *Thinker
 	Parent       *Thinker
 	Children     *ThreadManager // non-nil if this thread can spawn (depth < MaxSpawnDepth)
@@ -219,6 +220,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		ParentID:     parentID,
 		Depth:        depth,
 		Directive:    directive,
+		MCPNames:     opts.MCPNames,
 		Parent:       tm.parent,
 		Tools:        toolSet,
 		Started:      time.Now(),
@@ -600,7 +602,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					} else {
 						t.config.SaveThread(PersistentThread{
 							ID: sid, ParentID: thread.ID, Depth: thread.Depth + 1,
-							Directive: directive, Tools: spawnTools,
+							Directive: directive, Tools: spawnTools, MCPNames: mcpNames,
 						})
 						addResult(call.NativeID, fmt.Sprintf("thread %s spawned (depth %d)", sid, thread.Depth+1))
 					}
@@ -675,7 +677,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					}
 					tm.parent.config.SaveThread(PersistentThread{
 						ID: thread.ID, ParentID: thread.ParentID, Depth: thread.Depth,
-						Directive: d, Tools: toolSetToSlice(thread.Tools),
+						Directive: d, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
 					})
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
 					addResult(call.NativeID, "directive updated")
@@ -847,7 +849,7 @@ func (tm *ThreadManager) Update(id, directive string, tools []string) error {
 	// Persist
 	tm.parent.config.SaveThread(PersistentThread{
 		ID: id, ParentID: thread.ParentID, Depth: thread.Depth,
-		Directive: thread.Directive, Tools: toolSetToSlice(thread.Tools),
+		Directive: thread.Directive, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
 	})
 
 	return nil

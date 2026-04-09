@@ -490,6 +490,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 				ParentID: "main",
 				Depth:    pt.Depth,
 				DeferRun: true,
+				MCPNames: pt.MCPNames,
 			})
 		} else {
 			mgr := findThreadManager(t.threads, parentID)
@@ -498,6 +499,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 					ParentID: parentID,
 					Depth:    pt.Depth,
 					DeferRun: true,
+					MCPNames: pt.MCPNames,
 				})
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
@@ -596,7 +598,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					if err != nil {
 						addResult(fmt.Sprintf("error: %v", err))
 					} else {
-						t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools})
+						t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames})
 						addResult(fmt.Sprintf("thread %s spawned", id))
 					}
 				}

@@ -14,6 +14,7 @@ type PersistentThread struct {
 	Depth     int      `json:"depth,omitempty"`      // 0 = main's direct child
 	Directive string   `json:"directive"`
 	Tools     []string `json:"tools"`
+	MCPNames  []string `json:"mcp_names,omitempty"` // MCP servers to connect on respawn
 }
 
 // RunMode controls the agent's safety behavior via system prompt guidance.
