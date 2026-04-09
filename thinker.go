@@ -916,7 +916,8 @@ func (t *Thinker) Run() {
 				}
 			}
 			if memQuery != "" {
-				recalled := t.memory.Retrieve(memQuery, recallTopN)
+				// Namespace-aware recall: thread sees own memories + global
+				recalled := t.memory.RetrieveWithNamespace(memQuery, recallTopN, t.threadID)
 				if ctx := t.memory.BuildContext(recalled); ctx != "" {
 					t.messages = append(t.messages, Message{Role: "system", Content: ctx})
 				}
@@ -1058,6 +1059,18 @@ func (t *Thinker) Run() {
 				start--
 			}
 			t.messages = append(t.messages[:1], t.messages[start:]...)
+		}
+
+		// Compact session history if it's grown too large
+		if t.session != nil && t.session.NeedsCompaction() {
+			logMsg("SESSION", fmt.Sprintf("[%s] triggering compaction (count=%d)", t.threadID, t.session.Count()))
+			t.session.Compact(func(text string) string {
+				// Simple summary — truncate to key points (no LLM call to avoid cost)
+				if len(text) > 2000 {
+					text = text[:2000]
+				}
+				return fmt.Sprintf("Summary of %d earlier messages: %s", t.session.Count(), text)
+			})
 		}
 
 		// After processing, fall back to agent's chosen rate/sleep

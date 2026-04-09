@@ -204,6 +204,9 @@ func buildMCPBinary(t *testing.T, dir string) string {
 func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCPServerConfig, providerConfigs ...[]ProviderConfig) *Thinker {
 	t.Helper()
 
+	// Clean up leftover history files from previous runs
+	os.RemoveAll("history")
+
 	tmpDir := t.TempDir()
 
 	cfg := &Config{

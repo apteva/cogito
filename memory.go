@@ -25,6 +25,7 @@ type MemoryEntry struct {
 	Text      string    `json:"text"`
 	Time      time.Time `json:"time"`
 	Session   string    `json:"session"`
+	Namespace string    `json:"namespace,omitempty"` // thread ID or team name; empty = global
 	Embedding []float64 `json:"embedding"`
 }
 
@@ -68,6 +69,43 @@ func (ms *MemoryStore) save(entry MemoryEntry) error {
 	}
 	defer f.Close()
 	return json.NewEncoder(f).Encode(entry)
+}
+
+// StoreWithNamespace stores a memory tagged with a namespace (thread/team ID).
+// Empty namespace = global (visible to all threads).
+func (ms *MemoryStore) StoreWithNamespace(text, namespace string) error {
+	logMsg("MEMORY", fmt.Sprintf("storing (ns=%s): %s", namespace, truncateForLog(text, 100)))
+
+	if ms.apiKey == "" {
+		return fmt.Errorf("no API key for embeddings")
+	}
+
+	embedding, err := ms.embed(text)
+	if err != nil {
+		return fmt.Errorf("embedding failed: %w", err)
+	}
+
+	entry := MemoryEntry{
+		Text:      text,
+		Time:      time.Now(),
+		Session:   ms.session,
+		Namespace: namespace,
+		Embedding: embedding,
+	}
+
+	ms.mu.Lock()
+	ms.entries = append(ms.entries, entry)
+	if len(ms.entries) > maxMemories {
+		ms.entries = ms.entries[len(ms.entries)-maxMemories:]
+	}
+	ms.mu.Unlock()
+
+	if err := ms.save(entry); err != nil {
+		return err
+	}
+
+	logMsg("MEMORY", fmt.Sprintf("stored OK (ns=%s, total=%d)", namespace, ms.Count()))
+	return nil
 }
 
 func (ms *MemoryStore) Store(text string) error {
@@ -114,6 +152,56 @@ func truncateForLog(s string, max int) string {
 		return s[:max] + "..."
 	}
 	return s
+}
+
+// RetrieveWithNamespace returns memories matching the namespace + global (empty namespace).
+// If namespace is empty, returns all memories (backward compat).
+func (ms *MemoryStore) RetrieveWithNamespace(query string, n int, namespace string) []MemoryEntry {
+	if len(ms.entries) == 0 {
+		return nil
+	}
+
+	queryEmb, err := ms.embed(query)
+	if err != nil {
+		return nil
+	}
+
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+
+	type scored struct {
+		entry MemoryEntry
+		score float64
+	}
+
+	var results []scored
+	for _, e := range ms.entries {
+		// Filter: include if global (empty ns), or matching namespace
+		if namespace != "" && e.Namespace != "" && e.Namespace != namespace {
+			continue
+		}
+		sim := cosineSimilarity(queryEmb, e.Embedding)
+		results = append(results, scored{entry: e, score: sim})
+	}
+
+	// Sort by score descending
+	for i := 0; i < len(results)-1; i++ {
+		for j := i + 1; j < len(results); j++ {
+			if results[j].score > results[i].score {
+				results[i], results[j] = results[j], results[i]
+			}
+		}
+	}
+
+	if n > len(results) {
+		n = len(results)
+	}
+
+	out := make([]MemoryEntry, n)
+	for i := 0; i < n; i++ {
+		out[i] = results[i].entry
+	}
+	return out
 }
 
 func (ms *MemoryStore) Retrieve(query string, n int) []MemoryEntry {

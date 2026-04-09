@@ -109,6 +109,7 @@ type Thread struct {
 	Tools        map[string]bool
 	Started      time.Time
 	initialParts []ContentPart // media to inject before first Run()
+	doneForever  bool          // true if thread called [[done]] (permanent termination)
 }
 
 type ThreadManager struct {
@@ -406,6 +407,19 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// Set tool handler AFTER Children is set up (handler references thread.Children)
 	thinker.handleTools = threadToolHandler(thread, tm)
 
+	// Load conversation history from persistent session (for respawned threads)
+	if saved, summaries := thinker.session.LoadTail(defaultLoadTail); len(saved) > 0 {
+		if len(summaries) > 0 {
+			contextBlock := "\n\n[PREVIOUS CONTEXT]\n"
+			for _, s := range summaries {
+				contextBlock += s + "\n"
+			}
+			thinker.messages[0].Content += contextBlock
+		}
+		thinker.messages = append(thinker.messages, saved...)
+		logMsg("THREAD", fmt.Sprintf("%s loaded %d messages from history (%d compacted summaries)", id, len(saved), len(summaries)))
+	}
+
 	tm.threads[id] = thread
 
 	// Inject initial messages before starting so first thought picks them up
@@ -658,11 +672,12 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				}
 			case "remember":
 				if text := call.Args["text"]; text != "" && t.memory != nil {
-					go func(txt string) {
-						if err := t.memory.Store(txt); err != nil {
+					ns := thread.ID // namespace = thread ID
+					go func(txt, namespace string) {
+						if err := t.memory.StoreWithNamespace(txt, namespace); err != nil {
 							t.Inject(fmt.Sprintf("[remember] error: %v", err))
 						}
-					}(text)
+					}(text, ns)
 					addResult(call.NativeID, "stored")
 				}
 			default:
@@ -674,6 +689,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 		if doneMsg != nil {
 			addResult(doneCallID, "stopping")
 			logMsg("THREAD", fmt.Sprintf("%s calling done, msg=%q", thread.ID, *doneMsg))
+			thread.doneForever = true // mark for permanent cleanup (deletes session)
 			if *doneMsg != "" {
 				thread.Parent.Inject(fmt.Sprintf("[thread:%s done] %s", thread.ID, *doneMsg))
 			} else {
@@ -853,8 +869,9 @@ func (tm *ThreadManager) cleanupThread(id string) {
 		thread.Thinker.mcpServers = nil
 	}
 
-	// Delete thread session history
-	if thread != nil && thread.Thinker.session != nil {
+	// Only delete session history if thread called [[done]] (permanent termination).
+	// For kills/restarts, keep the session so the thread can restore context on respawn.
+	if thread != nil && thread.doneForever && thread.Thinker.session != nil {
 		thread.Thinker.session.Delete()
 	}
 
