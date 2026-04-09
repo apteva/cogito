@@ -313,6 +313,11 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			Providers  []ProviderConfig  `json:"providers,omitempty"`
 			Computer    *ComputerConfig   `json:"computer,omitempty"`
 			MCPServers  []MCPServerConfig `json:"mcp_servers,omitempty"`
+			Reset      *struct {
+				History bool `json:"history,omitempty"`
+				Memory  bool `json:"memory,omitempty"`
+				Threads bool `json:"threads,omitempty"`
+			} `json:"reset,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -412,6 +417,39 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.MCPServers != nil {
 			a.reconcileMCP(body.MCPServers)
+			// Update MCP catalog for lazy-loading prompt
+			a.thinker.mcpCatalog = nil
+			for _, srv := range a.thinker.mcpServers {
+				if tools, err := srv.ListTools(); err == nil {
+					a.thinker.mcpCatalog = append(a.thinker.mcpCatalog, MCPServerInfo{Name: srv.GetName(), ToolCount: len(tools)})
+				}
+			}
+		}
+		if body.Reset != nil {
+			logMsg("API", fmt.Sprintf("PUT /config reset: history=%v memory=%v threads=%v", body.Reset.History, body.Reset.Memory, body.Reset.Threads))
+			if body.Reset.Threads {
+				a.thinker.threads.KillAll()
+				a.thinker.config.ClearThreads()
+			}
+			if body.Reset.History {
+				if a.thinker.session != nil {
+					a.thinker.session.Delete()
+					a.thinker.session = NewSession(".", "main")
+				}
+				// Clear thread histories
+				os.RemoveAll("history")
+				os.MkdirAll("history", 0755)
+			}
+			if body.Reset.Memory && a.thinker.memory != nil {
+				os.Remove(a.thinker.memory.path)
+				a.thinker.memory.mu.Lock()
+				a.thinker.memory.entries = nil
+				a.thinker.memory.mu.Unlock()
+			}
+			// Reset message context to just system prompt
+			if body.Reset.History {
+				a.thinker.messages = a.thinker.messages[:1]
+			}
 		}
 		writeJSON(w, map[string]string{"status": "updated"})
 	default:
