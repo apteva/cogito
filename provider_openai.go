@@ -201,7 +201,7 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 			def.Function.Name = t.Name
 			def.Function.Description = t.Description
 			def.Function.Parameters = t.Parameters
-			def.Function.Strict = true // enforce required fields
+			// Note: Strict mode not supported by all providers (Fireworks ignores it)
 			defs = append(defs, def)
 		}
 		reqMap["tools"] = defs
