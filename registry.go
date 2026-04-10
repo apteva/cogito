@@ -70,9 +70,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	})
 	tr.Register(&ToolDef{
 		Name:        "send",
-		Description: "Send a message to any thread by ID. Optionally attach media (images/audio) via space-separated URLs.",
-		Syntax:      `[[send id="thread-name" message="..." media="url1 url2"]]`,
-		Rules:       `Use id="main" for the coordinator thread. media is optional — space-separated URLs. Supported: .png .jpg .gif .webp .mp3 .wav .aac .ogg .flac .aiff .m4a`,
+		Description: "Send a message to another thread. Use id=\"parent\" to report to your parent thread. ALWAYS send results back after completing work.",
+		Syntax:      `[[send id="parent" message="..." media="url1 url2"]]`,
+		Rules:       `Use id="parent" for your parent thread. Use id="main" for the top coordinator. media is optional — space-separated URLs. You MUST send results back to your parent after completing any task.`,
 		Core:        true,
 	})
 	tr.Register(&ToolDef{
