@@ -524,6 +524,18 @@ func copyAndInjectReason(schema map[string]any) map[string]any {
 		"description": "Brief reason for this tool call — what you're doing and why (for observability)",
 	}
 	out["properties"] = props
+	// Add _reason to required list
+	var required []any
+	if existing, ok := schema["required"].([]any); ok {
+		required = append(required, existing...)
+	}
+	if existingStr, ok := schema["required"].([]string); ok {
+		for _, s := range existingStr {
+			required = append(required, s)
+		}
+	}
+	required = append(required, "_reason")
+	out["required"] = required
 	return out
 }
 
