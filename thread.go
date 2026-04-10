@@ -558,11 +558,27 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				results = append(results, ToolResult{CallID: callID, Content: content})
 			}
 		}
+		// Emit tool.result telemetry for inline tools
+		emitResult := func(call toolCall, content string) {
+			addResult(call.NativeID, content)
+			if t.telemetry != nil {
+				t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
+					ID: call.NativeID, Name: call.Name, Success: true, Result: content,
+				})
+			}
+		}
 
 		for _, call := range calls {
+			reason := call.Args["_reason"]
 			delete(call.Args, "_reason")
 			if !thread.Tools[call.Name] {
 				continue
+			}
+			// Emit tool.call telemetry for inline tools
+			if t.telemetry != nil {
+				t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
+					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
+				})
 			}
 			switch call.Name {
 			case "send":
@@ -581,12 +597,12 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						}
 						t.telemetry.Emit("thread.message", thread.ID, ThreadMessageData{From: thread.ID, To: resolvedID, Message: msg})
 					}
-					addResult(call.NativeID, fmt.Sprintf("sent to %s", id))
+					emitResult(call, fmt.Sprintf("sent to %s", id))
 				}
 			case "spawn":
 				// Leaders only (depth < MaxSpawnDepth) — enforced by tool allowlist
 				if thread.Children == nil {
-					addResult(call.NativeID, "error: cannot spawn (not a leader thread)")
+					emitResult(call, "error: cannot spawn (not a leader thread)")
 					break
 				}
 				sid := call.Args["id"]
@@ -631,13 +647,13 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						BuiltinTools: builtinTools,
 					})
 					if err != nil {
-						addResult(call.NativeID, fmt.Sprintf("error: %v", err))
+						emitResult(call, fmt.Sprintf("error: %v", err))
 					} else {
 						t.config.SaveThread(PersistentThread{
 							ID: sid, ParentID: thread.ID, Depth: thread.Depth + 1,
 							Directive: directive, Tools: spawnTools, MCPNames: mcpNames,
 						})
-						addResult(call.NativeID, fmt.Sprintf("thread %s spawned (depth %d)", sid, thread.Depth+1))
+						emitResult(call, fmt.Sprintf("thread %s spawned (depth %d)", sid, thread.Depth+1))
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -646,7 +662,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				if sid != "" && thread.Children != nil {
 					thread.Children.Kill(sid)
 					t.config.RemoveThread(sid)
-					addResult(call.NativeID, fmt.Sprintf("thread %s killed", sid))
+					emitResult(call, fmt.Sprintf("thread %s killed", sid))
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "update":
@@ -659,12 +675,12 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						updateTools = strings.Split(toolsStr, ",")
 					}
 					if err := thread.Children.Update(sid, directive, updateTools); err != nil {
-						addResult(call.NativeID, fmt.Sprintf("error: %v", err))
+						emitResult(call, fmt.Sprintf("error: %v", err))
 					} else {
 						if directive != "" {
 							thread.Children.Send(sid, fmt.Sprintf("[directive updated] %s", directive))
 						}
-						addResult(call.NativeID, fmt.Sprintf("thread %s updated", sid))
+						emitResult(call, fmt.Sprintf("thread %s updated", sid))
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -698,9 +714,9 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					}
 				}
 				if len(parts) > 0 {
-					addResult(call.NativeID, "set "+strings.Join(parts, " "))
+					emitResult(call, "set "+strings.Join(parts, " "))
 				} else {
-					addResult(call.NativeID, "ok")
+					emitResult(call, "ok")
 				}
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
@@ -713,7 +729,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						Directive: d, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
 					})
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
-					addResult(call.NativeID, "directive updated")
+					emitResult(call, "directive updated")
 				}
 			case "remember":
 				if text := call.Args["text"]; text != "" && t.memory != nil {
@@ -723,7 +739,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							t.Inject(fmt.Sprintf("[remember] error: %v", err))
 						}
 					}(text, ns)
-					addResult(call.NativeID, "stored")
+					emitResult(call, "stored")
 				}
 			default:
 				executeTool(t, call)

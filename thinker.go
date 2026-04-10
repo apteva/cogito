@@ -603,12 +603,23 @@ func mainToolHandler(t *Thinker) ToolHandler {
 		var toolNames []string
 		var results []ToolResult
 		for _, call := range calls {
-			// Extract _reason (observability, not passed to handlers)
+			reason := call.Args["_reason"]
 			delete(call.Args, "_reason")
-			// Helper to add inline tool result
+			// Emit tool.call telemetry for inline tools (same as MCP tools)
+			if t.telemetry != nil {
+				t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
+					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
+				})
+			}
+			// Helper to add inline tool result + emit telemetry
 			addResult := func(content string) {
 				if call.NativeID != "" {
 					results = append(results, ToolResult{CallID: call.NativeID, Content: content})
+				}
+				if t.telemetry != nil {
+					t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
+						ID: call.NativeID, Name: call.Name, Success: true, Result: content,
+					})
 				}
 			}
 
