@@ -106,6 +106,7 @@ type openaiToolDef struct {
 		Name        string         `json:"name"`
 		Description string         `json:"description"`
 		Parameters  map[string]any `json:"parameters"`
+		Strict      bool           `json:"strict,omitempty"`
 	} `json:"function"`
 }
 
@@ -200,6 +201,7 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 			def.Function.Name = t.Name
 			def.Function.Description = t.Description
 			def.Function.Parameters = t.Parameters
+			def.Function.Strict = true // enforce required fields
 			defs = append(defs, def)
 		}
 		reqMap["tools"] = defs
