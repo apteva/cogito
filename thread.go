@@ -87,6 +87,7 @@ type ThreadInfo struct {
 	Depth        int
 	Directive    string
 	Tools        []string
+	MCPNames     []string
 	Running      bool
 	Iteration    int
 	Rate         ThinkRate
@@ -823,6 +824,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			Started:      t.Started,
 			ContextMsgs:  len(t.Thinker.messages),
 			ContextChars: func() int { n := 0; for _, m := range t.Thinker.messages { n += len(m.Content) }; return n }(),
+			MCPNames:     t.MCPNames,
 			SubThreads:   subCount,
 		})
 	}

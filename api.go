@@ -81,6 +81,7 @@ type threadJSON struct {
 	Depth     int      `json:"depth"`
 	Directive string   `json:"directive,omitempty"`
 	Tools     []string `json:"tools,omitempty"`
+	MCPNames  []string `json:"mcp_names,omitempty"`
 	Iteration int      `json:"iteration"`
 	Rate      string   `json:"rate"`
 	Model     string   `json:"model"`
@@ -109,6 +110,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 				Depth:     t.Depth,
 				Directive: t.Directive,
 				Tools:     t.Tools,
+				MCPNames:  t.MCPNames,
 				Iteration: t.Iteration,
 				Rate:      t.Rate.String(),
 				Model:     t.Model.String(),
