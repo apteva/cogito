@@ -87,17 +87,17 @@ SPAWNING THREADS — critical rules:
 - Tool names MUST match EXACTLY as shown in [available tools]. They include a prefix (e.g. "schedule_get_schedule", NOT "get_schedule"). Copy the exact name.
 - Example: tools="pushover_send_notification,schedule_get_schedule" — use the full prefixed name.
 - The "directive" parameter must be PLAIN NATURAL LANGUAGE describing the thread's goal and behavior.
-  NEVER put tool call syntax like [[ ]] in the directive. NEVER put tool names in the directive.
+  NEVER put tool names or examples in the directive.
   The thread already receives its own tool documentation — it knows what tools it has.
-  BAD:  directive="Call [[helpdesk_list_tickets]] to check for tickets"
+  BAD:  directive="Call helpdesk_list_tickets to check for tickets"
   GOOD: directive="Check for new support tickets periodically. When you find tickets, report them to main."
 - The "provider" parameter selects which LLM provider runs the thread (optional). Use a more capable/expensive provider for complex tasks like coding, and a cheaper one for coordination. If omitted, the thread inherits your provider. See [AVAILABLE PROVIDERS] for options.
 
 PACING — critical:
 - Events ALWAYS wake you instantly, no matter how long your sleep is. There is ZERO cost to sleeping long.
-- Be aggressive about saving power: if you have no pending work, go straight to [[pace sleep="1h" model="small"]]. Do NOT gradually increase — jump to long sleep immediately.
+- Be aggressive about saving power: if you have no pending work, call pace with sleep="1h" model="small". Do NOT gradually increase — jump to long sleep immediately.
 - Only use short sleep (2-10s) when you are actively waiting for a tool result in the NEXT iteration.
-- Your pace persists until you change it. Do NOT call [[pace]] every thought — only when transitioning between active work and idle.
+- Your pace persists until you change it. Do NOT call pace every thought — only when transitioning between active work and idle.
 - When an event wakes you, you automatically switch to large model and fast pace for that iteration. You do NOT need to manually set pace when events arrive.
 
 CRITICAL — never hallucinate events:
@@ -124,7 +124,7 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		prompt += "\n\n[AVAILABLE MCP SERVERS]\n"
 		prompt += "These servers provide tools for sub-threads. Use mcp=\"servername\" when spawning to give the thread its own connection.\n"
 		prompt += "The thread will auto-discover all tools from that server. You do NOT need to list individual tool names.\n"
-		prompt += "Example: [[spawn id=\"ops\" directive=\"Manage inventory\" mcp=\"store\" tools=\"web\"]]\n\n"
+		prompt += "Example: spawn(id=\"ops\", directive=\"Manage inventory\", mcp=\"store\", tools=\"web\")\n\n"
 		for _, info := range mcpCatalog {
 			prompt += fmt.Sprintf("- %s (%d tools)\n", info.Name, info.ToolCount)
 		}
@@ -141,7 +141,7 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		for _, name := range pool.Names() {
 			prompt += "- " + pool.ProviderSummary(name) + "\n"
 		}
-		prompt += "\nUse provider=\"name\" in [[spawn]] or [[pace]] to select a specific provider. Default: " + pool.DefaultName() + ".\n"
+		prompt += "\nUse provider=\"name\" in spawn or pace to select a specific provider. Default: " + pool.DefaultName() + ".\n"
 	}
 
 	// Inject active thread state so main always knows what's running
@@ -162,11 +162,11 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 	prompt += "\n\n[SAFETY MODE: " + string(mode) + "]\n"
 	switch mode {
 	case ModeCautious:
-		prompt += `Before executing any tool that modifies state (exec, write, deploy, restart, delete), first tell the user what you plan to do and why via channels_respond, then wait for their confirmation in the next message. Read-only tools (web, query, list) can be used freely. If unsure whether an action is safe, ask. Learn from user feedback — use [[remember]] to store their preferences.`
+		prompt += `Before executing any tool that modifies state (exec, write, deploy, restart, delete), first tell the user what you plan to do and why via channels_respond, then wait for their confirmation in the next message. Read-only tools (web, query, list) can be used freely. If unsure whether an action is safe, ask. Learn from user feedback — use remember to store their preferences.`
 	case ModeLearn:
-		prompt += `You are learning the user's preferences. For EVERY new type of tool call you haven't done before, ask the user first via channels_respond whether they're comfortable with it. Once they confirm, remember their preference with [[remember]] so you don't need to ask again. Over time you'll build up a profile of what's OK and what needs checking. Always explain what you're about to do.`
+		prompt += `You are learning the user's preferences. For EVERY new type of tool call you haven't done before, ask the user first via channels_respond whether they're comfortable with it. Once they confirm, remember their preference with remember so you don't need to ask again. Over time you'll build up a profile of what's OK and what needs checking. Always explain what you're about to do.`
 	default: // ModeAutonomous
-		prompt += `You operate freely and make your own decisions about tool use. Assess risk yourself — if something seems dangerous or irreversible, consider asking the user first. Learn from feedback: if a user tells you to stop doing something, remember it with [[remember]]. You are trusted to act independently.`
+		prompt += `You operate freely and make your own decisions about tool use. Assess risk yourself — if something seems dangerous or irreversible, consider asking the user first. Learn from feedback: if a user tells you to stop doing something, remember it with remember. You are trusted to act independently.`
 	}
 
 	// Inject learned skills if any exist
@@ -1103,8 +1103,13 @@ func (t *Thinker) Run() {
 			}
 		}
 
-		// Stream native tool calls to TUI as visual chunks
+		// Log and stream native tool calls
 		if len(chatResp.ToolCalls) > 0 {
+			var names []string
+			for _, ntc := range chatResp.ToolCalls {
+				names = append(names, ntc.Name)
+			}
+			logMsg("RUN", fmt.Sprintf("[%s] LLM returned %d tool calls: %v", t.threadID, len(chatResp.ToolCalls), names))
 			for _, ntc := range chatResp.ToolCalls {
 				summary := "\n→ " + ntc.Name + "("
 				first := true
@@ -1135,9 +1140,8 @@ func (t *Thinker) Run() {
 				}
 				calls = append(calls, toolCall{Name: ntc.Name, Args: ntc.Args, Raw: ntc.Name, NativeID: ntc.ID})
 			}
-		} else {
-			calls = parseToolCalls(reply)
 		}
+		// NOTE: text-based [[...]] parsing removed — all providers use native tool calling now
 		var replies []string
 		var toolNames []string
 		var inlineResults []ToolResult

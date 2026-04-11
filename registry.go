@@ -247,7 +247,7 @@ func (tr *ToolRegistry) CoreDocs(includeMainOnly bool, includeSystemOnly ...bool
 		if tool.SystemOnly && !sysOnly {
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("  %s — %s\n", tool.Syntax, tool.Description))
+		sb.WriteString(fmt.Sprintf("  %s — %s\n", tool.Name, tool.Description))
 		if tool.Rules != "" {
 			sb.WriteString(fmt.Sprintf("    %s\n", tool.Rules))
 		}
@@ -347,7 +347,7 @@ func (tr *ToolRegistry) BuildDocs(tools []*ToolDef) string {
 	var sb strings.Builder
 	sb.WriteString("\n[available tools — matched to your current context]\n")
 	for _, tool := range tools {
-		sb.WriteString(fmt.Sprintf("  %s — %s\n", tool.Syntax, tool.Description))
+		sb.WriteString(fmt.Sprintf("  %s — %s\n", tool.Name, tool.Description))
 		if tool.Rules != "" {
 			sb.WriteString(fmt.Sprintf("    %s\n", tool.Rules))
 		}
