@@ -17,21 +17,21 @@ type ToolDefinition struct {
 	Parameters  map[string]any
 }
 
-// GetComputerToolDef returns the computer_use tool definition (screen interaction only, no navigate).
+// GetComputerToolDef returns the computer_use tool definition.
 func GetComputerToolDef(display DisplaySize) ToolDefinition {
 	return ToolDefinition{
 		Name: "computer_use",
 		Description: fmt.Sprintf(
-			"Interact with a browser screen (%dx%d). See what's on screen, click elements, type text, press keys, scroll. "+
-				"Every action returns a screenshot of the current screen state. "+
-				"Use browser_session to open URLs first, then use this tool to interact with the page.",
+			"Control a browser (%dx%d). Every action returns a screenshot. "+
+				"ALWAYS screenshot first to see the page, then click/type based on what you see. "+
+				"This is your PRIMARY tool for all browser interaction.",
 			display.Width, display.Height,
 		),
 		Syntax: `[[computer_use action="screenshot"]]`,
 		Rules: "Actions: screenshot, click (coordinate=\"x,y\"), double_click (coordinate=\"x,y\"), " +
 			"type (text=\"...\"), key (key=\"Enter\"/\"Escape\"/\"ctrl+c\"), " +
 			"scroll (direction=\"up\"/\"down\", amount=3), mouse_move (coordinate=\"x,y\"), wait (duration=1000ms). " +
-			"Always take a screenshot first to see the current state before interacting.",
+			"WORKFLOW: 1) screenshot to see page 2) click/type based on coordinates you see 3) screenshot again to verify.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -73,13 +73,10 @@ func GetComputerToolDef(display DisplaySize) ToolDefinition {
 func GetSessionToolDef() ToolDefinition {
 	return ToolDefinition{
 		Name: "browser_session",
-		Description: "Manage browser sessions. Open a URL to navigate the browser, check status, or close the session. " +
-			"This tool does NOT return screenshots. After opening a URL, use computer_use with action=screenshot to see the page.",
+		Description: "Navigate to a URL, check status, or close the browser. Does NOT return screenshots — take a screenshot after opening a URL to see the page.",
 		Syntax: `[[browser_session action="open" url="https://example.com"]]`,
-		Rules: "Actions: open (url — navigates browser to URL, returns screenshot), " +
-			"close (ends browser session), " +
-			"resume (session_id — reconnect to a Browserbase session), " +
-			"status (returns current URL, session type, session ID).",
+		Rules: "Actions: open (navigates to URL), close (ends session), status (returns current URL), resume (reconnect to session). " +
+			"After opening a URL, ALWAYS take a screenshot to see the page. Do NOT use status to check what happened — take a screenshot instead.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -130,23 +127,35 @@ func AnthropicBetaHeader(toolVersion string) string {
 }
 
 // HandleComputerAction executes a screen interaction action (no navigate).
+// Normalizes provider-specific action names (e.g. Claude's left_click → click).
+// Retries screenshot if it fails after a click (page may be mid-navigation).
 func HandleComputerAction(comp Computer, args map[string]string) (text string, screenshot []byte, err error) {
-	actionType := args["action"]
-	if actionType == "" {
+	rawAction := args["action"]
+	if rawAction == "" {
 		return "", nil, fmt.Errorf("missing action argument")
 	}
 
 	// Reject navigate — use browser_session for that
-	if actionType == "navigate" {
+	if rawAction == "navigate" {
 		return "", nil, fmt.Errorf("use browser_session to navigate to URLs, not computer_use")
 	}
+
+	// Normalize action name (left_click → click, etc.)
+	actionType := NormalizeActionType(rawAction)
 
 	action := Action{Type: actionType}
 	parseCoordinate(args["coordinate"], &action)
 	action.Text = args["text"]
 	action.Key = args["key"]
+
+	// Claude sends scroll_direction + scroll_amount; we use direction + amount
 	action.Direction = args["direction"]
+	if action.Direction == "" {
+		action.Direction = args["scroll_direction"]
+	}
 	if amt := args["amount"]; amt != "" {
+		action.Amount, _ = strconv.Atoi(amt)
+	} else if amt := args["scroll_amount"]; amt != "" {
 		action.Amount, _ = strconv.Atoi(amt)
 	}
 	if dur := args["duration"]; dur != "" {
@@ -161,12 +170,27 @@ func HandleComputerAction(comp Computer, args map[string]string) (text string, s
 	}
 	duration := time.Since(start)
 
-	if err != nil {
+	// If screenshot failed after an action (e.g. page mid-navigation), retry
+	if err != nil && actionType != "screenshot" && strings.Contains(err.Error(), "screenshot") {
+		// The action itself succeeded but the post-action screenshot failed.
+		// Wait for page to settle and retry.
+		for i := 0; i < 3; i++ {
+			time.Sleep(500 * time.Millisecond)
+			screenshot, err = comp.Screenshot()
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			return fmt.Sprintf("Action %s completed but screenshot failed: %v", rawAction, err), nil, err
+		}
+		duration = time.Since(start)
+	} else if err != nil {
 		return fmt.Sprintf("Error: %v", err), nil, err
 	}
 
 	text = fmt.Sprintf("Success: %s action completed. Screenshot attached (%d bytes, %dms).",
-		actionType, len(screenshot), duration.Milliseconds())
+		rawAction, len(screenshot), duration.Milliseconds())
 	return text, screenshot, nil
 }
 
@@ -245,6 +269,32 @@ type Resumable interface {
 }
 
 // geminiComputerUseActions maps Gemini native Computer Use function names.
+// NormalizeActionType maps provider-specific action names to our standard names.
+// Claude sends left_click, right_click, etc. — we normalize to what Computer.Execute understands.
+func NormalizeActionType(action string) string {
+	switch action {
+	case "left_click":
+		return "click"
+	case "right_click":
+		return "click" // TODO: right-click button support
+	case "middle_click":
+		return "click"
+	case "triple_click":
+		return "double_click" // closest approximation
+	case "left_click_drag":
+		return "click" // TODO: drag support
+	case "left_mouse_down", "left_mouse_up":
+		return "click" // TODO: fine-grained mouse support
+	case "mouse_move":
+		return "scroll" // move cursor — closest we have
+	case "keypress":
+		return "key"
+	case "hold_key":
+		return "key"
+	}
+	return action
+}
+
 var geminiComputerUseActions = map[string]bool{
 	"click_at": true, "type_text_at": true, "hover_at": true,
 	"scroll_at": true, "scroll_document": true, "key_combination": true,

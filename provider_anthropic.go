@@ -40,8 +40,8 @@ func NewAnthropicProvider(apiKey string) LLMProvider {
 	return &AnthropicProvider{
 		apiKey: apiKey,
 		models: map[ModelTier]string{
-			ModelLarge:  "claude-opus-4-6",
-			ModelMedium: "claude-sonnet-4-6",
+			ModelLarge:  "claude-sonnet-4-6",
+			ModelMedium: "claude-haiku-4-5-20251001",
 			ModelSmall:  "claude-haiku-4-5-20251001",
 		},
 	}
@@ -187,11 +187,16 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 					IsError:   tr.IsError,
 				}
 				if tr.Image != nil {
-					// Image result (screenshot etc.)
+					// Image result (screenshot etc.) — detect MIME from magic bytes
+					mime := "image/png"
+					if len(tr.Image) > 2 && tr.Image[0] == 0xFF && tr.Image[1] == 0xD8 {
+						mime = "image/jpeg"
+					}
+					logMsg("ANTHROPIC", fmt.Sprintf("tool_result image: call_id=%s mime=%s size=%d bytes first_bytes=%x", tr.CallID, mime, len(tr.Image), tr.Image[:4]))
 					block.Content = []anthropicContentBlock{
 						{Type: "image", Source: &anthropicSource{
 							Type:      "base64",
-							MediaType: "image/png",
+							MediaType: mime,
 							Data:      base64.StdEncoding.EncodeToString(tr.Image),
 						}},
 					}
@@ -252,7 +257,7 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 		if t.Name == "computer_use" {
 			// Use the native Anthropic computer use format
 			// Parse display dimensions from parameters or defaults
-			width, height := 1280, 800
+			width, height := 1024, 768
 			if w, ok := t.Parameters["_display_width"].(int); ok {
 				width = w
 			}
@@ -266,6 +271,7 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 				toolVersion = "20251124" // enhanced computer use for 4.5+ models
 			}
 			spec := computer.GetAnthropicToolSpec(display, toolVersion)
+			logMsg("ANTHROPIC", fmt.Sprintf("computer tool: type=%s display=%dx%d beta=%s", spec.Type, spec.DisplayWidthPx, spec.DisplayHeightPx, computer.AnthropicBetaHeader(toolVersion)))
 			anthropicTools = append(anthropicTools, spec)
 			computerBeta = computer.AnthropicBetaHeader(toolVersion)
 			hasComputerUse = true

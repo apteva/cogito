@@ -603,10 +603,24 @@ func mainToolHandler(t *Thinker) ToolHandler {
 		var toolNames []string
 		var results []ToolResult
 		for _, call := range calls {
-			reason := call.Args["_reason"]
-			delete(call.Args, "_reason")
-			// Emit tool.call telemetry for all inline tools
-			if t.telemetry != nil {
+			// Check if this is an inline tool (handled here) or registry tool (handled by executeTool)
+			isInline := true
+			switch call.Name {
+			case "spawn", "kill", "update", "send", "evolve", "remember", "pace", "connect", "disconnect", "list_connected", "done":
+				// inline — we handle _reason and telemetry here
+			default:
+				isInline = false // executeTool handles _reason and telemetry
+			}
+
+			// Only strip _reason for inline tools — executeTool needs it
+			reason := ""
+			if isInline {
+				reason = call.Args["_reason"]
+				delete(call.Args, "_reason")
+			}
+
+			// Emit tool.call telemetry only for inline tools
+			if isInline && t.telemetry != nil {
 				t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
 					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
 				})
@@ -1283,6 +1297,7 @@ func (t *Thinker) think() (ChatResponse, error) {
 	// so the provider can extract them for the native spec
 	if t.computer != nil && t.provider != nil && t.provider.Name() == "anthropic" {
 		display := t.computer.DisplaySize()
+		logMsg("COMPUTER", fmt.Sprintf("injecting display dims for anthropic: %dx%d", display.Width, display.Height))
 		for i, nt := range nativeTools {
 			if nt.Name == "computer_use" {
 				if nativeTools[i].Parameters == nil {
@@ -1505,7 +1520,7 @@ func (t *Thinker) Stop() {
 // isComputerUseTool returns true if the tool name is a computer use tool from any provider.
 func isComputerUseTool(name string) bool {
 	switch name {
-	case "computer_use", "computer_use_2025", "computer_20250124":
+	case "computer_use", "computer", "computer_use_2025", "computer_20250124":
 		return true
 	}
 	// Gemini native Computer Use actions
@@ -1514,7 +1529,7 @@ func isComputerUseTool(name string) bool {
 
 // normalizeComputerAction converts provider-specific args to a computer.Action.
 func normalizeComputerAction(args map[string]string) computer.Action {
-	action := computer.Action{Type: args["action"]}
+	action := computer.Action{Type: computer.NormalizeActionType(args["action"])}
 
 	// Parse coordinate — providers use different formats
 	// Anthropic: coordinate=[x, y] as string; OpenAI: x=400, y=300
@@ -1549,6 +1564,15 @@ func normalizeComputerAction(args map[string]string) computer.Action {
 // executeComputerAction runs a computer_use action and injects the result as a proper ToolResult.
 func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 	logMsg("COMPUTER", fmt.Sprintf("action=%s args=%v", ntc.Name, ntc.Args))
+	reason := ntc.Args["_reason"]
+	delete(ntc.Args, "_reason")
+
+	// Emit tool.call telemetry
+	if t.telemetry != nil {
+		t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
+			ID: ntc.ID, Name: ntc.Name, Args: ntc.Args, Reason: reason,
+		})
+	}
 	start := time.Now()
 
 	var screenshot []byte
@@ -1572,6 +1596,11 @@ func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 
 	if err != nil {
 		logMsg("COMPUTER", fmt.Sprintf("error (%dms): %v", duration.Milliseconds(), err))
+		if t.telemetry != nil {
+			t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
+				ID: ntc.ID, Name: ntc.Name, DurationMs: duration.Milliseconds(), Success: false, Result: err.Error(),
+			})
+		}
 		// Inject as tool result with error
 		t.bus.Publish(Event{
 			Type: EventInbox, To: t.threadID,
@@ -1588,6 +1617,12 @@ func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 	}
 
 	logMsg("COMPUTER", fmt.Sprintf("done (%dms) screenshot=%d bytes", duration.Milliseconds(), len(screenshot)))
+	if t.telemetry != nil {
+		t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
+			ID: ntc.ID, Name: ntc.Name, DurationMs: duration.Milliseconds(), Success: true,
+			Result: fmt.Sprintf("screenshot %d bytes", len(screenshot)),
+		})
+	}
 
 	// Inject as tool result with screenshot image
 	t.bus.Publish(Event{

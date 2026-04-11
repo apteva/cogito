@@ -69,9 +69,9 @@ func NewGoogleProvider(apiKey string) LLMProvider {
 	return &GoogleProvider{
 		apiKey: apiKey,
 		models: map[ModelTier]string{
-			ModelLarge:  "gemini-2.5-pro-preview-05-06",
-			ModelMedium: "gemini-2.5-flash-preview-04-17",
-			ModelSmall:  "gemini-2.5-flash-preview-04-17",
+			ModelLarge:  "gemini-3.1-pro-preview",
+			ModelMedium: "gemini-3-flash-preview",
+			ModelSmall:  "gemini-3-flash-preview",
 		},
 		activeModel: "gemini-3.1-pro-preview",
 	}

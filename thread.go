@@ -584,13 +584,24 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 		}
 
 		for _, call := range calls {
-			reason := call.Args["_reason"]
-			delete(call.Args, "_reason")
 			if !thread.Tools[call.Name] {
 				continue
 			}
-			// Emit tool.call telemetry for inline tools
-			if t.telemetry != nil {
+			// Check if inline or registry tool
+			isInline := true
+			switch call.Name {
+			case "send", "spawn", "kill", "update", "evolve", "remember", "pace", "done":
+				// inline
+			default:
+				isInline = false // executeTool handles _reason and telemetry
+			}
+
+			reason := ""
+			if isInline {
+				reason = call.Args["_reason"]
+				delete(call.Args, "_reason")
+			}
+			if isInline && t.telemetry != nil {
 				t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
 					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
 				})
