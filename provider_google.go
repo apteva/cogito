@@ -70,8 +70,8 @@ func NewGoogleProvider(apiKey string) LLMProvider {
 		apiKey: apiKey,
 		models: map[ModelTier]string{
 			ModelLarge:  "gemini-3.1-pro-preview",
-			ModelMedium: "gemini-3-flash-preview",
-			ModelSmall:  "gemini-3-flash-preview",
+			ModelMedium: "gemini-3.1-pro-preview",
+			ModelSmall:  "gemini-3.1-pro-preview",
 		},
 		activeModel: "gemini-3.1-pro-preview",
 	}
@@ -149,10 +149,11 @@ type geminiContent struct {
 }
 
 type geminiPart struct {
-	Text             string                  `json:"text,omitempty"`
-	InlineData       *geminiInline           `json:"inlineData,omitempty"`
-	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
-	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+	Text              string                  `json:"text,omitempty"`
+	InlineData        *geminiInline           `json:"inlineData,omitempty"`
+	FunctionCall      *geminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse  *geminiFunctionResponse `json:"functionResponse,omitempty"`
+	ThoughtSignature  string                  `json:"thoughtSignature,omitempty"`
 }
 
 type geminiFunctionCall struct {
@@ -254,9 +255,15 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 				for k, v := range tc.Args {
 					args[k] = v
 				}
-				parts = append(parts, geminiPart{
-					FunctionCall: &geminiFunctionCall{Name: tc.Name, Args: args},
-				})
+				sig := tc.ThoughtSignature
+				if sig == "" {
+					sig = "skip_thought_signature_validator"
+				}
+				part := geminiPart{
+					FunctionCall:     &geminiFunctionCall{Name: tc.Name, Args: args},
+					ThoughtSignature: sig,
+				}
+				parts = append(parts, part)
 			}
 			if len(contents) > 0 && contents[len(contents)-1].Role == "model" {
 				contents[len(contents)-1].Parts = append(contents[len(contents)-1].Parts, parts...)
@@ -333,12 +340,22 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 	// Convert native tools to Gemini function declarations
 	// Separate computer_use (native) from regular tools
 	var geminiTools []geminiToolDecl
+	// Models that support native Computer Use
+	// Note: gemini-3-flash-preview supports it but auto-triggers browsing unprompted.
+	// Only enable for the dedicated computer-use model for now.
+	computerUseModels := map[string]bool{
+		"gemini-2.5-computer-use-preview-10-2025": true,
+	}
+
 	hasComputerUse := false
 	if len(tools) > 0 {
 		var funcs []geminiFunctionDecl
 		for _, t := range tools {
 			if t.Name == "computer_use" {
-				// Use native Gemini Computer Use tool
+				if !computerUseModels[model] {
+					logMsg("GEMINI", fmt.Sprintf("skipping computer_use — not supported by %s", model))
+					continue
+				}
 				geminiTools = append(geminiTools, geminiToolDecl{
 					ComputerUse: &geminiComputerUse{
 						Environment: "ENVIRONMENT_BROWSER",
@@ -440,9 +457,10 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 						}
 					}
 					toolCalls = append(toolCalls, NativeToolCall{
-						ID:   fmt.Sprintf("gemini_%d", toolCallSeq),
-						Name: part.FunctionCall.Name,
-						Args: args,
+						ID:               fmt.Sprintf("gemini_%d", toolCallSeq),
+						Name:             part.FunctionCall.Name,
+						Args:             args,
+						ThoughtSignature: part.ThoughtSignature,
 					})
 					// Gemini delivers complete tool calls, emit the full args as one chunk
 					if onToolChunk != nil {

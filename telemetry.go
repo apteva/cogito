@@ -28,8 +28,10 @@ type Telemetry struct {
 	liveLog        []TelemetryEvent // all events including live-only (for SSE)
 	notify         chan struct{}
 	forwardCh      chan TelemetryEvent // serialized queue for live event forwarding
-	serverURL      string // server URL (e.g. "http://localhost:5280")
-	instanceSecret string // shared secret for telemetry auth
+	serverURL        string // server URL (e.g. "http://localhost:5280")
+	telemetryURL     string // full URL for batched stored events
+	telemetryLiveURL string // full URL for live event forwarding
+	instanceSecret   string // shared secret for telemetry auth
 	instanceID     int64
 	seq            int64
 	quit           chan struct{}
@@ -50,14 +52,20 @@ func NewTelemetry() *Telemetry {
 	// Read instance secret from env (for telemetry auth)
 	t.instanceSecret = os.Getenv("INSTANCE_SECRET")
 
-	// Configure server URL for fire-and-forget
-	if url := os.Getenv("SERVER_URL"); url != "" {
-		t.serverURL = url
-		logMsg("TELEMETRY", fmt.Sprintf("server URL configured: %s, instanceID=%d", url, t.instanceID))
+	// Telemetry endpoints are provided by the server via env vars.
+	// Core doesn't need to know the server's route layout — fire-and-forget
+	// to whatever URLs it was given.
+	t.telemetryURL = os.Getenv("TELEMETRY_URL")
+	t.telemetryLiveURL = os.Getenv("TELEMETRY_LIVE_URL")
+	t.serverURL = os.Getenv("SERVER_URL")
+
+	if t.telemetryURL != "" || t.telemetryLiveURL != "" {
+		logMsg("TELEMETRY", fmt.Sprintf("telemetry URLs configured: stored=%s live=%s instanceID=%d",
+			t.telemetryURL, t.telemetryLiveURL, t.instanceID))
 		go t.forwardLoop()
-		go t.liveForwardLoop() // serialized live event forwarding
+		go t.liveForwardLoop()
 	} else {
-		logMsg("TELEMETRY", "no SERVER_URL set — forwarding disabled")
+		logMsg("TELEMETRY", "no TELEMETRY_URL/TELEMETRY_LIVE_URL set — forwarding disabled")
 	}
 
 	return t
@@ -97,7 +105,7 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 	t.mu.Lock()
 	if store {
 		t.log = append(t.log, ev)
-		logMsg("TELEMETRY", fmt.Sprintf("emit STORED %s (log=%d, serverURL=%s)", eventType, len(t.log), t.serverURL))
+		logMsg("TELEMETRY", fmt.Sprintf("emit STORED %s (log=%d, url=%s)", eventType, len(t.log), t.telemetryURL))
 		if len(t.log) > 2000 {
 			t.log = t.log[len(t.log)-1000:]
 		}
@@ -117,7 +125,7 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 	}
 
 	// Forward ALL events to server for broadcast (live display on dashboard/console)
-	if t.serverURL != "" {
+	if t.telemetryLiveURL != "" {
 		select {
 		case t.forwardCh <- ev:
 		default:
@@ -144,7 +152,7 @@ func (t *Telemetry) forwardLive(ev TelemetryEvent) {
 	if err != nil {
 		return
 	}
-	req, err := http.NewRequest("POST", t.serverURL+"/telemetry/live", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", t.telemetryLiveURL, bytes.NewReader(body))
 	if err != nil {
 		return
 	}
@@ -202,11 +210,14 @@ func (t *Telemetry) forwardLoop() {
 	var lastSent int
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	logMsg("TELEMETRY", fmt.Sprintf("forwardLoop started, server=%s", t.serverURL))
+	logMsg("TELEMETRY", fmt.Sprintf("forwardLoop started, url=%s", t.telemetryURL))
 
 	for {
 		select {
 		case <-ticker.C:
+			if t.telemetryURL == "" {
+				continue
+			}
 			events, total := t.StoredEvents(lastSent)
 			if len(events) == 0 {
 				continue
@@ -216,7 +227,7 @@ func (t *Telemetry) forwardLoop() {
 			for i, e := range events {
 				types[i] = e.Type
 			}
-			logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: sending %d events to /telemetry: %v", len(events), types))
+			logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: sending %d events to %s: %v", len(events), t.telemetryURL, types))
 
 			body, err := json.Marshal(events)
 			if err != nil {
@@ -224,7 +235,7 @@ func (t *Telemetry) forwardLoop() {
 				continue
 			}
 
-			req, err := http.NewRequest("POST", t.serverURL+"/telemetry", bytes.NewReader(body))
+			req, err := http.NewRequest("POST", t.telemetryURL, bytes.NewReader(body))
 			if err != nil {
 				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: request error: %v", err))
 				continue
@@ -242,7 +253,7 @@ func (t *Telemetry) forwardLoop() {
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode != 200 {
-				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST /telemetry status=%d body=%s", resp.StatusCode, string(respBody)))
+				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST %s status=%d body=%s", t.telemetryURL, resp.StatusCode, string(respBody)))
 			}
 			// Always advance cursor — don't retry failed batches forever
 			lastSent = total

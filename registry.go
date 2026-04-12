@@ -71,8 +71,8 @@ func (tr *ToolRegistry) registerDefaults() {
 	tr.Register(&ToolDef{
 		Name:        "send",
 		Description: "Send a message to another thread. Use id=\"parent\" to report to your parent thread. ALWAYS send results back after completing work.",
-		Syntax:      `[[send id="parent" message="..." media="url1 url2"]]`,
-		Rules:       `Use id="parent" for your parent thread. Use id="main" for the top coordinator. media is optional — space-separated URLs. You MUST send results back to your parent after completing any task.`,
+		Syntax:      `send(id="parent", message="...", media="url1 url2")`,
+		Rules:       `Use id="parent" for your parent thread. Use id="main" for the top coordinator. media is optional — space-separated URLs (audio, images, video). Media URLs are sent natively to the target thread's LLM for analysis. You MUST send results back to your parent after completing any task.`,
 		Core:        true,
 	})
 	tr.Register(&ToolDef{
@@ -101,9 +101,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Main-only tools
 	tr.Register(&ToolDef{
 		Name:        "spawn",
-		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Optionally select a provider, MCP servers, and forward media.",
-		Syntax:      `[[spawn id="name" directive="What this thread does" tools="web,exec" mcp="store,stripe" builtins="" provider="openai" media="url1 url2"]]`,
-		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated local tools (web, exec, read_file, etc). mcp: comma-separated MCP server names — thread gets its own connection and only sees those tools (efficient, auto-cleanup). builtins: provider builtins like "code_execution" (omit to inherit, empty string "" to disable all). provider: LLM provider name (optional). media: optional space-separated URLs forwarded as the thread's first event.`,
+		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Use media to pass audio/image/video URLs for the new thread's LLM to analyze natively.",
+		Syntax:      `spawn(id="name", directive="What this thread does", tools="web,exec", mcp="store,stripe", media="https://example.com/audio.mp3")`,
+		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated local tools (web, exec, read_file, etc). mcp: comma-separated MCP server names — thread gets its own connection and only sees those tools. provider: LLM provider name (optional). media: space-separated URLs (audio/image/video) — these are sent directly to the thread's LLM as native content for analysis. Use this when a user shares a media URL and you want a worker to analyze it.`,
 		Core:        true,
 		MainOnly:    true,
 	})

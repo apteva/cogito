@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -271,12 +272,19 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 		if data == "[DONE]" {
 			break
 		}
+		// Debug: dump the raw delta so we can see what fields Fireworks is
+		// actually returning (reasoning_content, thinking, etc.). Enable via
+		// APTEVA_DUMP_STREAM=1 to avoid log spam in production.
+		if os.Getenv("APTEVA_DUMP_STREAM") == "1" {
+			logMsg("OPENAI-STREAM", data)
+		}
 
 		var event struct {
 			Choices []struct {
 				Delta struct {
-					Content   string                 `json:"content"`
-					ToolCalls []openaiToolCallDelta   `json:"tool_calls,omitempty"`
+					Content          string                `json:"content"`
+					ReasoningContent string                `json:"reasoning_content,omitempty"`
+					ToolCalls        []openaiToolCallDelta `json:"tool_calls,omitempty"`
 				} `json:"delta"`
 			} `json:"choices"`
 			Usage *Usage `json:"usage,omitempty"`
@@ -286,6 +294,14 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 		}
 		if len(event.Choices) > 0 {
 			delta := event.Choices[0].Delta
+			// Fireworks/DeepSeek-style reasoning models emit chain-of-thought
+			// in `reasoning_content` on the delta, separate from `content`.
+			// We stream it through the same onChunk hook so the UI's Thoughts
+			// panel shows it. Reasoning tokens are NOT appended to `full`
+			// because they shouldn't end up in the assistant message history.
+			if delta.ReasoningContent != "" && onChunk != nil {
+				onChunk(delta.ReasoningContent)
+			}
 			if delta.Content != "" {
 				full.WriteString(delta.Content)
 				if onChunk != nil {

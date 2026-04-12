@@ -26,9 +26,9 @@ func NewOpenAINativeProvider(apiKey string) LLMProvider {
 	return &OpenAINativeProvider{
 		apiKey: apiKey,
 		models: map[ModelTier]string{
-			ModelLarge:  "gpt-5.4",
-			ModelMedium: "gpt-4.1-mini",
-			ModelSmall:  "gpt-4.1-nano",
+			ModelLarge:  "gpt-5.4-mini",
+			ModelMedium: "gpt-5.4-mini",
+			ModelSmall:  "gpt-5.4-mini",
 		},
 	}
 }
@@ -36,7 +36,10 @@ func NewOpenAINativeProvider(apiKey string) LLMProvider {
 func (p *OpenAINativeProvider) Name() string                            { return "openai" }
 func (p *OpenAINativeProvider) Models() map[ModelTier]string            { return p.models }
 func (p *OpenAINativeProvider) SupportsNativeTools() bool               { return true }
-func (p *OpenAINativeProvider) CostPer1M() (float64, float64, float64) { return 2.50, 1.25, 10.00 }
+func (p *OpenAINativeProvider) CostPer1M() (float64, float64, float64) {
+	// Default to gpt-5.4-mini pricing
+	return 0.75, 0.375, 4.50
+}
 
 func (p *OpenAINativeProvider) AvailableBuiltinTools() []BuiltinTool {
 	return []BuiltinTool{
@@ -66,20 +69,23 @@ type oaiResponsesRequest struct {
 
 // oaiInputItem is a polymorphic input item for the Responses API.
 type oaiInputItem struct {
-	Type    string `json:"type"`              // "message", "computer_call_output"
+	Type    string `json:"type"`              // "message", "computer_call_output", "function_call", "function_call_output"
 	Role    string `json:"role,omitempty"`    // for type=message
 	Content any    `json:"content,omitempty"` // string or []oaiContentBlock
+	Name    string `json:"name,omitempty"`    // for type=function_call
 
-	// computer_call_output fields
+	// computer_call_output / function_call fields
 	CallID     string `json:"call_id,omitempty"`
 	Output     any    `json:"output,omitempty"` // screenshot etc.
+	Arguments  string `json:"arguments,omitempty"` // for type=function_call (JSON string)
 }
 
 type oaiContentBlock struct {
-	Type     string `json:"type"`               // "input_text", "input_image"
+	Type     string `json:"type"`                  // "input_text", "input_image", "input_file"
 	Text     string `json:"text,omitempty"`
-	ImageURL string `json:"image_url,omitempty"` // data:image/png;base64,...
-	Detail   string `json:"detail,omitempty"`    // "original", "high", "low"
+	ImageURL string `json:"image_url,omitempty"`    // data:image/png;base64,...
+	Detail   string `json:"detail,omitempty"`       // "original", "high", "low"
+	FileURL  string `json:"file_url,omitempty"`     // URL or data URI for audio/files
 }
 
 type oaiComputerTool struct {
@@ -89,14 +95,10 @@ type oaiComputerTool struct {
 }
 
 type oaiFunctionTool struct {
-	Type     string              `json:"type"` // "function"
-	Function oaiFunctionToolSpec `json:"function"`
-}
-
-type oaiFunctionToolSpec struct {
+	Type        string         `json:"type"` // "function"
 	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 // --- Streaming response types ---
@@ -153,6 +155,11 @@ func (p *OpenAINativeProvider) Chat(messages []Message, model string, tools []Na
 	hasComputerUse := false
 	for _, t := range tools {
 		if t.Name == "computer_use" {
+			// Only gpt-5.4 supports native computer use
+			if !strings.Contains(model, "gpt-5.4") || strings.Contains(model, "mini") || strings.Contains(model, "nano") {
+				logMsg("OPENAI-NATIVE", fmt.Sprintf("skipping computer_use — not supported by %s", model))
+				continue
+			}
 			width, height := 1280, 800
 			if w, ok := t.Parameters["_display_width"].(int); ok {
 				width = w
@@ -168,24 +175,30 @@ func (p *OpenAINativeProvider) Chat(messages []Message, model string, tools []Na
 			hasComputerUse = true
 			logMsg("OPENAI-NATIVE", "native computer tool enabled")
 		} else if t.Name == "browser_session" {
-			// Handled natively by computer tool
+			if !hasComputerUse {
+				continue // skip if computer not enabled
+			}
 			continue
 		} else {
 			apiTools = append(apiTools, oaiFunctionTool{
-				Type: "function",
-				Function: oaiFunctionToolSpec{
-					Name:        t.Name,
-					Description: t.Description,
-					Parameters:  t.Parameters,
-				},
+				Type:        "function",
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.Parameters,
 			})
 		}
 	}
 	_ = hasComputerUse
 
-	// Add builtin tools
+	// Add builtin tools (only those supported by Responses API)
+	supportedBuiltins := map[string]bool{
+		"code_interpreter": true, "web_search_preview": true,
+		"file_search": true, "image_generation": true,
+	}
 	for _, bt := range p.builtinTools {
-		apiTools = append(apiTools, map[string]string{"type": bt})
+		if supportedBuiltins[bt] {
+			apiTools = append(apiTools, map[string]string{"type": bt})
+		}
 	}
 
 	reqBody := oaiResponsesRequest{
@@ -200,7 +213,13 @@ func (p *OpenAINativeProvider) Chat(messages []Message, model string, tools []Na
 		return ChatResponse{}, err
 	}
 
-	logMsg("OPENAI-NATIVE", fmt.Sprintf("model=%s input_items=%d tools=%d", model, len(input), len(apiTools)))
+	// Log first tool for debugging
+	if len(apiTools) > 0 {
+		toolJSON, _ := json.Marshal(apiTools[0])
+		logMsg("OPENAI-NATIVE", fmt.Sprintf("model=%s input_items=%d tools=%d first_tool=%s", model, len(input), len(apiTools), string(toolJSON)))
+	} else {
+		logMsg("OPENAI-NATIVE", fmt.Sprintf("model=%s input_items=%d tools=0", model, len(input)))
+	}
 
 	req, err := http.NewRequest("POST", "https://api.openai.com/v1/responses", bytes.NewReader(body))
 	if err != nil {
@@ -290,9 +309,10 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 				} else {
 					argsJSON, _ := json.Marshal(tc.Args)
 					items = append(items, oaiInputItem{
-						Type:    "function_call",
-						CallID:  tc.ID,
-						Content: string(argsJSON),
+						Type:      "function_call",
+						CallID:    tc.ID,
+						Name:      tc.Name,
+						Arguments: string(argsJSON),
 					})
 				}
 			}
@@ -306,8 +326,10 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 		}
 
 		if m.HasParts() {
+			logMsg("OPENAI-NATIVE", fmt.Sprintf("message with %d parts (role=%s)", len(m.Parts), m.Role))
 			var blocks []oaiContentBlock
 			for _, part := range m.Parts {
+				logMsg("OPENAI-NATIVE", fmt.Sprintf("  part type=%s", part.Type))
 				switch part.Type {
 				case "text":
 					blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: part.Text})
@@ -315,6 +337,8 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 					if part.ImageURL != nil {
 						blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: part.ImageURL.URL, Detail: "original"})
 					}
+				case "audio_url", "input_audio":
+					// OpenAI Responses API does not support audio input — skip silently
 				}
 			}
 			items = append(items, oaiInputItem{Type: "message", Role: role, Content: blocks})
@@ -461,17 +485,30 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 
 		// Usage
 		case "response.completed":
+			// Log raw usage for debugging
+			var rawCompleted map[string]any
+			json.Unmarshal([]byte(data), &rawCompleted)
+			if resp, ok := rawCompleted["response"].(map[string]any); ok {
+				if u, ok := resp["usage"].(map[string]any); ok {
+					logMsg("OPENAI-NATIVE", fmt.Sprintf("raw usage: %v", u))
+				}
+			}
+
 			var completed struct {
 				Response struct {
 					Usage struct {
 						InputTokens  int `json:"input_tokens"`
 						OutputTokens int `json:"output_tokens"`
+						InputDetails struct {
+							CachedTokens int `json:"cached_tokens"`
+						} `json:"input_tokens_details"`
 					} `json:"usage"`
 				} `json:"response"`
 			}
 			json.Unmarshal([]byte(data), &completed)
 			usage.PromptTokens = completed.Response.Usage.InputTokens
 			usage.CompletionTokens = completed.Response.Usage.OutputTokens
+			usage.CachedTokens = completed.Response.Usage.InputDetails.CachedTokens
 		}
 	}
 

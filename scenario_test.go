@@ -3723,3 +3723,1011 @@ func TestScenario_Conglomerate(t *testing.T) {
 	s.MCPServers[0].Command = storeBin
 	runScenario(t, s)
 }
+
+// --- Conversational Team Building Scenario ---
+// Instead of a directive that pre-defines the org, the user builds the team
+// through natural conversation — sending events like CLI chat messages.
+
+var conversationalTeamScenario = Scenario{
+	Name: "ConversationalTeam",
+	MCPServers: []MCPServerConfig{
+		{Name: "helpdesk", Command: "", Env: map[string]string{"HELPDESK_DATA_DIR": "{{dataDir}}"}},
+		{Name: "codebase", Command: "", Env: map[string]string{"CODEBASE_DATA_DIR": "{{dataDir}}"}},
+	},
+	Directive: "You are a helpful coordinator. You manage threads and route work. You do NOT have a pre-defined team — the user will tell you what to set up.",
+	Phases: []Phase{
+		{
+			Name: "User asks to create a support thread",
+			Setup: func(t *testing.T, dir string) {
+				// Seed a helpdesk ticket so support has something to find
+				os.MkdirAll(dir, 0755)
+				os.WriteFile(filepath.Join(dir, "tickets.json"), []byte(`[{"id":"T-001","question":"My login is broken, please help","status":"open"}]`), 0644)
+			},
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				// Inject the user request on first call
+				if th.iteration <= 2 {
+					th.Inject("[console] Create a support thread that monitors the helpdesk for tickets. Give it access to the helpdesk MCP server.")
+				}
+				return th.threads.Count() >= 1
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				threads := th.threads.List()
+				found := false
+				for _, thr := range threads {
+					if strings.Contains(strings.ToLower(thr.ID), "support") || strings.Contains(strings.ToLower(thr.Directive), "support") || strings.Contains(strings.ToLower(thr.Directive), "helpdesk") {
+						found = true
+						t.Logf("support thread found: id=%s", thr.ID)
+					}
+				}
+				if !found {
+					t.Errorf("expected a support/helpdesk thread, got: %v", threads)
+				}
+			},
+			Timeout: 60 * time.Second,
+		},
+		{
+			Name: "User asks to add a dev thread",
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.iteration <= 4 {
+					th.Inject("[console] Now create a dev thread that can read and write code using the codebase tools. It should fix bugs that support finds.")
+				}
+				return th.threads.Count() >= 2
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				threads := th.threads.List()
+				foundDev := false
+				for _, thr := range threads {
+					if strings.Contains(strings.ToLower(thr.ID), "dev") || strings.Contains(strings.ToLower(thr.Directive), "code") {
+						foundDev = true
+						t.Logf("dev thread found: id=%s", thr.ID)
+					}
+				}
+				if !foundDev {
+					t.Errorf("expected a dev/code thread, got: %v", threads)
+				}
+			},
+			Timeout: 60 * time.Second,
+		},
+		{
+			Name: "User asks to check for tickets — support finds T-001",
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.iteration <= 6 {
+					th.Inject("[console] Ask support to check for open tickets right now.")
+				}
+				// Wait for support to find and report the ticket
+				for _, m := range th.messages {
+					if strings.Contains(m.Content, "T-001") || strings.Contains(m.Content, "login") {
+						return true
+					}
+				}
+				return false
+			},
+			Timeout: 90 * time.Second,
+		},
+		{
+			Name: "User asks for status — coordinator reports team state",
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.iteration <= 10 {
+					th.Inject("[console] What threads do we have running and what are they doing?")
+				}
+				// Wait for a response that mentions the threads
+				for i := len(th.messages) - 1; i >= 0; i-- {
+					m := th.messages[i]
+					if m.Role == "assistant" && (strings.Contains(strings.ToLower(m.Content), "support") && strings.Contains(strings.ToLower(m.Content), "dev")) {
+						return true
+					}
+				}
+				return false
+			},
+			Timeout: 60 * time.Second,
+		},
+	},
+	Timeout:    5 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_ConversationalTeam(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+
+	helpdeskBin := buildMCPBinary(t, "mcps/helpdesk")
+	codebaseBin := buildMCPBinary(t, "mcps/codebase")
+	t.Logf("built helpdesk=%s codebase=%s", helpdeskBin, codebaseBin)
+
+	s := conversationalTeamScenario
+	s.MCPServers[0].Command = helpdeskBin
+	s.MCPServers[1].Command = codebaseBin
+	runScenario(t, s)
+}
+
+// --- Conversational Org Building Scenario ---
+// User builds a 3-level org through chat: CEO → directors → workers.
+// No predefined threads — everything spawned via conversation.
+
+var conversationalOrgScenario = Scenario{
+	Name: "ConversationalOrg",
+	MCPServers: []MCPServerConfig{
+		{Name: "helpdesk", Command: "", Env: map[string]string{"HELPDESK_DATA_DIR": "{{dataDir}}"}},
+		{Name: "codebase", Command: "", Env: map[string]string{"CODEBASE_DATA_DIR": "{{dataDir}}"}},
+	},
+	Directive: "You are a CEO coordinator. You can spawn director threads (with spawn tool), and directors can spawn their own workers. Build the org as the user requests. Keep it lean.",
+	Phases: []Phase{
+		{
+			Name: "User asks to create an engineering director",
+			Setup: func(t *testing.T, dir string) {
+				// Seed helpdesk + codebase data
+				os.MkdirAll(dir, 0755)
+				os.WriteFile(filepath.Join(dir, "tickets.json"), []byte(`[{"id":"T-100","question":"API returns 500 on /users endpoint","status":"open"}]`), 0644)
+				writeGoProject(t, dir)
+			},
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.iteration <= 2 {
+					th.Inject(`[console] Create an engineering director thread with tools=spawn,send and mcp=codebase. It MUST have spawn in its tools so it can create sub-workers.`)
+				}
+				for _, thr := range th.threads.List() {
+					if strings.Contains(strings.ToLower(thr.ID), "eng") || strings.Contains(strings.ToLower(thr.ID), "director") {
+						return true
+					}
+				}
+				return false
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				for _, thr := range th.threads.List() {
+					t.Logf("thread: id=%s depth=%d tools=%v", thr.ID, thr.Depth, thr.Tools)
+				}
+			},
+			Timeout: 60 * time.Second,
+		},
+		{
+			Name: "User asks to create a support director",
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.iteration <= 4 {
+					th.Inject(`[console] Create a support director thread with tools=spawn,send and mcp=helpdesk. It MUST have spawn in its tools.`)
+				}
+				count := 0
+				for _, thr := range th.threads.List() {
+					if thr.Depth == 0 {
+						count++
+					}
+				}
+				return count >= 2
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				t.Logf("depth-0 threads (directors):")
+				for _, thr := range th.threads.List() {
+					if thr.Depth == 0 {
+						t.Logf("  %s (tools: %v)", thr.ID, thr.Tools)
+					}
+				}
+			},
+			Timeout: 60 * time.Second,
+		},
+		{
+			Name: "User tells engineering director to spawn a dev worker",
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.iteration <= 6 {
+					th.Inject("[console] Send a message to the engineering director: spawn a dev-worker thread with codebase tools to fix bug T-100 (API returns 500 on /users).")
+				}
+				// Check directors' children for depth-1 workers
+				for _, dir := range th.threads.List() {
+					if dir.SubThreads > 0 {
+						return true
+					}
+				}
+				return false
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				t.Logf("threads after worker spawn:")
+				totalWorkers := 0
+				for _, thr := range th.threads.List() {
+					t.Logf("  %s (sub_threads=%d)", thr.ID, thr.SubThreads)
+					totalWorkers += thr.SubThreads
+				}
+				if totalWorkers < 1 {
+					t.Errorf("expected at least 1 worker, got %d", totalWorkers)
+				} else {
+					t.Logf("PASS: %d workers under directors", totalWorkers)
+				}
+			},
+			Timeout: 90 * time.Second,
+		},
+		{
+			Name: "User tells support director to spawn a ticket handler",
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.iteration <= 10 {
+					th.Inject("[console] Send a message to the support director: spawn a ticket-handler worker with helpdesk tools to handle open tickets.")
+				}
+				// Count workers across all directors
+				workerCount := 0
+				for _, dir := range th.threads.List() {
+					workerCount += dir.SubThreads
+				}
+				return workerCount >= 2
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				t.Logf("final org structure:")
+				directors := th.threads.List()
+				totalWorkers := 0
+				for _, dir := range directors {
+					t.Logf("  [director] %s (sub_threads=%d)", dir.ID, dir.SubThreads)
+					totalWorkers += dir.SubThreads
+				}
+				if len(directors) < 2 {
+					t.Errorf("expected at least 2 directors, got %d", len(directors))
+				}
+				t.Logf("org: %d directors + %d workers (from SubThreads)", len(directors), totalWorkers)
+				// Don't fail on worker count — SubThreads may lag behind actual spawns
+			},
+			Timeout: 90 * time.Second,
+		},
+	},
+	Timeout:    5 * time.Minute,
+	MaxThreads: 8,
+}
+
+// writeGoProject creates a simple Go project for the codebase MCP to work with.
+func writeGoProject(t *testing.T, dir string) {
+	t.Helper()
+	os.MkdirAll(filepath.Join(dir, "app"), 0755)
+	os.WriteFile(filepath.Join(dir, "app", "main.go"), []byte(`package main
+
+import "fmt"
+
+func GetUser(id int) (string, error) {
+	if id <= 0 {
+		return "", fmt.Errorf("invalid user id")
+	}
+	return fmt.Sprintf("user_%d", id), nil
+}
+
+func main() {
+	name, _ := GetUser(1)
+	fmt.Println(name)
+}
+`), 0644)
+	os.WriteFile(filepath.Join(dir, "app", "main_test.go"), []byte(`package main
+
+import "testing"
+
+func TestGetUser(t *testing.T) {
+	name, err := GetUser(1)
+	if err != nil || name != "user_1" {
+		t.Fatalf("expected user_1, got %s err=%v", name, err)
+	}
+}
+`), 0644)
+}
+
+func TestScenario_ConversationalOrg(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+
+	helpdeskBin := buildMCPBinary(t, "mcps/helpdesk")
+	codebaseBin := buildMCPBinary(t, "mcps/codebase")
+	t.Logf("built helpdesk=%s codebase=%s", helpdeskBin, codebaseBin)
+
+	s := conversationalOrgScenario
+	s.MCPServers[0].Command = helpdeskBin
+	s.MCPServers[1].Command = codebaseBin
+	runScenario(t, s)
+}
+
+// cloneTeamScenario: the CEO bootstraps a "team A" (director + worker) and is then
+// asked to clone it as "team B" using ONLY the primitives already in the system —
+// send (to query the existing director for its state) and spawn (to rebuild the
+// mirror). No new tools. Verifies that self-replication by conversation works.
+var cloneTeamScenario = Scenario{
+	Name: "CloneTeam",
+	MCPServers: []MCPServerConfig{
+		{Name: "helpdesk", Command: "", Env: map[string]string{"HELPDESK_DATA_DIR": "{{dataDir}}"}},
+	},
+	Directive: `You are a CEO coordinator. You spawn director threads, and directors spawn their own workers. When a user asks you to clone an existing team:
+1. Use the send tool to ask the existing director for (a) its current directive verbatim, (b) the ids/directives/tools of each worker under it.
+2. Wait for the director's reply to arrive in your next thought.
+3. Use spawn to create a mirror director with a "_b" suffix on its id, copying the directive and tools you were told.
+4. Use send to tell the new director to spawn the same workers (with "_b" suffixes on their ids).
+Keep it lean — one director branch is enough.`,
+	Phases: []Phase{
+		{
+			Name: "Bootstrap team A — support director + ticket handler",
+			Setup: func(t *testing.T, dir string) {
+				os.MkdirAll(dir, 0755)
+				os.WriteFile(filepath.Join(dir, "tickets.json"), []byte(`[{"id":"T-200","question":"Password reset link is broken","status":"open"}]`), 0644)
+			},
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.iteration <= 2 {
+					th.Inject(`[console] Create a director thread with id="support_director_a", tools=spawn,send and mcp=helpdesk. Then tell it (via send) to spawn a worker with id="ticket_handler_a" using helpdesk tools to handle open tickets.`)
+				}
+				workers := 0
+				haveA := false
+				for _, thr := range th.threads.List() {
+					if strings.Contains(thr.ID, "support_director_a") {
+						haveA = true
+					}
+					workers += thr.SubThreads
+				}
+				return haveA && workers >= 1
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				t.Logf("team A:")
+				for _, thr := range th.threads.List() {
+					t.Logf("  %s (depth=%d sub_threads=%d)", thr.ID, thr.Depth, thr.SubThreads)
+				}
+			},
+			Timeout: 120 * time.Second,
+		},
+		{
+			Name: "Clone team A as team B — CEO queries director, rebuilds mirror",
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				sent := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !sent {
+						sent = true
+						th.Inject(`[console] Clone the support team as team B. Follow your directive: send support_director_a to ask for its state, then spawn support_director_b with the same directive/tools, then send the new director to spawn a mirror worker ticket_handler_b.`)
+					}
+					haveB := false
+					mirrorWorkers := 0
+					for _, thr := range th.threads.List() {
+						if strings.Contains(thr.ID, "support_director_b") {
+							haveB = true
+							mirrorWorkers += thr.SubThreads
+						}
+					}
+					return haveB && mirrorWorkers >= 1
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				t.Logf("final org:")
+				var aDir, bDir *ThreadInfo
+				list := th.threads.List()
+				for i := range list {
+					thr := &list[i]
+					t.Logf("  %s (depth=%d sub_threads=%d tools=%v)", thr.ID, thr.Depth, thr.SubThreads, thr.Tools)
+					if strings.Contains(thr.ID, "support_director_a") {
+						aDir = thr
+					}
+					if strings.Contains(thr.ID, "support_director_b") {
+						bDir = thr
+					}
+				}
+				if aDir == nil || bDir == nil {
+					t.Errorf("expected both support_director_a and support_director_b, got a=%v b=%v", aDir, bDir)
+					return
+				}
+				if bDir.SubThreads < 1 {
+					t.Errorf("expected mirror director to have at least 1 worker, got %d", bDir.SubThreads)
+				}
+				t.Logf("PASS: team cloned by conversation — A has %d workers, B has %d workers", aDir.SubThreads, bDir.SubThreads)
+			},
+			Timeout: 180 * time.Second,
+		},
+	},
+	Timeout:    6 * time.Minute,
+	MaxThreads: 6,
+}
+
+func TestScenario_CloneTeam(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+
+	helpdeskBin := buildMCPBinary(t, "mcps/helpdesk")
+	t.Logf("built helpdesk=%s", helpdeskBin)
+
+	s := cloneTeamScenario
+	s.MCPServers[0].Command = helpdeskBin
+	runScenario(t, s)
+}
+
+// longCodingTaskScenario measures the core's capacity to drive a non-trivial
+// coding task through sub-threads over a 2-3 minute window. It's a soak-style
+// scenario: the main thread is a coordinator, one worker thread does the
+// actual coding via the codebase MCP (read_file / write_file / run_tests), and
+// we observe iterative progress — how many write/test cycles the worker can
+// run, whether tests eventually pass, and whether the threads stay alive for
+// the full duration.
+//
+// The task is a Go word-count package with failing tests and a skeleton
+// implementation. The worker needs to read the tests, implement the missing
+// logic in main.go, write the file, run tests, iterate on failures, and keep
+// going until tests pass or the budget runs out.
+var longCodingTaskScenario = Scenario{
+	Name: "LongCodingTask",
+	MCPServers: []MCPServerConfig{
+		// NOTE: codebase MCP reads CODEBASE_DIR, not CODEBASE_DATA_DIR — if we
+		// passed the wrong name it falls back to "." (the test's cwd) and
+		// silently operates on the apteva-core package directory instead.
+		{Name: "codebase", Command: "", Env: map[string]string{"CODEBASE_DIR": "{{dataDir}}"}},
+	},
+	Directive: `You are a coordinator. You have a dev worker thread under you that does all the coding.
+Your job: spawn a dev-worker thread with codebase tools and give it a clear goal. Then monitor its
+progress, respond to questions, and only intervene when it's stuck.
+
+The dev worker should:
+1. Read the existing files (main.go, main_test.go) to understand the task.
+2. Implement the missing functionality in main.go.
+3. Run tests via run_tests. If they fail, read the failure, fix the code, run again.
+4. Keep iterating until tests pass, or until it has made genuine progress.
+
+Do not do the coding yourself — delegate everything to the worker. Stay on normal pace as the
+coordinator. The worker should be on fast pace to iterate quickly.`,
+	DataSetup: func(t *testing.T, dir string) {
+		// Skeleton main.go with stub functions that must be implemented.
+		os.WriteFile(filepath.Join(dir, "main.go"), []byte(`package main
+
+import (
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+)
+
+// WordCount returns a map of lowercased words → occurrence counts for the
+// given text. Words are split on whitespace, leading/trailing punctuation is
+// stripped, and empty tokens are ignored.
+//
+// TODO: implement.
+func WordCount(text string) map[string]int {
+	return nil
+}
+
+// TopN returns the top-N words by count, sorted by count descending then
+// alphabetically ascending for tie-breaking. Return at most n entries.
+//
+// TODO: implement.
+func TopN(counts map[string]int, n int) []string {
+	return nil
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: wordcount <file> [n]")
+		os.Exit(1)
+	}
+	data, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read: %v\n", err)
+		os.Exit(1)
+	}
+	n := 10
+	counts := WordCount(string(data))
+	for _, w := range TopN(counts, n) {
+		fmt.Printf("%d\t%s\n", counts[w], w)
+	}
+	// references to avoid unused-import errors while stubs are empty
+	_ = sort.Strings
+	_ = strings.ToLower
+}
+`), 0644)
+
+		// Full test suite that must pass.
+		os.WriteFile(filepath.Join(dir, "main_test.go"), []byte(`package main
+
+import (
+	"reflect"
+	"testing"
+)
+
+func TestWordCount_Basic(t *testing.T) {
+	got := WordCount("the quick brown fox the lazy dog the")
+	want := map[string]int{"the": 3, "quick": 1, "brown": 1, "fox": 1, "lazy": 1, "dog": 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestWordCount_CaseAndPunct(t *testing.T) {
+	got := WordCount("Hello, world! HELLO world.")
+	want := map[string]int{"hello": 2, "world": 2}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestWordCount_Empty(t *testing.T) {
+	got := WordCount("")
+	if len(got) != 0 {
+		t.Errorf("expected empty, got %v", got)
+	}
+}
+
+func TestTopN_SortedByCountThenAlpha(t *testing.T) {
+	counts := map[string]int{"a": 3, "b": 3, "c": 2, "d": 1}
+	got := TopN(counts, 3)
+	want := []string{"a", "b", "c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestTopN_LimitsToN(t *testing.T) {
+	counts := map[string]int{"a": 1, "b": 2, "c": 3}
+	got := TopN(counts, 2)
+	if len(got) != 2 {
+		t.Errorf("expected 2 results, got %v", got)
+	}
+	if got[0] != "c" || got[1] != "b" {
+		t.Errorf("expected [c b], got %v", got)
+	}
+}
+`), 0644)
+
+		// test.sh is what the codebase MCP's run_tests tool shells out to.
+		os.WriteFile(filepath.Join(dir, "test.sh"), []byte("#!/bin/bash\ncd \"$(dirname \"$0\")\"\ngo test ./... 2>&1\n"), 0755)
+
+		// go.mod so `go test` works without network deps.
+		os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module wordcount\n\ngo 1.21\n"), 0644)
+	},
+	Phases: []Phase{
+		{
+			Name:    "Bootstrap — coordinator spawns dev worker",
+			Timeout: 60 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.iteration <= 2 {
+					th.Inject(`[console] Task: main.go in your codebase has two stub functions (WordCount and TopN). main_test.go already contains the tests. Spawn a worker with id="dev-worker" using spawn(id="dev-worker", directive="Read main.go and main_test.go, implement WordCount and TopN so all tests pass, run tests after each change, iterate until green.", mcp="codebase", tools="send,done,pace"). Set its pace to fast. Do not code yourself.`)
+				}
+				// main's children are Depth=0 — just confirm at least one
+				// thread is alive under main.
+				if th.threads.Count() >= 1 {
+					for _, thr := range th.threads.List() {
+						t.Logf("  ✓ thread alive: id=%s depth=%d", thr.ID, thr.Depth)
+					}
+					return true
+				}
+				return false
+			},
+		},
+		{
+			Name:    "Active coding — worker reads, writes, tests",
+			Timeout: 120 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				// Poll the main.go contents for evidence of real implementation
+				// (the stub returns nil; any map literal or loop means progress)
+				data, _ := os.ReadFile(filepath.Join(dir, "main.go"))
+				src := string(data)
+				stubbed := strings.Contains(src, "return nil") &&
+					!strings.Contains(src, "make(map[string]int)") &&
+					!strings.Contains(src, "for _,")
+				writes := 0
+				reads := 0
+				tests := 0
+				for _, thr := range th.threads.List() {
+					_ = thr // placeholder; actual tool counts come from audit log below
+				}
+				// The codebase MCP does not produce audit entries like some of
+				// the others; we rely on file mutations + the observer counts
+				// logged in the main runner. Record what we can see here.
+				t.Logf("  ... main.go bytes=%d stubbed=%v writes=%d reads=%d tests=%d threads=%v",
+					len(data), stubbed, writes, reads, tests, threadIDs(th))
+				return !stubbed && len(data) > len([]byte("package main")) + 400
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "main.go"))
+				t.Logf("  main.go size: %d bytes", len(data))
+				t.Logf("  threads alive: %d", th.threads.Count())
+			},
+		},
+		{
+			Name:    "Convergence — aim for green tests",
+			Timeout: 120 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				// Directly shell out to `go test` ourselves to check status.
+				// We don't mutate files — this is an independent read of the
+				// worker's progress.
+				cmd := exec.Command("go", "test", "./...")
+				cmd.Dir = dir
+				out, err := cmd.CombinedOutput()
+				passing := err == nil
+				t.Logf("  ... go test: passing=%v threads=%v", passing, threadIDs(th))
+				if passing {
+					t.Logf("  output: %s", strings.TrimSpace(string(out)))
+				}
+				return passing
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Best-effort: if tests did not pass, log the last failure so
+				// the test report shows what the worker was stuck on.
+				cmd := exec.Command("go", "test", "./...")
+				cmd.Dir = dir
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Logf("NOTE: tests did not reach green within budget — last go test output:")
+					lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+					if len(lines) > 20 {
+						lines = lines[len(lines)-20:]
+					}
+					for _, l := range lines {
+						t.Logf("    %s", l)
+					}
+				} else {
+					t.Logf("PASS: worker drove tests to green")
+				}
+				// Always log final main.go size for capacity measurement
+				data, _ := os.ReadFile(filepath.Join(dir, "main.go"))
+				t.Logf("final main.go: %d bytes, %d lines",
+					len(data), strings.Count(string(data), "\n"))
+			},
+		},
+		{
+			Name:    "Soak — threads still alive",
+			Timeout: 20 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				alive := th.threads.Count()
+				t.Logf("  ... alive=%d", alive)
+				return alive >= 1
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				if th.threads.Count() < 1 {
+					t.Errorf("expected at least 1 thread still alive, got %d", th.threads.Count())
+				}
+			},
+		},
+	},
+	// Hard budget: 5 minutes total. Phases 2+3 together already consume 4
+	// minutes of polling window, but the scenario will often finish phase 3
+	// early if the worker drives tests green quickly.
+	Timeout:    5 * time.Minute,
+	MaxThreads: 4,
+}
+
+func TestScenario_LongCodingTask(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+
+	codebaseBin := buildMCPBinary(t, "mcps/codebase")
+	t.Logf("built codebase=%s", codebaseBin)
+
+	s := longCodingTaskScenario
+	s.MCPServers[0].Command = codebaseBin
+	runScenario(t, s)
+}
+
+// longCodingTaskHardScenario is the hard variant of LongCodingTask. It gives
+// the dev worker a substantially bigger target: a miniature arithmetic
+// expression evaluator with a lexer, a recursive-descent parser with operator
+// precedence, and an AST evaluator. Twelve tests cover precedence,
+// associativity, parentheses, unary minus, float literals, and three error
+// paths (empty input, unbalanced parens, division by zero).
+//
+// Why this task shape:
+//   - It genuinely requires ~150 lines across 4 functions, so even a capable
+//     model usually writes 2-5 iterations before all tests pass.
+//   - The parser has classic edge cases (unary minus vs. binary, operator
+//     precedence, right/left-associativity) that surface real fix-up loops.
+//   - Error paths force the worker to distinguish "returning a number" from
+//     "returning an error", which early iterations often get wrong.
+//
+// This scenario is designed to actually exercise the 2-3 minute window the
+// user asked for, as opposed to LongCodingTask which Kimi K2.5 solves in one
+// write.
+var longCodingTaskHardScenario = Scenario{
+	Name: "LongCodingTaskHard",
+	MCPServers: []MCPServerConfig{
+		{Name: "codebase", Command: "", Env: map[string]string{"CODEBASE_DIR": "{{dataDir}}"}},
+	},
+	Directive: `You are a coordinator. You have a dev worker under you that does all the coding.
+Your job: spawn the worker, hand it the task, and stay out of its way. Do not write code yourself —
+delegate everything. When the worker reports progress, acknowledge briefly. Only intervene if it
+gets stuck for many iterations without making progress.
+
+The worker should:
+1. Read main.go and main_test.go to understand the task.
+2. Implement the four stub functions (Tokenize, Parse, Eval, Evaluate) in main.go.
+3. Run tests after each change via codebase_run_tests.
+4. When tests fail, read the failure carefully, fix the specific bug, and re-run.
+5. Iterate until all 12 tests pass. Do not give up — edge cases are the hard part.`,
+	DataSetup: func(t *testing.T, dir string) {
+		os.WriteFile(filepath.Join(dir, "main.go"), []byte(`package main
+
+import (
+	"fmt"
+)
+
+// --- Types ---
+
+// TokenKind enumerates lexeme kinds the Tokenize function must recognize.
+type TokenKind int
+
+const (
+	TokNumber TokenKind = iota
+	TokPlus
+	TokMinus
+	TokStar
+	TokSlash
+	TokLParen
+	TokRParen
+	TokEOF
+)
+
+// Token is one lexeme with its kind and (for TokNumber) its numeric value.
+type Token struct {
+	Kind  TokenKind
+	Value float64
+}
+
+// Expr is the AST node interface. Implementations represent number literals,
+// binary ops, and unary ops. Pick any concrete types you want — the tests
+// only call the four public functions below.
+type Expr interface {
+	exprNode()
+}
+
+// --- Stub functions — implement these. ---
+
+// Tokenize produces a slice of tokens ending in a single TokEOF. Whitespace
+// is skipped. Numbers may be integer or float (e.g. "3" or "3.14"). Any
+// unrecognized character is an error.
+//
+// TODO: implement.
+func Tokenize(src string) ([]Token, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+// Parse consumes the token slice and returns an AST root using standard
+// arithmetic precedence: * and / bind tighter than + and -, both left-
+// associative. Parentheses override precedence. Unary minus is supported
+// and has higher precedence than binary ops.
+//
+// Returns an error if tokens are ill-formed (e.g. unmatched paren, trailing
+// operator, empty input).
+//
+// TODO: implement.
+func Parse(tokens []Token) (Expr, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+// Eval walks the AST and returns the numeric result. It returns an error on
+// division by zero. Other runtime errors are at your discretion but the tests
+// only check division-by-zero.
+//
+// TODO: implement.
+func Eval(e Expr) (float64, error) {
+	return 0, fmt.Errorf("not implemented")
+}
+
+// Evaluate is the public entry point: Tokenize + Parse + Eval.
+//
+// TODO: implement.
+func Evaluate(src string) (float64, error) {
+	return 0, fmt.Errorf("not implemented")
+}
+
+func main() {
+	fmt.Println("expression evaluator — run tests")
+}
+`), 0644)
+
+		os.WriteFile(filepath.Join(dir, "main_test.go"), []byte(`package main
+
+import (
+	"math"
+	"strings"
+	"testing"
+)
+
+func approx(a, b float64) bool {
+	return math.Abs(a-b) < 1e-9
+}
+
+// --- Public API: Evaluate (end-to-end) ---
+
+func TestEvaluate_Basic(t *testing.T) {
+	got, err := Evaluate("1 + 2")
+	if err != nil || !approx(got, 3) {
+		t.Errorf("1+2: got %v err=%v", got, err)
+	}
+}
+
+func TestEvaluate_Precedence(t *testing.T) {
+	got, err := Evaluate("2 + 3 * 4")
+	if err != nil || !approx(got, 14) {
+		t.Errorf("2+3*4: got %v err=%v (want 14)", got, err)
+	}
+}
+
+func TestEvaluate_Parens(t *testing.T) {
+	got, err := Evaluate("(2 + 3) * 4")
+	if err != nil || !approx(got, 20) {
+		t.Errorf("(2+3)*4: got %v err=%v (want 20)", got, err)
+	}
+}
+
+func TestEvaluate_LeftAssociativeMinus(t *testing.T) {
+	got, err := Evaluate("10 - 3 - 2")
+	if err != nil || !approx(got, 5) {
+		t.Errorf("10-3-2: got %v err=%v (want 5, left-assoc)", got, err)
+	}
+}
+
+func TestEvaluate_LeftAssociativeDiv(t *testing.T) {
+	got, err := Evaluate("16 / 4 / 2")
+	if err != nil || !approx(got, 2) {
+		t.Errorf("16/4/2: got %v err=%v (want 2, left-assoc)", got, err)
+	}
+}
+
+func TestEvaluate_UnaryMinus(t *testing.T) {
+	got, err := Evaluate("-5 + 3")
+	if err != nil || !approx(got, -2) {
+		t.Errorf("-5+3: got %v err=%v (want -2)", got, err)
+	}
+}
+
+func TestEvaluate_UnaryInsideParens(t *testing.T) {
+	got, err := Evaluate("2 * (-3 + 1)")
+	if err != nil || !approx(got, -4) {
+		t.Errorf("2*(-3+1): got %v err=%v (want -4)", got, err)
+	}
+}
+
+func TestEvaluate_NestedParens(t *testing.T) {
+	got, err := Evaluate("((1 + 2) * (3 - 4))")
+	if err != nil || !approx(got, -3) {
+		t.Errorf("((1+2)*(3-4)): got %v err=%v (want -3)", got, err)
+	}
+}
+
+func TestEvaluate_FloatLiteral(t *testing.T) {
+	got, err := Evaluate("3.14 * 2")
+	if err != nil || !approx(got, 6.28) {
+		t.Errorf("3.14*2: got %v err=%v (want 6.28)", got, err)
+	}
+}
+
+// --- Error paths ---
+
+func TestEvaluate_EmptyInput(t *testing.T) {
+	_, err := Evaluate("")
+	if err == nil {
+		t.Errorf("empty input should return error")
+	}
+}
+
+func TestEvaluate_UnbalancedParen(t *testing.T) {
+	_, err := Evaluate("(1 + 2")
+	if err == nil {
+		t.Errorf("unbalanced paren should return error")
+	}
+}
+
+func TestEvaluate_DivisionByZero(t *testing.T) {
+	_, err := Evaluate("1 / 0")
+	if err == nil {
+		t.Errorf("division by zero should return error")
+	}
+	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "zero") &&
+		!strings.Contains(strings.ToLower(err.Error()), "divide") {
+		t.Logf("note: error text %q does not mention 'zero' or 'divide' — OK but weird", err.Error())
+	}
+}
+`), 0644)
+
+		os.WriteFile(filepath.Join(dir, "test.sh"), []byte("#!/bin/bash\ncd \"$(dirname \"$0\")\"\ngo test ./... 2>&1\n"), 0755)
+		os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module exprcalc\n\ngo 1.21\n"), 0644)
+	},
+	Phases: []Phase{
+		{
+			Name:    "Bootstrap — coordinator spawns dev worker",
+			Timeout: 60 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				if th.iteration <= 2 {
+					th.Inject(`[console] Task: main.go in your codebase has four stub functions (Tokenize, Parse, Eval, Evaluate) for an arithmetic expression evaluator. main_test.go has 12 tests covering precedence, associativity, parens, unary minus, floats, and error cases. Spawn a worker with id="dev-worker" using spawn(id="dev-worker", directive="Implement a complete arithmetic expression evaluator: read main.go and main_test.go, then implement Tokenize, Parse, Eval, and Evaluate in main.go so every test passes. Use a standard recursive-descent parser. Run tests after each change, read failures carefully, and iterate until all 12 tests pass.", mcp="codebase", tools="send,done,pace"). Do not code yourself.`)
+				}
+				if th.threads.Count() >= 1 {
+					for _, thr := range th.threads.List() {
+						t.Logf("  ✓ thread alive: id=%s depth=%d", thr.ID, thr.Depth)
+					}
+					return true
+				}
+				return false
+			},
+		},
+		{
+			Name:    "First write — worker makes a real implementation attempt",
+			Timeout: 120 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, _ := os.ReadFile(filepath.Join(dir, "main.go"))
+				src := string(data)
+				stubbed := strings.Contains(src, `return nil, fmt.Errorf("not implemented")`)
+				t.Logf("  ... main.go=%d bytes stubbed=%v threads=%v", len(data), stubbed, threadIDs(th))
+				// Progress = stubs gone AND file substantially grown
+				return !stubbed && len(data) > 1500
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "main.go"))
+				t.Logf("  first-draft main.go: %d bytes", len(data))
+			},
+		},
+		{
+			Name:    "Iteration — worker runs tests, reads failures, fixes bugs",
+			Timeout: 180 * time.Second,
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				lastSize := 0
+				cycles := 0
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					// Count distinct iterations by tracking file mutations
+					data, _ := os.ReadFile(filepath.Join(dir, "main.go"))
+					if len(data) != lastSize && lastSize != 0 {
+						cycles++
+					}
+					lastSize = len(data)
+
+					// Run tests ourselves — independent of whatever the worker
+					// thinks is happening
+					cmd := exec.Command("go", "test", "./...")
+					cmd.Dir = dir
+					out, err := cmd.CombinedOutput()
+					passing := err == nil
+					passCount := 0
+					failCount := 0
+					for _, line := range strings.Split(string(out), "\n") {
+						if strings.HasPrefix(line, "--- PASS") {
+							passCount++
+						}
+						if strings.HasPrefix(line, "--- FAIL") {
+							failCount++
+						}
+					}
+					t.Logf("  ... go test passing=%v pass=%d fail=%d cycles=%d main.go=%d bytes threads=%v",
+						passing, passCount, failCount, cycles, len(data), threadIDs(th))
+					return passing
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				cmd := exec.Command("go", "test", "-v", "./...")
+				cmd.Dir = dir
+				out, err := cmd.CombinedOutput()
+				if err == nil {
+					t.Logf("ALL GREEN — worker converged.")
+					return
+				}
+				t.Logf("NOTE: tests did not reach full green within budget. Final go test output (tail):")
+				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+				if len(lines) > 30 {
+					lines = lines[len(lines)-30:]
+				}
+				for _, l := range lines {
+					t.Logf("    %s", l)
+				}
+			},
+		},
+		{
+			Name:    "Soak — worker and main still alive",
+			Timeout: 20 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				alive := th.threads.Count()
+				t.Logf("  ... alive=%d", alive)
+				return alive >= 1
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				if th.threads.Count() < 1 {
+					t.Errorf("expected at least 1 thread still alive, got %d", th.threads.Count())
+				}
+				data, _ := os.ReadFile(filepath.Join(dir, "main.go"))
+				t.Logf("final main.go: %d bytes, %d lines",
+					len(data), strings.Count(string(data), "\n"))
+			},
+		},
+	},
+	// Hard budget: 8 minutes. Phases 2+3 together give ~5 minutes of polling;
+	// bootstrap + soak add ~1.5 minutes headroom. Most of the time will be
+	// spent in Phase 3 as the worker iterates on test failures.
+	Timeout:    8 * time.Minute,
+	MaxThreads: 3,
+}
+
+func TestScenario_LongCodingTaskHard(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+
+	codebaseBin := buildMCPBinary(t, "mcps/codebase")
+	t.Logf("built codebase=%s", codebaseBin)
+
+	s := longCodingTaskHardScenario
+	s.MCPServers[0].Command = codebaseBin
+	runScenario(t, s)
+}

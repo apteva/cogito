@@ -30,9 +30,10 @@ type NativeTool struct {
 
 // NativeToolCall is a structured tool call returned by the provider.
 type NativeToolCall struct {
-	ID   string            `json:"id"`   // provider-assigned ID for matching results
-	Name string            `json:"name"`
-	Args map[string]string `json:"args"`
+	ID               string            `json:"id"`                          // provider-assigned ID for matching results
+	Name             string            `json:"name"`
+	Args             map[string]string `json:"args"`
+	ThoughtSignature string            `json:"thought_signature,omitempty"` // Gemini: encrypted reasoning state
 }
 
 // ToolResult is sent back to the provider after executing a tool.

@@ -290,13 +290,33 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				computerInfo["type"] = a.thinker.config.Computer.Type
 			}
 		}
-		// Build live MCP server info
-		var mcpInfo []map[string]any
+		// Build live MCP server info. Include every MCP in the persisted
+		// config — both main-access (live connection in mcpServers) and
+		// cataloged entries (connected on-demand per thread) — so the
+		// dashboard sees the same list the user configured. Fall back to
+		// config.mcp_servers as the source of truth; overlay "connected"
+		// for anything currently alive in mcpServers.
+		liveNames := make(map[string]bool, len(a.thinker.mcpServers))
 		for _, srv := range a.thinker.mcpServers {
-			mcpInfo = append(mcpInfo, map[string]any{
-				"name":      srv.GetName(),
-				"connected": true,
-			})
+			liveNames[srv.GetName()] = true
+		}
+		var mcpInfo []map[string]any
+		for _, cfg := range a.thinker.config.GetMCPServers() {
+			entry := map[string]any{
+				"name":        cfg.Name,
+				"connected":   liveNames[cfg.Name],
+				"main_access": cfg.MainAccess,
+			}
+			if cfg.Transport != "" {
+				entry["transport"] = cfg.Transport
+			}
+			if cfg.URL != "" {
+				entry["url"] = cfg.URL
+			}
+			if cfg.Command != "" {
+				entry["command"] = cfg.Command
+			}
+			mcpInfo = append(mcpInfo, entry)
 		}
 
 		writeJSON(w, map[string]any{
@@ -460,10 +480,62 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 }
 
 // reconcileMCP diffs the desired MCP server list against the live state,
-// connecting new servers and disconnecting removed ones.
+// connecting new servers, disconnecting removed ones, and replacing servers
+// whose connection details (URL, command, args, transport, main_access)
+// changed.
+//
+// Two kinds of "live" state are considered:
+//   - t.mcpServers — servers with main_access=true, open connections, fully
+//     registered tools in the instance registry.
+//   - t.mcpCatalog — servers with main_access=false, no open connection.
+//     Only the name and tool count are cached for the main thread's system
+//     prompt; sub-threads open their own connections on demand at spawn.
+//
+// Matching reconciler behavior to instance-start semantics means:
+//   - main_access=false entries get their tools listed once, the connection
+//     closed, and only an mcpCatalog row kept.
+//   - main_access=true entries get fully registered.
+// systemMCPNames are entries injected by the server at spawn time
+// (apteva-server gateway + per-instance channels MCP). The dashboard's GET
+// /config returns them as summaries (name + connected only) because they
+// carry dynamic URLs that aren't user-editable. If a client later PUTs the
+// mcp_servers list back, those system entries come back in stripped form —
+// reconcile must leave them untouched so we don't disconnect them and then
+// fail to reconnect from incomplete configs. Users attach/detach only
+// *their* MCP servers through the dashboard; system entries stay put.
+var systemMCPNames = map[string]bool{
+	"apteva-server":   true,
+	"channels":        true,
+	"apteva-channels": true,
+}
+
 func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
-	logMsg("API", fmt.Sprintf("reconcileMCP: %d desired servers", len(desired)))
+	// Strip system entries from the desired list so reconcile ignores them.
+	filtered := make([]MCPServerConfig, 0, len(desired))
+	for _, c := range desired {
+		if systemMCPNames[c.Name] {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	desired = filtered
+
+	names := make([]string, len(desired))
+	for i, c := range desired {
+		names[i] = c.Name
+	}
+	logMsg("API", fmt.Sprintf("reconcileMCP: %d desired servers (system entries preserved): %v", len(desired), names))
 	t := a.thinker
+
+	// Current config map lets us detect when the URL/command/args/transport
+	// or main_access changed between reconciles — any change forces a
+	// detach-then-reattach.
+	currentCfg := make(map[string]MCPServerConfig)
+	if t.config != nil {
+		for _, c := range t.config.GetMCPServers() {
+			currentCfg[c.Name] = c
+		}
+	}
 
 	// Index desired by name
 	want := make(map[string]MCPServerConfig, len(desired))
@@ -471,74 +543,162 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 		want[cfg.Name] = cfg
 	}
 
-	// Disconnect servers not in the desired list
+	// For each server name currently known to exist, decide whether it
+	// stays as-is, gets removed, or gets replaced (close + reconnect).
+	// Replacement happens when the desired config differs from the current
+	// one in any connection-level field.
+	changed := func(old, new MCPServerConfig) bool {
+		if old.URL != new.URL || old.Command != new.Command || old.Transport != new.Transport {
+			return true
+		}
+		if old.MainAccess != new.MainAccess {
+			return true
+		}
+		if len(old.Args) != len(new.Args) {
+			return true
+		}
+		for i := range old.Args {
+			if old.Args[i] != new.Args[i] {
+				return true
+			}
+		}
+		if len(old.Env) != len(new.Env) {
+			return true
+		}
+		for k, v := range old.Env {
+			if new.Env[k] != v {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Disconnect live (main_access) servers that are either absent from
+	// desired or whose config changed. System entries are never touched —
+	// they're not user-editable and the desired list doesn't include them.
 	var kept []MCPConn
 	for _, srv := range t.mcpServers {
-		if _, ok := want[srv.GetName()]; ok {
+		name := srv.GetName()
+		if systemMCPNames[name] {
 			kept = append(kept, srv)
-		} else {
-			srv.Close()
-			t.config.RemoveMCPServer(srv.GetName())
-			t.registry.RemoveByMCPServer(srv.GetName())
-			if t.telemetry != nil {
-				t.telemetry.Emit("mcp.disconnected", "api", map[string]string{"name": srv.GetName()})
-			}
+			continue
+		}
+		desiredCfg, stillWant := want[name]
+		if stillWant && !changed(currentCfg[name], desiredCfg) {
+			kept = append(kept, srv)
+			continue
+		}
+		// Disconnect: either removed or replaced.
+		srv.Close()
+		t.config.RemoveMCPServer(name)
+		t.registry.RemoveByMCPServer(name)
+		if t.telemetry != nil {
+			t.telemetry.Emit("mcp.disconnected", "api", map[string]string{"name": name})
 		}
 	}
 	t.mcpServers = kept
 
-	// Index live by name
-	live := make(map[string]bool, len(kept))
+	// Prune cataloged (non-main_access) servers that are either absent from
+	// desired or whose config changed. Catalog entries have no live
+	// connection, so we just rebuild the slice. System entries are never
+	// touched.
+	var newCatalog []MCPServerInfo
+	for _, info := range t.mcpCatalog {
+		if systemMCPNames[info.Name] {
+			newCatalog = append(newCatalog, info)
+			continue
+		}
+		desiredCfg, stillWant := want[info.Name]
+		if stillWant && !changed(currentCfg[info.Name], desiredCfg) && !desiredCfg.MainAccess {
+			newCatalog = append(newCatalog, info)
+			continue
+		}
+		// Dropped or replaced — remove from config. Nothing to close.
+		if !stillWant {
+			t.config.RemoveMCPServer(info.Name)
+			if t.telemetry != nil {
+				t.telemetry.Emit("mcp.disconnected", "api", map[string]string{"name": info.Name})
+			}
+		}
+	}
+	t.mcpCatalog = newCatalog
+
+	// Index what's now live after the prune pass so the connect loop
+	// doesn't reprocess servers that survived untouched.
+	live := make(map[string]bool, len(kept)+len(newCatalog))
 	for _, srv := range kept {
 		live[srv.GetName()] = true
 	}
+	for _, info := range newCatalog {
+		live[info.Name] = true
+	}
 
-	// Connect new servers
+	// Connect new / replaced servers.
 	for _, cfg := range desired {
 		if live[cfg.Name] {
 			continue
 		}
 		srv, err := connectAnyMCP(cfg)
 		if err != nil {
+			logMsg("MCP-RECONCILE", fmt.Sprintf("%s: connect error: %v", cfg.Name, err))
 			continue
 		}
 		tools, err := srv.ListTools()
 		if err != nil {
 			srv.Close()
+			logMsg("MCP-RECONCILE", fmt.Sprintf("%s: list tools error: %v", cfg.Name, err))
 			continue
 		}
-		t.mcpServers = append(t.mcpServers, srv)
-		for _, tool := range tools {
-			fullName := cfg.Name + "_" + tool.Name
-			syntax := buildMCPSyntax(fullName, tool.InputSchema)
-			t.registry.Register(&ToolDef{
-				Name:        fullName,
-				Description: fmt.Sprintf("[%s] %s", cfg.Name, tool.Description),
-				Syntax:      syntax,
-				Rules:       fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
-				Handler:     mcpProxyHandler(srv, tool.Name),
-				InputSchema: tool.InputSchema,
-				MCP:         !cfg.MainAccess,
-				MCPServer:   cfg.Name,
-			})
-		}
-		if t.memory != nil {
-			go func(srvName string, srvTools []mcpToolDef) {
-				for _, tl := range srvTools {
-					fullName := srvName + "_" + tl.Name
-					emb, err := t.memory.embed(fullName + ": " + tl.Description)
-					if err == nil {
-						td := t.registry.Get(fullName)
-						if td != nil {
-							td.Embedding = emb
+
+		if cfg.MainAccess {
+			// Full registration — tools become callable by main and threads
+			// with matching allowlists. Connection stays open for the life
+			// of the instance.
+			t.mcpServers = append(t.mcpServers, srv)
+			for _, tool := range tools {
+				fullName := cfg.Name + "_" + tool.Name
+				syntax := buildMCPSyntax(fullName, tool.InputSchema)
+				t.registry.Register(&ToolDef{
+					Name:        fullName,
+					Description: fmt.Sprintf("[%s] %s", cfg.Name, tool.Description),
+					Syntax:      syntax,
+					Rules:       fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
+					Handler:     mcpProxyHandler(srv, tool.Name),
+					InputSchema: tool.InputSchema,
+					MCP:         !cfg.MainAccess,
+					MCPServer:   cfg.Name,
+				})
+			}
+			if t.memory != nil {
+				go func(srvName string, srvTools []mcpToolDef) {
+					for _, tl := range srvTools {
+						fullName := srvName + "_" + tl.Name
+						emb, err := t.memory.embed(fullName + ": " + tl.Description)
+						if err == nil {
+							td := t.registry.Get(fullName)
+							if td != nil {
+								td.Embedding = emb
+							}
 						}
 					}
-				}
-			}(cfg.Name, tools)
+				}(cfg.Name, tools)
+			}
+		} else {
+			// Catalog mode — discover tool count, then close the connection.
+			// Sub-threads open their own sessions on demand at spawn time
+			// (see thread.go:308-374).
+			t.mcpCatalog = append(t.mcpCatalog, MCPServerInfo{Name: cfg.Name, ToolCount: len(tools)})
+			srv.Close()
+			logMsg("MCP-RECONCILE", fmt.Sprintf("%s: cataloged (%d tools, threads connect on demand)", cfg.Name, len(tools)))
 		}
+
 		t.config.SaveMCPServer(cfg)
 		if t.telemetry != nil {
-			t.telemetry.Emit("mcp.connected", "api", map[string]string{"name": cfg.Name, "tools": fmt.Sprintf("%d", len(tools))})
+			t.telemetry.Emit("mcp.connected", "api", map[string]string{
+				"name":  cfg.Name,
+				"tools": fmt.Sprintf("%d", len(tools)),
+				"mode":  map[bool]string{true: "main", false: "catalog"}[cfg.MainAccess],
+			})
 		}
 	}
 }

@@ -6,15 +6,30 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 // MCPHTTPServer connects to an MCP server via Streamable HTTP transport.
 // Per MCP spec 2025-03-26: POST for requests, single endpoint.
+//
+// Compatibility notes for real-world hosted MCP servers (observed against
+// Composio's backend.composio.dev):
+//   - Some servers host the MCP endpoint at a sub-path and respond to the
+//     parent path with HTTP 307 → Location (appending "/mcp"). Go's default
+//     client strips the POST body on 307 redirects, so we disable auto-
+//     redirects and re-issue the POST manually with the body intact.
+//     After the first successful hop we store the resolved URL and skip the
+//     redirect on every subsequent call.
+//   - Some servers return SSE-framed responses (`Content-Type: text/event-stream`
+//     with one or more `event: message\ndata: {...}\n\n` frames) instead of
+//     plain JSON, even for POST requests. We parse both.
 type MCPHTTPServer struct {
 	Name      string
+	mu        sync.Mutex // guards url (after redirect)
 	url       string
 	sessionID string
 	nextID    atomic.Int64
@@ -23,9 +38,17 @@ type MCPHTTPServer struct {
 
 func connectMCPHTTP(name, url string) (*MCPHTTPServer, error) {
 	srv := &MCPHTTPServer{
-		Name:   name,
-		url:    url,
-		client: &http.Client{Timeout: 30 * time.Second},
+		Name: name,
+		url:  url,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+			// Disable auto-redirects so we can re-issue POSTs with the body
+			// preserved. http.Client would otherwise follow 307/308 but drop
+			// the body for non-idempotent methods.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 
 	// Initialize
@@ -53,6 +76,96 @@ func connectMCPHTTP(name, url string) (*MCPHTTPServer, error) {
 	return srv, nil
 }
 
+// decodeMCPBody extracts the JSON-RPC payload from either a plain JSON body
+// or an SSE-framed `event: message\ndata: {...}` body. Returns the raw JSON
+// bytes suitable for unmarshaling into jsonRPCResponse.
+func decodeMCPBody(contentType string, body []byte) ([]byte, error) {
+	ct := strings.ToLower(contentType)
+	trimmed := strings.TrimSpace(string(body))
+	if strings.Contains(ct, "text/event-stream") ||
+		strings.HasPrefix(trimmed, "event:") ||
+		strings.HasPrefix(trimmed, "data:") {
+		// SSE: walk lines and take the last `data:` payload.
+		var last string
+		for _, line := range strings.Split(trimmed, "\n") {
+			line = strings.TrimRight(line, "\r")
+			if strings.HasPrefix(line, "data:") {
+				last = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			}
+		}
+		if last == "" {
+			return nil, fmt.Errorf("SSE body had no data: line")
+		}
+		return []byte(last), nil
+	}
+	return body, nil
+}
+
+// doPOST issues a POST to the current URL, manually following 307/308
+// redirects up to 3 hops while preserving the body. Returns the response
+// headers + raw body bytes. Updates srv.url in-place to the post-redirect
+// URL so subsequent calls skip the redirect entirely.
+func (s *MCPHTTPServer) doPOST(body []byte, includeAccept bool) (http.Header, []byte, int, error) {
+	s.mu.Lock()
+	currentURL := s.url
+	s.mu.Unlock()
+
+	for attempt := 0; attempt < 4; attempt++ {
+		httpReq, err := http.NewRequest("POST", currentURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if includeAccept {
+			// Accept both JSON and SSE — some servers (Composio) respond
+			// with SSE even for POSTs.
+			httpReq.Header.Set("Accept", "application/json, text/event-stream")
+		}
+		if s.sessionID != "" {
+			httpReq.Header.Set("Mcp-Session-Id", s.sessionID)
+		}
+
+		resp, err := s.client.Do(httpReq)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("http: %w", err)
+		}
+		if resp.StatusCode == http.StatusTemporaryRedirect || resp.StatusCode == http.StatusPermanentRedirect {
+			loc := resp.Header.Get("Location")
+			resp.Body.Close()
+			if loc == "" {
+				return nil, nil, resp.StatusCode, fmt.Errorf("redirect with no Location header")
+			}
+			// Location may be relative (RFC 7231 §7.1.2). Resolve against
+			// the URL we just POSTed to so "/mcp/inner" → full URL.
+			base, berr := url.Parse(currentURL)
+			if berr != nil {
+				return nil, nil, resp.StatusCode, fmt.Errorf("parse current URL: %w", berr)
+			}
+			target, perr := url.Parse(loc)
+			if perr != nil {
+				return nil, nil, resp.StatusCode, fmt.Errorf("parse Location: %w", perr)
+			}
+			currentURL = base.ResolveReference(target).String()
+			continue
+		}
+		respBody, rerr := io.ReadAll(io.LimitReader(resp.Body, 4_000_000))
+		resp.Body.Close()
+		if rerr != nil {
+			return resp.Header, nil, resp.StatusCode, fmt.Errorf("read: %w", rerr)
+		}
+
+		// Pin the post-redirect URL so the next call skips the redirect.
+		if attempt > 0 {
+			s.mu.Lock()
+			s.url = currentURL
+			s.mu.Unlock()
+			logMsg("MCP-HTTP", fmt.Sprintf("resolved redirect → %s", currentURL))
+		}
+		return resp.Header, respBody, resp.StatusCode, nil
+	}
+	return nil, nil, 0, fmt.Errorf("too many redirects")
+}
+
 func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMessage, http.Header, error) {
 	id := s.nextID.Add(1)
 	logMsg("MCP-HTTP", fmt.Sprintf("call %s id=%d url=%s", method, id, s.url))
@@ -63,46 +176,36 @@ func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMess
 		Method:  method,
 		Params:  params,
 	}
-
 	data, _ := json.Marshal(req)
 
-	httpReq, err := http.NewRequest("POST", s.url, bytes.NewReader(data))
+	headers, body, status, err := s.doPOST(data, true)
 	if err != nil {
-		return nil, nil, fmt.Errorf("request: %w", err)
+		return nil, headers, err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json")
-	if s.sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", s.sessionID)
+	if status < 200 || status >= 300 {
+		snippet := string(body)
+		if len(snippet) > 500 {
+			snippet = snippet[:500] + "…"
+		}
+		logMsg("MCP-HTTP", fmt.Sprintf("error %d: %s", status, snippet))
+		return nil, headers, fmt.Errorf("HTTP %d: %s", status, snippet)
 	}
 
-	resp, err := s.client.Do(httpReq)
+	payload, err := decodeMCPBody(headers.Get("Content-Type"), body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("http: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1000))
-		logMsg("MCP-HTTP", fmt.Sprintf("error %d: %s", resp.StatusCode, string(body)))
-		return nil, resp.Header, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logMsg("MCP-HTTP", fmt.Sprintf("read error: %v", err))
-		return nil, resp.Header, fmt.Errorf("read: %w", err)
+		logMsg("MCP-HTTP", fmt.Sprintf("decode error: %v body=%s", err, string(body[:min(len(body), 200)])))
+		return nil, headers, fmt.Errorf("decode: %w", err)
 	}
 
 	var rpcResp jsonRPCResponse
-	if err := json.Unmarshal(body, &rpcResp); err != nil {
-		logMsg("MCP-HTTP", fmt.Sprintf("parse error: %v body=%s", err, string(body[:min(len(body), 200)])))
-		return nil, resp.Header, fmt.Errorf("parse: %w", err)
+	if err := json.Unmarshal(payload, &rpcResp); err != nil {
+		logMsg("MCP-HTTP", fmt.Sprintf("parse error: %v payload=%s", err, string(payload[:min(len(payload), 200)])))
+		return nil, headers, fmt.Errorf("parse: %w", err)
 	}
 
 	if rpcResp.Error != nil {
 		logMsg("MCP-HTTP", fmt.Sprintf("rpc error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message))
-		return nil, resp.Header, fmt.Errorf("MCP error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
+		return nil, headers, fmt.Errorf("MCP error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
 	}
 
 	resultPreview := string(rpcResp.Result)
@@ -110,7 +213,7 @@ func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMess
 		resultPreview = resultPreview[:200] + "..."
 	}
 	logMsg("MCP-HTTP", fmt.Sprintf("ok id=%d result=%s", id, resultPreview))
-	return rpcResp.Result, resp.Header, nil
+	return rpcResp.Result, headers, nil
 }
 
 func (s *MCPHTTPServer) call(method string, params any) (json.RawMessage, error) {
@@ -125,21 +228,8 @@ func (s *MCPHTTPServer) notify(method string, params any) {
 		Params:  params,
 	}
 	data, _ := json.Marshal(req)
-
-	httpReq, err := http.NewRequest("POST", s.url, bytes.NewReader(data))
-	if err != nil {
-		return
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if s.sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", s.sessionID)
-	}
-
-	resp, err := s.client.Do(httpReq)
-	if err != nil {
-		return
-	}
-	resp.Body.Close()
+	// Best-effort — ignore response. doPOST still handles redirects.
+	_, _, _, _ = s.doPOST(data, false)
 }
 
 func (s *MCPHTTPServer) ListTools() ([]mcpToolDef, error) {

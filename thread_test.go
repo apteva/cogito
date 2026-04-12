@@ -132,34 +132,37 @@ func TestToolRegistry_CoreDocs(t *testing.T) {
 	reg := NewToolRegistry("test")
 	docs := reg.CoreDocs(true)
 
-	if !strings.Contains(docs, "[[spawn") {
+	// CoreDocs lists each tool as `  <name> — <description>` (native tool
+	// calling — no `[[...]]` syntax). Check for the formatted prefix so we
+	// don't match tool names that appear inside other descriptions.
+	if !strings.Contains(docs, "  spawn —") {
 		t.Error("expected spawn in main core docs")
 	}
-	if !strings.Contains(docs, "[[send") {
+	if !strings.Contains(docs, "  send —") {
 		t.Error("expected send in core docs")
 	}
-	if !strings.Contains(docs, "[[pace") {
+	if !strings.Contains(docs, "  pace —") {
 		t.Error("expected pace in core docs")
 	}
-	if !strings.Contains(docs, "[[connect") {
+	if !strings.Contains(docs, "  connect —") {
 		t.Error("expected connect in main core docs")
 	}
-	if !strings.Contains(docs, "[[disconnect") {
+	if !strings.Contains(docs, "  disconnect —") {
 		t.Error("expected disconnect in main core docs")
 	}
-	if !strings.Contains(docs, "[[list_connected") {
+	if !strings.Contains(docs, "  list_connected —") {
 		t.Error("expected list_connected in main core docs")
 	}
 
 	// Without main-only
 	docs = reg.CoreDocs(false)
-	if strings.Contains(docs, "[[spawn") {
+	if strings.Contains(docs, "  spawn —") {
 		t.Error("spawn should not be in non-main core docs")
 	}
-	if strings.Contains(docs, "[[connect") {
+	if strings.Contains(docs, "  connect —") {
 		t.Error("connect should not be in non-main core docs")
 	}
-	if !strings.Contains(docs, "[[send") {
+	if !strings.Contains(docs, "  send —") {
 		t.Error("expected send in non-main core docs")
 	}
 }
