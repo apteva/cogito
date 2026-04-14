@@ -414,6 +414,38 @@ func NewOpenAIProvider(apiKey string) LLMProvider {
 	}
 }
 
+// NewNvidiaProvider wires up NVIDIA's NIM hosted catalog. They expose an
+// OpenAI-compatible Chat Completions endpoint at integrate.api.nvidia.com,
+// so we reuse OpenAICompatProvider verbatim — just the base URL and default
+// model slugs are NVIDIA-specific. Pricing is left at zero by default because
+// NIM billing is account-scoped rather than per-token-listed, so cost
+// projections in the dashboard stats bar will stay at $0 unless the user
+// manually overrides these costs via config.
+func NewNvidiaProvider(apiKey string) LLMProvider {
+	return &OpenAICompatProvider{
+		name:       "nvidia",
+		apiKey:     apiKey,
+		url:        "https://integrate.api.nvidia.com/v1/chat/completions",
+		authHeader: "Bearer",
+		models: map[ModelTier]string{
+			// Defaults picked from NVIDIA's public NIM catalog. Users will
+			// typically override via Config.Providers[].Models on the
+			// dashboard settings page.
+			ModelLarge:  "nvidia/llama-3.1-nemotron-70b-instruct",
+			ModelMedium: "meta/llama-3.1-70b-instruct",
+			ModelSmall:  "meta/llama-3.1-8b-instruct",
+		},
+		// NIM pricing is account-plan dependent — leave the per-token cost
+		// at 0 so calculateCostForProvider() returns 0 instead of a
+		// misleading number. Users wanting real cost tracking can edit
+		// the struct directly from a fork or set costs via a future
+		// config field.
+		inputCost:  0,
+		cachedCost: 0,
+		outputCost: 0,
+	}
+}
+
 func NewOllamaProvider(host string) LLMProvider {
 	url := strings.TrimRight(host, "/") + "/v1/chat/completions"
 	return &OpenAICompatProvider{

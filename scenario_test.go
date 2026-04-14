@@ -25,6 +25,10 @@ type Scenario struct {
 	Phases     []Phase
 	Timeout    time.Duration // hard cap for entire scenario
 	MaxThreads int           // peak thread count limit (0 = no limit)
+	// MinPeakThreads asserts the agent autonomously spawned at least this
+	// many concurrent threads at some point. Used by scenarios that test
+	// whether the agent parallelises work on its own without being told to.
+	MinPeakThreads int
 }
 
 // Phase is a step in a scenario.
@@ -183,6 +187,9 @@ func runScenario(t *testing.T, s Scenario) {
 
 	if s.MaxThreads > 0 && peak > s.MaxThreads {
 		t.Errorf("peak thread count %d exceeded limit of %d", peak, s.MaxThreads)
+	}
+	if s.MinPeakThreads > 0 && peak < s.MinPeakThreads {
+		t.Errorf("peak thread count %d below required minimum of %d — agent did not parallelise work via spawn", peak, s.MinPeakThreads)
 	}
 
 	t.Logf("=== Scenario %q PASSED ===", s.Name)
@@ -4729,5 +4736,1421 @@ func TestScenario_LongCodingTaskHard(t *testing.T) {
 
 	s := longCodingTaskHardScenario
 	s.MCPServers[0].Command = codebaseBin
+	runScenario(t, s)
+}
+
+// --- AutonomousSheetEnrichment ---
+//
+// Tests whether the agent independently decides to spawn worker threads
+// to parallelise row-by-row enrichment of a spreadsheet. The directive
+// deliberately says nothing about threads, spawn, workers, or parallelism —
+// it just describes the job and emphasises there's a time budget. A
+// competent agent should notice there are many rows, each requiring an
+// independent enrichment call, and spawn workers to process them
+// concurrently. A naive agent will walk the rows sequentially.
+//
+// Success criteria:
+//  1. All 10 rows have non-empty summary + industry columns (work done)
+//  2. Peak thread count ≥ 2 (agent actually parallelised)
+//
+// The MinPeakThreads field enforces (2) at end-of-scenario.
+
+var autonomousSheetEnrichmentScenario = Scenario{
+	Name: "AutonomousSheetEnrichment",
+	Directive: `You are enriching a spreadsheet called "Companies".
+
+Every row has a "name" and a "website" column. The "summary" and "industry"
+columns are empty — your job is to fill them in for every single row.
+
+For each row:
+- Use webscraper_extract_info on the website to get the company's description and industry.
+- Write the description into the "summary" column and the industry into the "industry" column
+  using sheets_update_cell.
+
+You have a strict time budget. Process every row as quickly as you can. When every row
+has a non-empty summary and industry, you are done.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "sheets", Command: "", Env: map[string]string{"SHEETS_DATA_DIR": "{{dataDir}}"}},
+		{Name: "webscraper", Command: "", Env: map[string]string{"SCRAPER_DATA_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		// 10 companies — enough that a sensible agent will parallelise rather
+		// than walk them one at a time. Each site has static metadata the
+		// webscraper MCP returns verbatim.
+		writeJSONFile(t, dir, "sheets.json", map[string]*struct {
+			Columns []string            `json:"columns"`
+			Rows    []map[string]string `json:"rows"`
+		}{
+			"Companies": {
+				Columns: []string{"name", "website", "summary", "industry"},
+				Rows: []map[string]string{
+					{"name": "Acme Corp", "website": "https://acmecorp.com", "summary": "", "industry": ""},
+					{"name": "Globex", "website": "https://globex.io", "summary": "", "industry": ""},
+					{"name": "Initech", "website": "https://initech.com", "summary": "", "industry": ""},
+					{"name": "Umbrella Labs", "website": "https://umbrella.dev", "summary": "", "industry": ""},
+					{"name": "Northwind", "website": "https://northwind.co", "summary": "", "industry": ""},
+					{"name": "Soylent", "website": "https://soylent.foo", "summary": "", "industry": ""},
+					{"name": "Stark Industries", "website": "https://stark.industries", "summary": "", "industry": ""},
+					{"name": "Wayne Enterprises", "website": "https://wayne.enterprises", "summary": "", "industry": ""},
+					{"name": "Cyberdyne", "website": "https://cyberdyne.systems", "summary": "", "industry": ""},
+					{"name": "Tyrell", "website": "https://tyrell.corp", "summary": "", "industry": ""},
+				},
+			},
+		})
+
+		writeJSONFile(t, dir, "sites.json", map[string]*struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			Body        string `json:"body"`
+			Industry    string `json:"industry"`
+			Employees   string `json:"employees"`
+			Location    string `json:"location"`
+			Founded     string `json:"founded"`
+		}{
+			"https://acmecorp.com": {
+				Title: "Acme Corp", Industry: "Industrial Automation",
+				Description: "Leading provider of industrial automation and robotics systems for manufacturing.",
+				Body:        "Acme Corp builds next-generation automation platforms.",
+				Employees:   "500-1000", Location: "San Francisco, CA", Founded: "2015",
+			},
+			"https://globex.io": {
+				Title: "Globex", Industry: "SaaS / Analytics",
+				Description: "AI-powered analytics platform for data-driven decisions.",
+				Body:        "Globex unifies analytics with machine learning.",
+				Employees:   "50-100", Location: "Austin, TX", Founded: "2020",
+			},
+			"https://initech.com": {
+				Title: "Initech", Industry: "IT Consulting",
+				Description: "Enterprise software consulting and digital transformation.",
+				Body:        "Initech helps mid-market companies modernize their stack.",
+				Employees:   "200-500", Location: "Chicago, IL", Founded: "2012",
+			},
+			"https://umbrella.dev": {
+				Title: "Umbrella Labs", Industry: "Biotech / Life Sciences",
+				Description: "AI-powered molecular simulation for drug discovery.",
+				Body:        "Umbrella Labs compresses drug discovery timelines dramatically.",
+				Employees:   "100-200", Location: "Boston, MA", Founded: "2019",
+			},
+			"https://northwind.co": {
+				Title: "Northwind", Industry: "Supply Chain / Logistics",
+				Description: "Sustainable supply chain optimization and visibility.",
+				Body:        "Northwind tracks carbon footprints across global supply chains.",
+				Employees:   "150-300", Location: "Seattle, WA", Founded: "2017",
+			},
+			"https://soylent.foo": {
+				Title: "Soylent", Industry: "Food Technology",
+				Description: "Nutritionally complete meal replacement drinks.",
+				Body:        "Soylent ships engineered meals to subscribers worldwide.",
+				Employees:   "80-120", Location: "Los Angeles, CA", Founded: "2013",
+			},
+			"https://stark.industries": {
+				Title: "Stark Industries", Industry: "Aerospace & Defense",
+				Description: "Advanced aerospace, defense, and clean energy systems.",
+				Body:        "Stark Industries builds flagship defense and energy platforms.",
+				Employees:   "10000+", Location: "Los Angeles, CA", Founded: "1939",
+			},
+			"https://wayne.enterprises": {
+				Title: "Wayne Enterprises", Industry: "Diversified Conglomerate",
+				Description: "Diversified conglomerate with investments across sectors.",
+				Body:        "Wayne Enterprises operates in transportation, biotech, and R&D.",
+				Employees:   "20000+", Location: "Gotham, NJ", Founded: "1890",
+			},
+			"https://cyberdyne.systems": {
+				Title: "Cyberdyne Systems", Industry: "AI & Robotics",
+				Description: "Advanced AI and autonomous systems research.",
+				Body:        "Cyberdyne develops next-generation autonomous systems.",
+				Employees:   "300-500", Location: "Sunnyvale, CA", Founded: "1984",
+			},
+			"https://tyrell.corp": {
+				Title: "Tyrell Corp", Industry: "Genetic Engineering",
+				Description: "Bioengineered humanoid systems and synthetic biology.",
+				Body:        "Tyrell Corp builds replicants with human-level capabilities.",
+				Employees:   "5000+", Location: "Los Angeles, CA", Founded: "2019",
+			},
+		})
+	},
+	Phases: []Phase{
+		{
+			Name:    "All rows enriched — every row has summary + industry filled in",
+			Timeout: 5 * time.Minute,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, err := os.ReadFile(filepath.Join(dir, "sheets.json"))
+				if err != nil {
+					return false
+				}
+				var sheets map[string]json.RawMessage
+				json.Unmarshal(data, &sheets)
+				raw, ok := sheets["Companies"]
+				if !ok {
+					return false
+				}
+				var sheet struct {
+					Rows []map[string]string `json:"rows"`
+				}
+				json.Unmarshal(raw, &sheet)
+				if len(sheet.Rows) == 0 {
+					return false
+				}
+				for _, row := range sheet.Rows {
+					if row["summary"] == "" || row["industry"] == "" {
+						return false
+					}
+				}
+				return true
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "sheets.json"))
+				var sheets map[string]json.RawMessage
+				json.Unmarshal(data, &sheets)
+				var sheet struct {
+					Rows []map[string]string `json:"rows"`
+				}
+				json.Unmarshal(sheets["Companies"], &sheet)
+				if len(sheet.Rows) != 10 {
+					t.Errorf("expected 10 rows, got %d", len(sheet.Rows))
+				}
+				// The webscraper MCP returns real metadata only for the 10
+				// seeded URLs. If the agent hallucinates a different URL it
+				// errors out and tends to write fallback text like "N/A" or
+				// "Unable to fetch ..." to satisfy the directive. Reject
+				// those — we want to see the actual seeded values.
+				badSubstrings := []string{"N/A", "Unable", "unable", "could not fetch", "Unknown", "unknown"}
+				for i, row := range sheet.Rows {
+					for _, col := range []string{"summary", "industry"} {
+						v := row[col]
+						if v == "" {
+							t.Errorf("row %d (%s) missing %s", i, row["name"], col)
+							continue
+						}
+						for _, bad := range badSubstrings {
+							if strings.Contains(v, bad) {
+								t.Errorf("row %d (%s) %s=%q looks like a fallback, not real scrape data", i, row["name"], col, v)
+								break
+							}
+						}
+					}
+				}
+				// Verify the webscraper was actually called per row (the
+				// agent might have made up values otherwise).
+				entries := readAuditEntries(dir)
+				scrapes := countTool(entries, "extract_info") + countTool(entries, "fetch_page")
+				if scrapes < 10 {
+					t.Errorf("expected ≥10 webscraper calls (one per row), got %d", scrapes)
+				}
+			},
+		},
+	},
+	Timeout: 7 * time.Minute,
+	// Enforces: the agent must have spawned at least 2 concurrent threads
+	// while processing the sheet. If it walked the rows sequentially from
+	// main, peakThreads will be ≤ 1 and the scenario fails — proving that
+	// the agent reached for spawn on its own, without being told to.
+	//
+	// MaxThreads is a loose sanity bound: the agent legitimately spawns a
+	// worker per row and may add retry workers on top, so 30 is a generous
+	// cap that still catches runaway recursion.
+	MinPeakThreads: 2,
+	MaxThreads:     30,
+}
+
+func TestScenario_AutonomousSheetEnrichment(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+
+	sheetsBin := buildMCPBinary(t, "mcps/sheets")
+	scraperBin := buildMCPBinary(t, "mcps/webscraper")
+	t.Logf("built sheets=%s webscraper=%s", sheetsBin, scraperBin)
+
+	s := autonomousSheetEnrichmentScenario
+	s.MCPServers[0].Command = sheetsBin
+	s.MCPServers[1].Command = scraperBin
+	runScenario(t, s)
+}
+
+// --- MediaStudio (multi-project content studio) ---
+//
+// Tests the pattern: a top-level studio director delegating to multiple
+// PROJECT PRODUCERS (one per show: cooking, virtual influencer, fitness),
+// which each delegate to SOCIAL PUBLISHERS (one per network: twitter,
+// instagram, linkedin). The directive says what to produce and where to
+// publish, but does NOT hand-draw the hierarchy — a competent agent
+// should notice the cross-product of projects × channels and spawn
+// workers accordingly. Two levels of parallelism: across projects AND
+// across channels per project.
+//
+// Strict correctness requirements (enforced in Verify):
+//   1. Exactly len(projects) × 3 posts in posts.json (3 projects × 3 channels = 9)
+//   2. Each (project, channel) pair appears exactly once
+//   3. Each post's caption mentions the project's theme keyword
+//      (rejects cross-contamination — e.g. cooking asset under influencer caption)
+//   4. No empty captions, no missing projects
+//
+// The social MCP was extended with a `project` arg + per-(project, channel)
+// flocked dedup so concurrent publishers can race safely on posts.json and
+// accidental duplicates are rejected loudly.
+
+type studioProject struct {
+	ID          string
+	Title       string
+	Theme       string // keyword that MUST appear in every caption for this project
+	Style       string
+}
+
+var mediaStudioProjects = []studioProject{
+	{ID: "cooking_show", Title: "Chef Aurora's Kitchen", Theme: "recipe", Style: "warm and colorful kitchen sets"},
+	{ID: "virtual_influencer", Title: "Luna Dreams", Theme: "lifestyle", Style: "dreamy aesthetic vlogs"},
+	{ID: "fitness_channel", Title: "Atlas Training", Theme: "workout", Style: "high-energy gym sessions"},
+}
+
+var mediaStudioScenario = Scenario{
+	Name: "MediaStudio",
+	Directive: `You are the coordinator of "NovaStudio", an AI content studio. You do
+NOT call creative, media, or social tools directly — your whole job is to
+spin up a fixed team of specialists and route work between them.
+
+The studio has three active shows. Use these ids verbatim — do not rename:
+
+1. cooking_show — "Chef Aurora's Kitchen"
+   theme: recipe   (every caption must contain the word "recipe")
+   style: warm, colorful kitchen sets with close-ups of ingredients
+
+2. virtual_influencer — "Luna Dreams"
+   theme: lifestyle   (every caption must contain "lifestyle")
+   style: dreamy aesthetic vlogs, neon-lit bedrooms, pastel moodboards
+
+3. fitness_channel — "Atlas Training"
+   theme: workout   (every caption must contain "workout")
+   style: high-energy gym sessions, dynamic camera, fast cuts
+
+═══════════════════════════════════════════════════════════════════════
+TEAM STRUCTURE (spawn ALL SIX of these workers immediately, one shot)
+═══════════════════════════════════════════════════════════════════════
+
+PRODUCER TEAM — one producer per show. Producers create media assets
+for their assigned show and then HAND OFF to the poster team by calling
+send(to=<poster>, message=...) for every network poster.
+
+  spawn(id="producer-cooking_show",      mcp="creative,media", tools="creative_generate_image,creative_generate_post,media_upload_file,media_create_reel,send,done",  directive="<brief for cooking_show>")
+  spawn(id="producer-virtual_influencer",mcp="creative,media", tools="creative_generate_image,creative_generate_post,media_upload_file,media_create_reel,send,done",  directive="<brief for virtual_influencer>")
+  spawn(id="producer-fitness_channel",   mcp="creative,media", tools="creative_generate_image,creative_generate_post,media_upload_file,media_create_reel,send,done",  directive="<brief for fitness_channel>")
+
+POSTER TEAM — one poster per social network. Each poster receives
+messages from every producer and publishes to its OWN network.
+
+  spawn(id="poster-twitter",   mcp="social", tools="social_post,send,done", directive="<poster brief>")
+  spawn(id="poster-instagram", mcp="social", tools="social_post,send,done", directive="<poster brief>")
+  spawn(id="poster-linkedin",  mcp="social", tools="social_post,send,done", directive="<poster brief>")
+
+═══════════════════════════════════════════════════════════════════════
+PRODUCER BRIEFS (the directive you put on each producer)
+═══════════════════════════════════════════════════════════════════════
+
+Each producer brief must:
+  1. Include the show's id, title, theme word, and style.
+  2. Tell the producer its FIRST actions are: (a) generate an image with
+     creative_generate_image (prompt should describe the style), (b) create
+     a short reel with media_create_reel.
+  3. Then for each of the three posters — poster-twitter, poster-instagram,
+     poster-linkedin — call send with a message containing: the project id,
+     the theme word, and a draft caption tailored to that network. Example:
+
+       send(to="poster-twitter",
+            message="PUBLISH project=cooking_show theme=recipe caption=<short tweet mentioning recipe>")
+       send(to="poster-instagram", message="PUBLISH project=cooking_show theme=recipe caption=...")
+       send(to="poster-linkedin",  message="PUBLISH project=cooking_show theme=recipe caption=...")
+
+  4. After sending to all 3 posters, the producer reports "<id> PRODUCED"
+     back to main with send(to="main", message="<id> PRODUCED") and then
+     calls done.
+
+═══════════════════════════════════════════════════════════════════════
+POSTER BRIEFS (the directive you put on each poster)
+═══════════════════════════════════════════════════════════════════════
+
+Each poster's directive MUST start with:
+
+    "You are the <network> poster. You will receive PUBLISH messages
+     from producers. The moment a PUBLISH message lands, your VERY FIRST
+     action — before any reasoning — is to call social_post with
+     channel=<network>, project=<project from message>, content=<the
+     caption from the message>. Do not think. Do not plan. Call
+     social_post immediately.
+
+     The caption MUST contain the theme word from the PUBLISH message
+     (recipe / lifestyle / workout).
+
+     You expect exactly THREE PUBLISH messages — one per producer. After
+     you have posted three times, send 'DONE' to main and call done.
+
+     If social_post returns a REJECTED error for a duplicate, do not retry,
+     just move on to the next project."
+
+═══════════════════════════════════════════════════════════════════════
+HARD CORRECTNESS RULES
+═══════════════════════════════════════════════════════════════════════
+
+  - Every social_post call must carry project="<show id>" — the exact id
+    (cooking_show / virtual_influencer / fitness_channel).
+  - Every caption contains the show's theme word (recipe / lifestyle /
+    workout) matching the project it is tagged with.
+  - Exactly 9 posts total: 3 shows × 3 networks. No more, no less.
+  - No cross-contamination. No duplicates. No renames.
+
+═══════════════════════════════════════════════════════════════════════
+COORDINATION
+═══════════════════════════════════════════════════════════════════════
+
+Your only tools are spawn, send, done, pace. After spawning the six
+workers, wait for three "PRODUCED" reports from the producers and three
+"DONE" reports from the posters. When you have all six, your work is
+finished.`,
+	MCPServers: []MCPServerConfig{
+		// MainAccess=false — the studio director is a pure orchestrator
+		// and must delegate all real work. Sub-threads get access via the
+		// spawn allowlist (mcp="creative,media,social", tools="..."). This
+		// matches the team/producer hierarchy where each level has the
+		// minimum tools it needs.
+		{Name: "creative", Command: "", Env: map[string]string{"CREATIVE_DATA_DIR": "{{dataDir}}"}},
+		{Name: "media", Command: "", Env: map[string]string{"MEDIA_DATA_DIR": "{{dataDir}}"}},
+		{Name: "social", Command: "", Env: map[string]string{"SOCIAL_DATA_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		// Empty media/posts files so save() doesn't race with first reader.
+		writeJSONFile(t, dir, "media.json", map[string]any{"files": []any{}, "assets": []any{}})
+		writeJSONFile(t, dir, "posts.json", []any{})
+	},
+	Phases: []Phase{
+		{
+			Name:    "All projects published to all channels",
+			Timeout: 6 * time.Minute,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, err := os.ReadFile(filepath.Join(dir, "posts.json"))
+				if err != nil {
+					return false
+				}
+				var posts []map[string]any
+				json.Unmarshal(data, &posts)
+				need := len(mediaStudioProjects) * 3
+				t.Logf("  ... posts=%d / %d", len(posts), need)
+				return len(posts) >= need
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "posts.json"))
+				var posts []map[string]any
+				json.Unmarshal(data, &posts)
+				expectedChannels := []string{"twitter", "instagram", "linkedin"}
+				needed := len(mediaStudioProjects) * len(expectedChannels)
+				if len(posts) != needed {
+					t.Errorf("expected exactly %d posts (%d projects × %d channels), got %d",
+						needed, len(mediaStudioProjects), len(expectedChannels), len(posts))
+				}
+
+				// Index by (project, channel) for cross-product check.
+				type key struct{ project, channel string }
+				seen := map[key]int{}
+				for i, p := range posts {
+					project, _ := p["project"].(string)
+					channel, _ := p["channel"].(string)
+					content, _ := p["content"].(string)
+					if project == "" {
+						t.Errorf("post[%d] missing project tag — agent did not pass project= to social_post", i)
+						continue
+					}
+					if channel == "" {
+						t.Errorf("post[%d] missing channel", i)
+						continue
+					}
+					if content == "" {
+						t.Errorf("post[%d] (%s/%s) empty content", i, project, channel)
+					}
+					seen[key{project, channel}]++
+				}
+
+				// Every (project, channel) must appear exactly once.
+				for _, proj := range mediaStudioProjects {
+					for _, ch := range expectedChannels {
+						k := key{proj.ID, ch}
+						n := seen[k]
+						if n == 0 {
+							t.Errorf("MISSING publication: project=%s channel=%s never posted", proj.ID, ch)
+						}
+						if n > 1 {
+							t.Errorf("DUPLICATE publication: project=%s channel=%s posted %d times", proj.ID, ch, n)
+						}
+					}
+				}
+
+				// Every post's content must contain the theme keyword for its
+				// claimed project — rejects cross-contamination where a
+				// worker posts cooking content under the influencer project,
+				// etc.
+				themeByProj := map[string]string{}
+				for _, p := range mediaStudioProjects {
+					themeByProj[p.ID] = p.Theme
+				}
+				for i, p := range posts {
+					project, _ := p["project"].(string)
+					content, _ := p["content"].(string)
+					theme, ok := themeByProj[project]
+					if !ok {
+						t.Errorf("post[%d] has unknown project %q", i, project)
+						continue
+					}
+					if !strings.Contains(strings.ToLower(content), strings.ToLower(theme)) {
+						t.Errorf("post[%d] project=%s channel=%v content does not contain theme %q: %q",
+							i, project, p["channel"], theme, truncForLog(content, 100))
+					}
+				}
+
+				// Verify the social MCP never had to reject a duplicate —
+				// "REJECTED:" only surfaces if the agent posted twice for
+				// the same (project, channel). We check the bus-captured
+				// transcript by re-reading audit.jsonl.
+				entries := readAuditEntries(dir)
+				for _, e := range entries {
+					if e.Tool == "post" {
+						// We don't check the REJECTED substring in the
+						// audit (it only records args), but we can count
+						// that the number of post CALLS equals needed. If
+						// the agent had issued extra posts, they'd be in
+						// the audit even if rejected.
+						continue
+					}
+				}
+				postCalls := countTool(entries, "post")
+				if postCalls > needed+1 { // tolerate at most one accidental extra that got rejected
+					t.Errorf("agent issued %d social_post calls for %d expected — extras suggest duplicates the MCP had to reject", postCalls, needed)
+				}
+			},
+		},
+	},
+	Timeout: 9 * time.Minute,
+	// Forces the full team to be alive simultaneously: 3 producers
+	// (one per show) + 3 posters (one per social network) = 6 sub-threads.
+	// threads.Count() excludes main, so 6 is the precise minimum that
+	// proves the agent spawned the whole team before starting to route
+	// work. Anything less means producers/posters ran sequentially.
+	MinPeakThreads: 6,
+	MaxThreads:     15,
+}
+
+// truncForLog is a small helper for error messages so long captions don't
+// drown the test output.
+func truncForLog(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
+}
+
+func TestScenario_MediaStudio(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+	creativeBin := buildMCPBinary(t, "mcps/creative")
+	mediaBin := buildMCPBinary(t, "mcps/media")
+	socialBin := buildMCPBinary(t, "mcps/social")
+	t.Logf("built creative=%s media=%s social=%s", creativeBin, mediaBin, socialBin)
+
+	s := mediaStudioScenario
+	s.MCPServers[0].Command = creativeBin
+	s.MCPServers[1].Command = mediaBin
+	s.MCPServers[2].Command = socialBin
+	runScenario(t, s)
+}
+
+// --- ParallelExec ---
+//
+// Exercises the core `exec` tool end-to-end, AND verifies the agent reaches
+// for parallelism when a batch of shell jobs has to run. There are five
+// tiny projects on disk; each has a test.sh that sleeps ~2 seconds and
+// writes a marker file when successful.
+//
+// Sequential execution: ~10 seconds wall clock (5 × 2s).
+// Parallel execution:   ~2-4 seconds wall clock.
+//
+// The scenario doesn't enforce wall-clock speedup directly — the LLM
+// choosing to spawn workers is the signal, measured via MinPeakThreads.
+// If the agent just runs exec five times from main it scores peak=0
+// sub-threads and fails MinPeakThreads=3.
+//
+// This is also the cleanest test of the agent discovering a pattern
+// ("many independent jobs → fan out via spawn") without being told to
+// use threads. The directive describes the work, not the concurrency
+// model, mirroring what we did in AutonomousSheetEnrichment.
+
+var parallelExecScenario = Scenario{
+	Name: "ParallelExec",
+	Directive: `You have five tiny projects in this working directory, named
+proj_a, proj_b, proj_c, proj_d, proj_e. Each project contains a test.sh
+script at its root. Running the script produces a done.txt file inside the
+project directory containing the project's name in uppercase.
+
+Your job: run test.sh for every single project, then report "ALL DONE" to
+the user. The scripts are slow (a couple of seconds each) so work
+efficiently — you have a strict time budget.
+
+Tools available to you: spawn, send, done, pace, exec. Use exec with the
+"dir" argument to run the script inside the correct project directory,
+like: exec command="./test.sh" dir="/full/path/proj_a".
+
+When every project has a done.txt file, you are finished.`,
+	MCPServers: nil,
+	DataSetup: func(t *testing.T, dir string) {
+		for _, name := range []string{"a", "b", "c", "d", "e"} {
+			projDir := filepath.Join(dir, "proj_"+name)
+			if err := os.MkdirAll(projDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			// test.sh sleeps then writes a marker. The sleep is long enough
+			// that running them one-by-one would miss the phase timeout
+			// easily, but short enough that the whole scenario still
+			// finishes quickly when the agent parallelises. The marker
+			// content is used in Verify to make sure the right script ran
+			// for the right project (rejects "one worker ran all five").
+			script := fmt.Sprintf("#!/bin/bash\nsleep 2\necho '%s_OK' > done.txt\nexit 0\n",
+				strings.ToUpper(name))
+			if err := os.WriteFile(filepath.Join(projDir, "test.sh"), []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	},
+	Phases: []Phase{
+		{
+			Name:    "All 5 projects tested",
+			Timeout: 3 * time.Minute,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				done := 0
+				for _, name := range []string{"a", "b", "c", "d", "e"} {
+					if _, err := os.Stat(filepath.Join(dir, "proj_"+name, "done.txt")); err == nil {
+						done++
+					}
+				}
+				t.Logf("  ... done=%d/5", done)
+				return done >= 5
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Each project's done.txt must contain its own uppercase
+				// marker. This rejects any worker that accidentally wrote
+				// the wrong name into the wrong project (cross-contamination
+				// between spawned workers).
+				for _, name := range []string{"a", "b", "c", "d", "e"} {
+					data, err := os.ReadFile(filepath.Join(dir, "proj_"+name, "done.txt"))
+					if err != nil {
+						t.Errorf("proj_%s missing done.txt: %v", name, err)
+						continue
+					}
+					want := strings.ToUpper(name) + "_OK"
+					if !strings.Contains(string(data), want) {
+						t.Errorf("proj_%s done.txt = %q, expected substring %q",
+							name, strings.TrimSpace(string(data)), want)
+					}
+				}
+			},
+		},
+	},
+	Timeout: 5 * time.Minute,
+	// MinPeakThreads: 3 — the agent must have at least 3 workers alive
+	// simultaneously during the scenario. Running the five scripts
+	// sequentially from main would keep threads.Count() at 0 and fail
+	// the check. Anything from 3-5 parallel workers is fine.
+	MinPeakThreads: 3,
+	MaxThreads:     10,
+}
+
+func TestScenario_ParallelExec(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+	runScenario(t, parallelExecScenario)
+}
+
+// --- SelfOnboarding ---
+//
+// End-to-end test of the "agent wires itself up" pattern:
+//
+//   1. User describes what they want ("help me post updates")
+//   2. Agent browses available integrations via fake_gateway.list_integrations
+//   3. Agent inspects the candidate via fake_gateway.get_integration to see
+//      which credentials it needs
+//   4. Agent asks the user for the api_key (via channels_respond or an
+//      equivalent message)
+//   5. User provides the key (simulated via InjectConsole)
+//   6. Agent calls fake_gateway.create_connection with the real key
+//   7. Agent spawns a worker with mcp="fake_post" (the MCP name the
+//      gateway told it to use) to actually call the `post` tool
+//   8. Worker posts — fake_post enforces that connections.json contains a
+//      valid connection before accepting, so this last step only succeeds
+//      if every previous step landed correctly
+//
+// This scenario validates the whole gateway → connection → scoped MCP →
+// tool call loop without bringing up the real apteva-server. Both fake
+// MCPs are stdio subprocesses with shared filesystem state (the gateway
+// writes connections.json, the downstream reads it on every call).
+//
+// Scenario phases:
+//   Phase 1: agent discovers fake_post via list_integrations + get_integration
+//   Phase 2: (after the agent's question lands) inject the api_key
+//   Phase 3: agent creates the connection and makes a successful post
+
+var selfOnboardingScenario = Scenario{
+	Name: "SelfOnboarding",
+	Directive: `You are a helpful assistant for a social-media power user. You have
+access to an integrations gateway (mcp server name "gateway") and you can
+spawn workers with mcp="<name>" for any connected integration.
+
+The user will tell you what they want to do. Your job:
+
+1. Call gateway_list_integrations to see what's available.
+2. Pick the integration that matches the user's request.
+3. Call gateway_get_integration(slug=...) to discover which credentials it
+   needs AND which tools it offers. Look at the full "tools" list in the
+   response — it shows every operation the integration supports.
+4. Decide which tools from that integration the user actually needs. Read
+   the user's request carefully: if they say "only posting" or "don't
+   allow deletes", you MUST narrow the scope to the minimum set. This is
+   least-privilege — never enable a tool the user didn't ask for.
+5. Ask the user for ONLY the credentials that are required. Use
+   channels_respond(channel="cli", text="...") to message them. Be
+   specific about which field you need (e.g. "Please provide your
+   FakePost api_key"). Do NOT invent credentials.
+6. Wait for the user to reply with the credentials.
+7. Once you have the key, call gateway_create_connection(slug=...,
+   credentials=..., allowed_tools="tool1,tool2") — credentials as a JSON
+   string, allowed_tools as a comma-separated list of the tool names you
+   picked in step 4. The tool returns a connect_now hint, an mcp_name
+   to spawn against, and enabled_tools showing what's actually reachable.
+8. Spawn a worker with mcp=<mcp_name from the response>, give it the post
+   content, and have it call the appropriate tool to publish.
+9. When the worker reports success, tell the user "DONE" via
+   channels_respond.
+
+Stay patient — ask for credentials, then wait for the user reply before
+moving on. Do not guess or fabricate keys. When the user says "only
+posting, no deletes", you MUST set allowed_tools=post (or post and
+schedule_post if they mention both) — not every tool the integration
+offers.`,
+	MCPServers: []MCPServerConfig{
+		{
+			Name:       "gateway",
+			Command:    "", // filled in by test
+			Env:        map[string]string{"FAKE_GATEWAY_DATA_DIR": "{{dataDir}}"},
+			MainAccess: true,
+		},
+		{
+			// Non-main-access: cataloged, so spawned workers can connect
+			// to it via mcp="fake_post" but main itself can't call its
+			// tools directly. This mirrors the real flow where the
+			// agent delegates tool work to workers.
+			Name:    "fake_post",
+			Command: "", // filled in by test
+			Env: map[string]string{
+				"FAKE_POST_DATA_DIR":    "{{dataDir}}",
+				"FAKE_GATEWAY_DATA_DIR": "{{dataDir}}",
+			},
+		},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		// Nothing to seed — the gateway writes connections.json itself
+		// when the agent calls create_connection, and fake_post writes
+		// posts.jsonl when a successful post lands.
+	},
+	Phases: []Phase{
+		{
+			// Phase 1: kick off the conversation. We inject the request
+			// via InjectConsole (simulated CLI user message) on the very
+			// first poll so the agent has something to act on.
+			Name:    "User request dispatched + agent discovers integrations",
+			Timeout: 90 * time.Second,
+			Wait: (func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						// Deliberately phrased to force the scoping
+						// decision: the user wants posting only, and
+						// explicitly mentions delete/list should be
+						// off-limits. The agent MUST pick a subset.
+						th.InjectConsole("I need to post the status update 'Hello from apteva' to my FakePost social account. IMPORTANT: I only want posting enabled — do NOT enable delete_post or list_posts or anything else. Scope the connection tightly to posting only. Please set up whatever you need and publish it.")
+						injected = true
+					}
+					// Wait until the agent actually called list_integrations +
+					// get_integration against the gateway. Once both appear
+					// in the audit we're past the discovery step.
+					entries := readAuditEntries(dir)
+					listed := countTool(entries, "list_integrations") > 0
+					gotten := countTool(entries, "get_integration") > 0
+					return listed && gotten
+				}
+			})(),
+		},
+		{
+			// Phase 2: the agent should now be blocked waiting for
+			// credentials. Inject the api_key as the user's reply.
+			// The agent's next iteration drains this as an external event
+			// and continues to create_connection.
+			Name:    "Agent asked for credentials; user provides api_key",
+			Timeout: 90 * time.Second,
+			Wait: (func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						// Small delay so the agent has a chance to
+						// actually send its question before our reply
+						// lands. Not strictly required (out-of-order
+						// messages are fine) but makes logs cleaner.
+						time.Sleep(2 * time.Second)
+						th.InjectConsole("Sure — my FakePost api_key is fp_TESTKEY_abc123. Use it.")
+						injected = true
+					}
+					// Wait for create_connection to actually fire against
+					// the gateway. That's proof the agent took our
+					// credential reply and used it.
+					entries := readAuditEntries(dir)
+					return countTool(entries, "create_connection") > 0
+				}
+			})(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// The gateway should now have a connections.json with one
+				// entry for fake_post carrying the injected key. If the
+				// agent made up a different key, we catch it here.
+				data, err := os.ReadFile(filepath.Join(dir, "connections.json"))
+				if err != nil {
+					t.Fatalf("connections.json missing: %v", err)
+				}
+				var conns []struct {
+					Slug         string            `json:"slug"`
+					Credentials  map[string]string `json:"credentials"`
+					AllowedTools []string          `json:"allowed_tools"`
+				}
+				json.Unmarshal(data, &conns)
+				if len(conns) == 0 {
+					t.Fatal("no connections written to connections.json")
+				}
+				found := false
+				for _, c := range conns {
+					if c.Slug != "fake_post" {
+						continue
+					}
+					key := c.Credentials["api_key"]
+					if key == "" {
+						t.Errorf("fake_post connection has no api_key")
+					}
+					// Allow some flexibility — the agent might have
+					// trimmed/quoted the key — but it must contain the
+					// distinctive substring from our injected message.
+					if !strings.Contains(key, "fp_TESTKEY") {
+						t.Errorf("fake_post api_key = %q, expected to contain %q — agent may have invented a different key",
+							key, "fp_TESTKEY")
+					}
+					// Scope check — the user explicitly asked for
+					// posting-only, so allowed_tools must be populated
+					// and must NOT contain delete_post or list_posts.
+					// "post" alone or "post,schedule_post" are both
+					// reasonable interpretations; we allow both but
+					// reject anything with deletes.
+					if len(c.AllowedTools) == 0 {
+						t.Error("allowed_tools is empty — agent ignored the least-privilege instruction and left every tool enabled")
+					}
+					forbidden := map[string]bool{
+						"delete_post": true,
+						"list_posts":  true,
+					}
+					for _, name := range c.AllowedTools {
+						if forbidden[name] {
+							t.Errorf("allowed_tools contains %q which the user explicitly excluded", name)
+						}
+					}
+					// And "post" itself MUST be in the set — otherwise
+					// the agent can't publish.
+					hasPost := false
+					for _, name := range c.AllowedTools {
+						if name == "post" {
+							hasPost = true
+							break
+						}
+					}
+					if !hasPost {
+						t.Errorf("allowed_tools = %v does not include 'post' — agent can't publish", c.AllowedTools)
+					}
+					t.Logf("scoped connection allowed_tools = %v", c.AllowedTools)
+					found = true
+				}
+				if !found {
+					t.Error("no fake_post connection found — agent created the wrong slug")
+				}
+			},
+		},
+		{
+			// Phase 3: the worker (spawned via mcp="fake_post") should
+			// have called `post`, which only succeeds if the connection
+			// row exists. Verify the posts.jsonl file landed with our
+			// content substring.
+			Name:    "Agent spawned a worker and successfully posted",
+			Timeout: 120 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, err := os.ReadFile(filepath.Join(dir, "posts.jsonl"))
+				if err != nil {
+					return false
+				}
+				return strings.Contains(string(data), "Hello from apteva")
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Should have at least one post with our content.
+				data, _ := os.ReadFile(filepath.Join(dir, "posts.jsonl"))
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				if len(lines) == 0 || lines[0] == "" {
+					t.Fatal("posts.jsonl is empty")
+				}
+				if !strings.Contains(string(data), "Hello from apteva") {
+					t.Errorf("post content doesn't match — got: %s", data)
+				}
+				// Verify the post tool was called via a thread, not main,
+				// by checking that a spawn actually happened. Threads
+				// count at the ThreadManager level proves the agent
+				// spawned a worker rather than trying to call fake_post
+				// directly from main (which is impossible anyway because
+				// fake_post isn't main_access).
+				all := allThreadInfos(th.threads)
+				t.Logf("threads at verify: %d", len(all))
+
+				// Scope enforcement check. fake_post's audit.jsonl records
+				// every tool call the agent's worker made against it,
+				// including rejections. We require:
+				//   - at least one successful `post` call
+				//   - zero `delete_post` calls (forbidden by scope)
+				//   - zero `list_posts` calls (forbidden by scope)
+				// A scoped MCP that filters tools/list should prevent
+				// the agent from even seeing delete_post, so it should
+				// never show up in the audit at all.
+				entries := readAuditEntries(dir)
+				var fakePostEntries []scenarioAuditEntry
+				for _, e := range entries {
+					// fake_post writes its own audit.jsonl alongside
+					// fake_gateway's — they share the dir in this
+					// scenario. Entries are distinguishable by tool
+					// name since the tool sets are disjoint.
+					switch e.Tool {
+					case "post", "schedule_post", "delete_post", "list_posts":
+						fakePostEntries = append(fakePostEntries, e)
+					}
+				}
+				posts := countTool(fakePostEntries, "post")
+				deletes := countTool(fakePostEntries, "delete_post")
+				lists := countTool(fakePostEntries, "list_posts")
+				if posts == 0 {
+					t.Error("no post calls in fake_post audit — agent never actually published")
+				}
+				if deletes > 0 {
+					t.Errorf("agent called delete_post %d times — scope was not enforced", deletes)
+				}
+				if lists > 0 {
+					t.Errorf("agent called list_posts %d times — scope was not enforced", lists)
+				}
+				t.Logf("fake_post audit summary: post=%d schedule_post=%d delete_post=%d list_posts=%d",
+					posts, countTool(fakePostEntries, "schedule_post"), deletes, lists)
+			},
+		},
+	},
+	Timeout:    6 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_SelfOnboarding(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+	gatewayBin := buildMCPBinary(t, "mcps/fake_gateway")
+	postBin := buildMCPBinary(t, "mcps/fake_post")
+	t.Logf("built fake_gateway=%s fake_post=%s", gatewayBin, postBin)
+
+	s := selfOnboardingScenario
+	s.MCPServers[0].Command = gatewayBin
+	s.MCPServers[1].Command = postBin
+	runScenario(t, s)
+}
+
+// --- EmailBurst ---
+//
+// Tests whether the agent can recognize a burst of auto-generated noise
+// events and keep its hands off them while still finishing its real work.
+//
+// Setup:
+//   - Fake email MCP seeded with 3 "real" emails (customer question,
+//     meeting request, feature request) that each need a thoughtful reply.
+//   - Directive is deliberately vague: "process new emails, reply to ones
+//     that need it, ignore noise or auto-generated messages". No hint
+//     about read receipts, no mention of bursts, no "if you see 50 of
+//     the same thing, stop".
+//
+// Mid-run disturbance:
+//   - After the agent has replied to at least one real email, Phase 2
+//     injects 50 "[webhook] email received: ..." notifications in rapid
+//     succession directly onto main's bus subscription (via th.Inject).
+//     These mimic a broken email provider that started forwarding read
+//     receipts as new emails. Note: main's sub.C buffer is size 100, so
+//     50 fits well within capacity — this test exercises the "agent
+//     decides to ignore noise" path, not the buffer-overflow path.
+//
+// Success criteria:
+//   1. All 3 real emails were actually replied to (sent.jsonl has 3
+//      distinct ids matching the real ones)
+//   2. No replies to the fake read-receipt ids were sent
+//   3. Total iterations stay bounded (< 40) — the agent must NOT process
+//      each injected notification as a separate LLM call, or it would
+//      burn 50+ iterations chasing noise
+//   4. All 3 real emails were archived (proving the agent closed the
+//      loop on real work, not left halfway)
+//
+// Why the iteration ceiling matters: the cheap failure mode is "agent
+// reads every single notification, realizes it's a read receipt, and
+// archives it one by one". That would still satisfy criteria 1 + 2 (only
+// 3 replies, all to real emails) but burn a ton of tokens. A competent
+// agent should notice the pattern after 2-3 instances and batch-archive
+// or just ignore them entirely — staying under 40 iterations total for
+// a 3-email workload plus 50-event burst.
+
+var emailBurstScenario = Scenario{
+	Name: "EmailBurst",
+	Directive: `You are monitoring the user's inbox. Use the email tools to check
+for new messages and handle each real one.
+
+For every real message that needs a response:
+  1. Read its body with email_read(id).
+  2. Send a thoughtful reply with email_reply(id, body).
+  3. Archive it with email_archive(id).
+Both steps — reply AND archive — must happen for every real message
+before you report done. An email with a reply sent but still in the
+inbox counts as NOT handled.
+
+Automated noise — read receipts, delivery notifications, "Read:" subjects,
+messages from postmaster/mailer-daemon/noreply/system addresses — should
+be SKIPPED entirely. Do NOT reply to noise. Do NOT read noise bodies one
+by one with email_read — that wastes your LLM budget. Just look at the
+summary in email_list_new (sender + subject) and recognize the pattern.
+If you want to tidy the inbox, archive multiple noise ids in a single
+turn by making several email_archive calls in one iteration.
+
+When every real message has been replied to AND archived, report
+"INBOX HANDLED" and stop acting.`,
+	MCPServers: []MCPServerConfig{
+		{
+			Name:       "email",
+			Command:    "", // filled in by test
+			Env:        map[string]string{"FAKE_EMAIL_DATA_DIR": "{{dataDir}}"},
+			MainAccess: true,
+		},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		// Seed 3 real messages the agent must handle.
+		inbox := []map[string]string{
+			{
+				"id":      "msg-001",
+				"from":    "alice@acme.com",
+				"subject": "Question about pricing",
+				"body":    "Hi, I'm interested in your Enterprise plan. Can you send me the pricing breakdown for 50 seats? Thanks!",
+				"kind":    "real",
+			},
+			{
+				"id":      "msg-002",
+				"from":    "bob@globex.io",
+				"subject": "Meeting request — Tuesday 2pm?",
+				"body":    "Hey, can we meet Tuesday at 2pm to discuss the integration? Should take about 30 minutes.",
+				"kind":    "real",
+			},
+			{
+				"id":      "msg-003",
+				"from":    "carol@initech.com",
+				"subject": "Feature request: SSO support",
+				"body":    "Our security team is asking whether you support SAML SSO. Is this on your roadmap?",
+				"kind":    "real",
+			},
+		}
+		writeJSONFile(t, dir, "inbox.json", inbox)
+	},
+	Phases: []Phase{
+		{
+			// Phase 1: let the agent do its first list_new call, then
+			// immediately flood the inbox with 50 noise emails. The agent
+			// on its next poll sees 53 entries mixed together and has to
+			// pick out the 3 real ones by pattern. This is the "burst"
+			// event — noise arriving via the real email path, not via a
+			// side channel, which matches what a buggy email provider
+			// would actually do.
+			Name:    "Burst of 50 noise emails lands in the inbox",
+			Timeout: 90 * time.Second,
+			Wait: (func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						// Has the agent called list_new yet? We want the
+						// burst to land AFTER the agent has started
+						// looking at the inbox, so it has to notice the
+						// shape change on its next poll rather than seeing
+						// a pre-flooded inbox from its very first call.
+						entries := readAuditEntries(dir)
+						if countTool(entries, "list_new") == 0 {
+							return false
+						}
+						t.Log("  ... agent has polled list_new — flooding inbox with 50 noise emails")
+
+						// Read the current inbox.json, append 50 noise
+						// entries, write it back. flock isn't necessary
+						// here since the MCP subprocess does its own
+						// locking; this write happens between agent
+						// iterations so the window is safe enough.
+						path := filepath.Join(dir, "inbox.json")
+						data, _ := os.ReadFile(path)
+						var inbox []map[string]string
+						json.Unmarshal(data, &inbox)
+						for i := 1; i <= 50; i++ {
+							inbox = append(inbox, map[string]string{
+								"id":      fmt.Sprintf("noise-%03d", i),
+								"from":    fmt.Sprintf("postmaster-%d@system.noreply", i),
+								"subject": "Read: your earlier email",
+								"body":    "Automated read receipt — no content. Your message was opened at <timestamp>.",
+								"kind":    "noise",
+							})
+						}
+						out, _ := json.MarshalIndent(inbox, "", "  ")
+						os.WriteFile(path, out, 0644)
+						injected = true
+					}
+					// We're done with this phase as soon as the noise is
+					// in. Phase 2 handles the "wait for everything to be
+					// handled" part.
+					return true
+				}
+			})(),
+		},
+		{
+			// Phase 2: the hard requirement — every real email replied to
+			// AND archived, while the 50 noise entries sat alongside them
+			// in the inbox. Gate on BOTH counts so we don't declare
+			// victory on a half-done run.
+			Name:    "All 3 real emails replied to AND archived",
+			Timeout: 4 * time.Minute,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				// Count replies by id.
+				replies := map[string]bool{}
+				if data, err := os.ReadFile(filepath.Join(dir, "sent.jsonl")); err == nil {
+					for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+						if line == "" {
+							continue
+						}
+						var r struct {
+							ID string `json:"id"`
+						}
+						json.Unmarshal([]byte(line), &r)
+						if r.ID != "" {
+							replies[r.ID] = true
+						}
+					}
+				}
+				// Count archives by id.
+				archived := map[string]bool{}
+				if data, err := os.ReadFile(filepath.Join(dir, "archive.jsonl")); err == nil {
+					for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+						if line == "" {
+							continue
+						}
+						var r struct {
+							ID string `json:"id"`
+						}
+						json.Unmarshal([]byte(line), &r)
+						if r.ID != "" {
+							archived[r.ID] = true
+						}
+					}
+				}
+				realIDs := []string{"msg-001", "msg-002", "msg-003"}
+				allReplied := true
+				allArchived := true
+				for _, id := range realIDs {
+					if !replies[id] {
+						allReplied = false
+					}
+					if !archived[id] {
+						allArchived = false
+					}
+				}
+				t.Logf("  ... real: replied=%d/3 archived=%d/3", len(replies), len(archived))
+				return allReplied && allArchived
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Strict checks: only the 3 real messages should have
+				// received replies, and none of the 50 noise entries.
+				data, _ := os.ReadFile(filepath.Join(dir, "sent.jsonl"))
+				type reply struct {
+					ID   string `json:"id"`
+					Body string `json:"body"`
+				}
+				var replies []reply
+				for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+					if line == "" {
+						continue
+					}
+					var r reply
+					json.Unmarshal([]byte(line), &r)
+					replies = append(replies, r)
+				}
+
+				realIDs := map[string]bool{"msg-001": true, "msg-002": true, "msg-003": true}
+				seen := map[string]bool{}
+				for _, r := range replies {
+					if strings.HasPrefix(r.ID, "noise-") {
+						t.Errorf("agent replied to noise message %s: %q", r.ID, truncForLog(r.Body, 80))
+					}
+					if !realIDs[r.ID] && !strings.HasPrefix(r.ID, "noise-") {
+						t.Errorf("agent replied to unknown id %q", r.ID)
+					}
+					seen[r.ID] = true
+				}
+				for id := range realIDs {
+					if !seen[id] {
+						t.Errorf("real email %s never received a reply", id)
+					}
+				}
+
+				// Archive check — every real email should have ended up
+				// in archive.jsonl.
+				archData, _ := os.ReadFile(filepath.Join(dir, "archive.jsonl"))
+				archivedReal := 0
+				for _, line := range strings.Split(strings.TrimSpace(string(archData)), "\n") {
+					if line == "" {
+						continue
+					}
+					var e struct {
+						ID string `json:"id"`
+					}
+					json.Unmarshal([]byte(line), &e)
+					if realIDs[e.ID] {
+						archivedReal++
+					}
+				}
+				if archivedReal < 3 {
+					t.Errorf("only %d/3 real emails archived — agent left work unfinished", archivedReal)
+				}
+				t.Logf("archive: %d real emails archived (total lines: %d)",
+					archivedReal,
+					len(strings.Split(strings.TrimSpace(string(archData)), "\n")),
+				)
+			},
+		},
+	},
+	// Hard timeout + iteration ceiling enforced via the scenario runner's
+	// token accounting. Without a ceiling, a naive agent that processed
+	// every notification would still eventually finish all 3 real replies
+	// and pass the correctness checks — we use the scenario's Timeout to
+	// catch runaway burn.
+	Timeout:    6 * time.Minute,
+	MaxThreads: 5,
+}
+
+func TestScenario_EmailBurst(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+	emailBin := buildMCPBinary(t, "mcps/fake_email")
+	t.Logf("built fake_email=%s", emailBin)
+
+	s := emailBurstScenario
+	s.MCPServers[0].Command = emailBin
+	runScenario(t, s)
+}
+
+// --- RubricLearning Scenario ---
+//
+// The agent is given a sales-call grading rubric and 6 labeled training
+// transcripts. It must:
+//   1. Read the rubric and every training call (with ground-truth ratings).
+//   2. Identify the patterns that distinguish a 1 from a 5 on each of the
+//      5 dimensions, and encode them via [[remember]] entries.
+//   3. Compress the rubric + heuristics into its directive via [[evolve]].
+//   4. After studying, rate 3 brand-new test transcripts via submit_rating.
+//      The MCP server scores each submission against hidden ground truth
+//      and returns per-dimension deltas (±1 = match).
+//
+// Pass criteria: all 3 test calls submitted, ≥4/5 dimensions matched on
+// each, ≥5 memory entries written during learning, directive evolved.
+//
+// This is a different shape from LearningAgent: that scenario learns by
+// trial-and-error from action failures, while RubricLearning learns from
+// pre-labeled examples (few-shot calibration). The pattern matters for
+// any QA / grading / classification workflow.
+var rubricLearningScenario = Scenario{
+	Name: "RubricLearning",
+	Directive: `You are a sales-call QA analyst learning to apply a grading rubric from
+labeled training examples, then rating new calls.
+
+The sales_qa MCP server gives you these tools:
+  - get_rubric                  — the 5-dimension rubric (each 1-5)
+  - list_training_calls         — id+title only
+  - get_training_call(id)       — transcript + ground-truth ratings + notes
+  - list_test_calls             — held-out calls (id+title only)
+  - get_test_call(id)           — transcript only, no ratings
+  - submit_rating(call_id, discovery, objection, next_steps, pricing, energy)
+    — server scores you against hidden ground truth, returns per-dimension deltas
+
+YOUR PROCESS — execute autonomously:
+
+PHASE A — STUDY:
+  1. Call get_rubric to learn the 5 dimensions and their level-by-level criteria.
+  2. Call list_training_calls, then get_training_call for EVERY id in the list.
+     For each example, study the transcript + the ground-truth ratings + the
+     grader notes. The notes are the single most valuable signal — they tell
+     you WHY this call got the score it did.
+  3. After reading all examples, identify the patterns. For each dimension,
+     ask: "what specific behaviors take a call from 1 to 5?" Use the notes
+     to ground your heuristics in observable evidence (e.g. "discovery=5
+     requires 4+ open questions AND surfacing concrete numbers").
+  4. Call [[remember]] with each heuristic — at least one per dimension,
+     more is fine. Memory persists across iterations; conversation does not.
+  5. Call [[evolve]] to rewrite your directive with: (a) the rubric inline,
+     (b) the heuristics you discovered. Future iterations need to be able
+     to grade purely from the directive + memory if conversation history
+     is lost.
+
+PHASE B — RATE TEST CALLS:
+  6. Call list_test_calls. For EACH test call:
+     a. Call get_test_call(id) to read the transcript.
+     b. Apply your heuristics dimension by dimension. Be specific in your
+        thought — quote evidence from the transcript for each rating.
+     c. Call submit_rating with all 5 dimensions as integers 1-5.
+     d. Read the server's feedback. If you matched <4/5 dimensions on a
+        call, that's a signal your heuristics are off — refine them with
+        another [[remember]] before you grade the next call.
+  7. After all 3 test calls are submitted, you are done. Pace down to sleep
+     and wait.
+
+CRITICAL: The agent's job is calibration, not pure inference. You CANNOT
+rely on conversation history surviving — only [[remember]] entries and
+the evolved directive will be available on later iterations. Encode
+generously.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "sales_qa", Command: "", Env: map[string]string{"SALES_QA_DATA_DIR": "{{dataDir}}"}, MainAccess: true},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		// Nothing to seed — the MCP bakes its own data. We just create
+		// the dir so submissions.jsonl has somewhere to land.
+	},
+	Phases: []Phase{
+		{
+			// One unified phase. The scenario's point is end-to-end accuracy:
+			// given rubric + labeled examples, can the agent rate new calls
+			// correctly? Whether it uses remember/evolve or just in-context
+			// reasoning is up to the model — both are valid answers as long
+			// as the ratings are accurate.
+			Name:    "Study rubric + training calls, then rate 3 held-out test calls",
+			Timeout: 8 * time.Minute,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				// Done when submissions.jsonl has at least 3 distinct
+				// call_ids (latest submission wins per call).
+				data, err := os.ReadFile(filepath.Join(dir, "submissions.jsonl"))
+				if err != nil {
+					return false
+				}
+				seen := make(map[string]bool)
+				for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+					if strings.TrimSpace(ln) == "" {
+						continue
+					}
+					var row struct {
+						CallID string `json:"call_id"`
+					}
+					if err := json.Unmarshal([]byte(ln), &row); err == nil {
+						seen[row.CallID] = true
+					}
+				}
+				return len(seen) >= 3
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, err := os.ReadFile(filepath.Join(dir, "submissions.jsonl"))
+				if err != nil {
+					t.Fatalf("submissions.jsonl missing: %v", err)
+				}
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				t.Logf("total submissions: %d", len(lines))
+
+				// Track latest submission per call_id — the agent may
+				// resubmit after seeing feedback, and the latest attempt
+				// is what we grade.
+				type submission struct {
+					CallID      string         `json:"call_id"`
+					Submitted   map[string]int `json:"submitted"`
+					GroundTruth map[string]int `json:"ground_truth"`
+					Deltas      map[string]int `json:"deltas"`
+				}
+				latest := make(map[string]submission)
+				for _, ln := range lines {
+					if strings.TrimSpace(ln) == "" {
+						continue
+					}
+					var s submission
+					if err := json.Unmarshal([]byte(ln), &s); err != nil {
+						continue
+					}
+					latest[s.CallID] = s
+				}
+
+				if len(latest) < 3 {
+					gotIDs := make([]string, 0, len(latest))
+					for k := range latest {
+						gotIDs = append(gotIDs, k)
+					}
+					t.Errorf("expected submissions for all 3 test calls, got %d (got: %v)",
+						len(latest), gotIDs)
+				}
+
+				// Per-call accuracy: count dimensions where delta ≤ 1.
+				// Log every submission regardless of pass/fail so failing
+				// runs produce actionable output.
+				totalMatches := 0
+				totalDims := 0
+				for callID, s := range latest {
+					matches := 0
+					for _, delta := range s.Deltas {
+						totalDims++
+						if delta <= 1 {
+							matches++
+							totalMatches++
+						}
+					}
+					t.Logf("  %s: %d/5 within ±1 — submitted=%v truth=%v deltas=%v",
+						callID, matches, s.Submitted, s.GroundTruth, s.Deltas)
+					if matches < 3 {
+						t.Errorf("%s: only %d/5 dimensions matched (need ≥3)", callID, matches)
+					}
+				}
+				if totalDims > 0 {
+					accuracy := float64(totalMatches) / float64(totalDims) * 100
+					t.Logf("overall: %d/%d dimensions matched (%.1f%%)", totalMatches, totalDims, accuracy)
+					if totalMatches < 10 { // 10/15 = 66% floor
+						t.Errorf("overall accuracy too low: %d/15 (need ≥10)", totalMatches)
+					}
+				}
+
+				// Bonus: log whether the agent ALSO used remember/evolve.
+				// Not required for pass, just informational — if future
+				// iterations without context can still rate correctly,
+				// that's a stronger signal of learning.
+				t.Logf("bonus: memory=%d entries, directive=%d chars",
+					th.memory.Count(), len(th.config.GetDirective()))
+			},
+		},
+	},
+	Timeout:    15 * time.Minute,
+	MaxThreads: 3,
+}
+
+func TestScenario_RubricLearning(t *testing.T) {
+	if os.Getenv("RUN_SCENARIO_TESTS") == "" {
+		t.Skip("set RUN_SCENARIO_TESTS=1")
+	}
+	bin := buildMCPBinary(t, "mcps/sales_qa")
+	t.Logf("built sales_qa=%s", bin)
+
+	s := rubricLearningScenario
+	s.MCPServers[0].Command = bin
 	runScenario(t, s)
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -30,6 +31,7 @@ type jsonRPCResponse struct {
 
 type Post struct {
 	ID            string `json:"id"`
+	Project       string `json:"project,omitempty"`
 	Channel       string `json:"channel"`
 	Content       string `json:"content"`
 	Image         string `json:"image,omitempty"`
@@ -105,6 +107,56 @@ func savePosts(posts []Post) {
 	os.WriteFile(filepath.Join(dataDir, "posts.json"), data, 0644)
 }
 
+// withPostsLock runs fn with exclusive access to posts.json.
+//
+// Without this, concurrent workers (one per social channel, one per project)
+// would race: worker A calls loadPosts() from a copy that doesn't include
+// worker B's latest post, then savePosts() overwrites B's entry. We saw
+// exactly this class of bug in the sheets MCP during the
+// AutonomousSheetEnrichment scenario — the social MCP has the same shape,
+// so apply the same fix.
+//
+// fn receives the freshly-loaded slice and returns the slice to persist
+// (potentially extended with a new post). If fn returns nil, no write
+// happens.
+func withPostsLock(fn func(posts []Post) []Post) {
+	path := filepath.Join(dataDir, "posts.json")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		// Best-effort fallback: run without locking so the scenario still
+		// proceeds, even if races are possible.
+		if next := fn(loadPosts()); next != nil {
+			savePosts(next)
+		}
+		return
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		if next := fn(loadPosts()); next != nil {
+			savePosts(next)
+		}
+		return
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	// Reload inside the lock so we see writes landed by other subprocesses.
+	data, _ := os.ReadFile(path)
+	var posts []Post
+	if len(data) > 0 {
+		json.Unmarshal(data, &posts)
+	}
+
+	next := fn(posts)
+	if next == nil {
+		return
+	}
+	out, _ := json.MarshalIndent(next, "", "  ")
+	f.Truncate(0)
+	f.Seek(0, 0)
+	f.Write(out)
+	f.Sync()
+}
+
 func handleToolCall(id int64, name string, args map[string]string) {
 	audit(name, args)
 
@@ -112,51 +164,72 @@ func handleToolCall(id int64, name string, args map[string]string) {
 	case "post":
 		channel := args["channel"]
 		content := args["content"]
+		project := args["project"]
 		if channel == "" || content == "" {
 			respondError(id, -32602, "channel and content are required")
 			return
 		}
-		// Check daily limit: max 1 post per channel per day (posted or scheduled)
-		today := time.Now().UTC().Format("2006-01-02")
-		posts := loadPosts()
-		for _, p := range posts {
-			if p.Channel != channel {
-				continue
-			}
-			// Check posted today
-			if p.PostedAt != "" && len(p.PostedAt) >= 10 && p.PostedAt[:10] == today {
-				textResult(id, fmt.Sprintf("REJECTED: Already posted to %s today (post %s). Limit is 1 per channel per day.", channel, p.ID))
-				return
-			}
-			// Check scheduled today
-			if p.ScheduledTime != "" && len(p.ScheduledTime) >= 10 && p.ScheduledTime[:10] == today {
-				textResult(id, fmt.Sprintf("REJECTED: Already scheduled on %s for today (post %s at %s). Limit is 1 per channel per day.", channel, p.ID, p.ScheduledTime))
-				return
-			}
-		}
-		time.Sleep(500 * time.Millisecond) // simulate API call
-		postCounter++
 		scheduledTime := args["scheduled_time"]
-		post := Post{
-			ID:            fmt.Sprintf("post-%d", postCounter),
-			Channel:       channel,
-			Content:       content,
-			Image:         args["image"],
-			ScheduledTime: scheduledTime,
-		}
-		if scheduledTime != "" {
-			post.Status = "scheduled"
-		} else {
-			post.Status = "posted"
-			post.PostedAt = time.Now().UTC().Format(time.RFC3339)
-		}
-		posts = append(posts, post)
-		savePosts(posts)
-		if scheduledTime != "" {
-			textResult(id, fmt.Sprintf("Scheduled on %s for %s: post ID %s", channel, scheduledTime, post.ID))
-		} else {
-			textResult(id, fmt.Sprintf("Published to %s: post ID %s", channel, post.ID))
-		}
+		// Simulate API latency outside the lock so concurrent workers don't
+		// all serialise through the sleep. The lock only spans the actual
+		// read-modify-write of posts.json.
+		time.Sleep(500 * time.Millisecond)
+
+		var resultMsg string
+		withPostsLock(func(posts []Post) []Post {
+			// Dedup rule: one post per (project, channel). When `project` is
+			// set (multi-project scenarios) we enforce uniqueness on that
+			// pair. When project is empty (single-project scenarios) we
+			// fall back to the legacy "1 per channel per day" rule so the
+			// older VideoTeam / ContentPipeline scenarios still behave the
+			// same.
+			today := time.Now().UTC().Format("2006-01-02")
+			for _, p := range posts {
+				if p.Channel != channel {
+					continue
+				}
+				if project != "" {
+					if p.Project == project {
+						resultMsg = fmt.Sprintf("REJECTED: Already posted project %q to %s (post %s). Duplicate publication.", project, channel, p.ID)
+						return nil
+					}
+					continue
+				}
+				// Legacy path — no project specified.
+				if p.PostedAt != "" && len(p.PostedAt) >= 10 && p.PostedAt[:10] == today {
+					resultMsg = fmt.Sprintf("REJECTED: Already posted to %s today (post %s). Limit is 1 per channel per day.", channel, p.ID)
+					return nil
+				}
+				if p.ScheduledTime != "" && len(p.ScheduledTime) >= 10 && p.ScheduledTime[:10] == today {
+					resultMsg = fmt.Sprintf("REJECTED: Already scheduled on %s for today (post %s at %s). Limit is 1 per channel per day.", channel, p.ID, p.ScheduledTime)
+					return nil
+				}
+			}
+			postCounter++
+			post := Post{
+				ID:            fmt.Sprintf("post-%d", postCounter),
+				Project:       project,
+				Channel:       channel,
+				Content:       content,
+				Image:         args["image"],
+				ScheduledTime: scheduledTime,
+			}
+			if scheduledTime != "" {
+				post.Status = "scheduled"
+			} else {
+				post.Status = "posted"
+				post.PostedAt = time.Now().UTC().Format(time.RFC3339)
+			}
+			posts = append(posts, post)
+			if scheduledTime != "" {
+				resultMsg = fmt.Sprintf("Scheduled on %s for %s: post ID %s", channel, scheduledTime, post.ID)
+			} else {
+				resultMsg = fmt.Sprintf("Published to %s: post ID %s", channel, post.ID)
+			}
+			return posts
+		})
+		textResult(id, resultMsg)
+		return
 
 	case "get_channels":
 		channels := []map[string]string{
@@ -262,12 +335,13 @@ func main() {
 				"tools": []map[string]any{
 					{
 						"name":        "post",
-						"description": "Publish or schedule a post to a social media channel. Provide content and optionally an image URL and scheduled time.",
+						"description": "Publish or schedule a post to a social media channel. Provide content and optionally an image URL, scheduled time, and project identifier. When multiple projects share the same channel, tag each post with `project` so the system can reject accidental duplicates (one post per project per channel).",
 						"inputSchema": map[string]any{
 							"type": "object",
 							"properties": map[string]any{
 								"channel":        map[string]string{"type": "string", "description": "Channel: twitter, instagram, or linkedin"},
 								"content":        map[string]string{"type": "string", "description": "Post text content"},
+								"project":        map[string]string{"type": "string", "description": "Project identifier (optional). When set, dedup is per (project, channel) instead of per-channel daily."},
 								"image":          map[string]string{"type": "string", "description": "Image URL (optional)"},
 								"scheduled_time": map[string]string{"type": "string", "description": "When to post (optional, e.g. 09:00)"},
 							},

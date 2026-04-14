@@ -41,8 +41,8 @@ type ComputerConfig struct {
 	URL       string `json:"url,omitempty"`        // for "service" type
 	APIKey    string `json:"api_key,omitempty"`    // for "browserbase"
 	ProjectID string `json:"project_id,omitempty"` // for "browserbase"
-	Width     int    `json:"width,omitempty"`      // display width (default 1280)
-	Height    int    `json:"height,omitempty"`     // display height (default 800)
+	Width     int    `json:"width,omitempty"`      // display width (default 2000)
+	Height    int    `json:"height,omitempty"`     // display height (default 1000)
 }
 
 type Config struct {

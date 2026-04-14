@@ -125,6 +125,14 @@ func createProviderByName(name string) LLMProvider {
 			host = "http://localhost:11434"
 		}
 		return NewOllamaProvider(host)
+	case "nvidia":
+		// NIM (NVIDIA Inference Microservices) — OpenAI-compatible REST
+		// endpoint hosted at integrate.api.nvidia.com. See
+		// provider_openai.go:NewNvidiaProvider for the default model
+		// slugs.
+		if key := os.Getenv("NVIDIA_API_KEY"); key != "" {
+			return NewNvidiaProvider(key)
+		}
 	}
 	return nil
 }
@@ -370,6 +378,9 @@ func availableProviders() []LLMProvider {
 	}
 	if host := os.Getenv("OLLAMA_HOST"); host != "" {
 		providers = append(providers, NewOllamaProvider(host))
+	}
+	if key := os.Getenv("NVIDIA_API_KEY"); key != "" {
+		providers = append(providers, NewNvidiaProvider(key))
 	}
 	return providers
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -75,9 +76,14 @@ func (t *Telemetry) Stop() {
 	close(t.quit)
 }
 
+// generateID returns a monotonically-increasing unique event id.
+// Uses atomic increment so concurrent emit calls never collide on the
+// same (ms, seq) tuple — previously this was a plain `t.seq++` outside
+// the mutex, which occasionally produced duplicate ids under parallel
+// thread dispatch and confused the dashboard's dedup.
 func (t *Telemetry) generateID() string {
-	t.seq++
-	return fmt.Sprintf("%d-%d", time.Now().UnixMilli(), t.seq)
+	seq := atomic.AddInt64(&t.seq, 1)
+	return fmt.Sprintf("%d-%d", time.Now().UnixMilli(), seq)
 }
 
 // Emit records a telemetry event (stored + forwarded to server).

@@ -90,10 +90,22 @@ type threadJSON struct {
 
 func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	logMsg("API", "GET /threads")
+	// Main's MCP list = only the servers whose tools are actually live on
+	// main's registry (t.mcpServers). Cataloged servers (t.mcpCatalog) are
+	// deliberately excluded — main can't call them directly, so listing
+	// them under main would mislead the user into thinking the agent is
+	// using them. Sub-threads that spawn with mcp="X" are the ones that
+	// actually use catalog entries, and those appear in their own rows
+	// via tm.List() below with their own MCPNames populated.
+	var mainMCPs []string
+	for _, srv := range a.thinker.mcpServers {
+		mainMCPs = append(mainMCPs, srv.GetName())
+	}
 	// Always include main
 	out := []threadJSON{{
 		ID:        "main",
 		Directive: a.thinker.config.GetDirective(),
+		MCPNames:  mainMCPs,
 		Iteration: a.thinker.iteration,
 		Rate:      a.thinker.rate.String(),
 		Model:     a.thinker.model.String(),
@@ -413,14 +425,30 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				a.thinker.config.mu.Unlock()
 				a.thinker.config.Save()
 			} else {
-				// Connect new computer
+				// Pick a provider-aware viewport default when the caller
+				// didn't specify one. Anthropic's computer-use tool was
+				// trained on 1024×768 and Anthropic's docs specifically
+				// recommend keeping the screenshot at that exact size for
+				// best click accuracy. For non-Anthropic providers (Kimi,
+				// Gemini, etc.) we use 1600×800 — exact 2:1 widescreen,
+				// wide enough for desktop layouts but small enough to
+				// keep screenshot token counts modest on non-native
+				// vision models.
+				width, height := body.Computer.Width, body.Computer.Height
+				if width == 0 || height == 0 {
+					if a.thinker.provider != nil && a.thinker.provider.Name() == "anthropic" {
+						width, height = 1024, 768
+					} else {
+						width, height = 1600, 800
+					}
+				}
 				comp, err := aptcomputer.New(aptcomputer.Config{
 					Type:      body.Computer.Type,
 					URL:       body.Computer.URL,
 					APIKey:    body.Computer.APIKey,
 					ProjectID: body.Computer.ProjectID,
-					Width:     body.Computer.Width,
-					Height:    body.Computer.Height,
+					Width:     width,
+					Height:    height,
 				})
 				if err != nil {
 					http.Error(w, fmt.Sprintf("computer: %v", err), http.StatusBadRequest)
@@ -439,11 +467,27 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.MCPServers != nil {
 			a.reconcileMCP(body.MCPServers)
-			// Update MCP catalog for lazy-loading prompt
-			a.thinker.mcpCatalog = nil
-			for _, srv := range a.thinker.mcpServers {
-				if tools, err := srv.ListTools(); err == nil {
-					a.thinker.mcpCatalog = append(a.thinker.mcpCatalog, MCPServerInfo{Name: srv.GetName(), ToolCount: len(tools)})
+			// DO NOT rebuild t.mcpCatalog here — reconcileMCP already
+			// manages it correctly (populates for non-main-access
+			// servers in the connect pass at reconcileMCP:690, prunes
+			// removed entries in the prune pass). The old code here
+			// wiped the catalog and rebuilt it ONLY from t.mcpServers
+			// (the main-access list), which had the effect of deleting
+			// every catalog entry on every PUT /config — meaning an
+			// agent whose catalog MCPs were attached at runtime never
+			// saw them in its system prompt.
+			//
+			// Rebuild the system prompt so the updated `[AVAILABLE MCP
+			// SERVERS]` block reaches the LLM on its next iteration.
+			// Without this, the agent's system prompt stays frozen at
+			// the boot-time state and new catalog MCPs attached via
+			// dashboard are invisible to main. Use rebuildPrompt (which
+			// is set up at thinker init) so all the pieces — directive,
+			// core docs, providers, threads, MCPs — are consistent.
+			if a.thinker.rebuildPrompt != nil {
+				a.thinker.messages[0] = Message{
+					Role:    "system",
+					Content: a.thinker.rebuildPrompt(""),
 				}
 			}
 		}

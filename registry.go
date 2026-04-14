@@ -145,21 +145,35 @@ func (tr *ToolRegistry) registerDefaults() {
 		MainOnly:    true,
 	})
 
-	// Discoverable tools — retrieved by RAG
-	tr.Register(&ToolDef{
-		Name:        "web",
-		Description: "Fetch a URL from the internet and return its text content. Use for research, looking up information, checking websites.",
-		Syntax:      `[[web url="https://example.com"]]`,
-		Rules:       `Only parameter is url. Results arrive as events in your next thought.`,
-		Handler:     func(args map[string]string) ToolResponse { return ToolResponse{Text: webTool(args)} },
-	})
-	tr.Register(&ToolDef{
-		Name:        "exec",
-		Description: "Execute a shell command on the host machine and return stdout+stderr. Use for system administration, checking logs, running scripts, managing containers, inspecting files, git operations, deployments.",
-		Syntax:      `[[exec command="ls -la /app" timeout="30" dir="/home"]]`,
-		Rules:       `command: the shell command to run. timeout: seconds (default 30, max 300). dir: optional working directory. No interactive commands (no vim, top, less). Output truncated to 4000 chars.`,
-		Handler:     func(args map[string]string) ToolResponse { return ToolResponse{Text: execTool(args)} },
-	})
+	// Local tools (web + exec) are intentionally NOT registered by default
+	// anymore. They're dangerous enough (raw shell access, arbitrary HTTP
+	// fetch to arbitrary hosts) that exposing them on every instance by
+	// default is a security footgun. A follow-up will add a per-instance
+	// `enabled_local_tools` config field and wire it through the server +
+	// dashboard so the user has to explicitly opt in. Until then, these
+	// lines stay commented out and any scenario or instance that needs
+	// them must be updated deliberately.
+	//
+	// Code intentionally preserved below for quick re-enable during
+	// debugging — uncomment both Register calls to restore the old
+	// always-on behaviour.
+	//
+	// tr.Register(&ToolDef{
+	// 	Name:        "web",
+	// 	Description: "Fetch a URL from the internet and return its text content. Use for research, looking up information, checking websites.",
+	// 	Syntax:      `[[web url="https://example.com"]]`,
+	// 	Rules:       `Only parameter is url. Results arrive as events in your next thought.`,
+	// 	Handler:     func(args map[string]string) ToolResponse { return ToolResponse{Text: webTool(args)} },
+	// })
+	// tr.Register(&ToolDef{
+	// 	Name:        "exec",
+	// 	Description: "Execute a shell command on the host machine and return stdout+stderr. Use for system administration, checking logs, running scripts, managing containers, inspecting files, git operations, deployments.",
+	// 	Syntax:      `[[exec command="ls -la /app" timeout="30" dir="/home"]]`,
+	// 	Rules:       `command: the shell command to run. timeout: seconds (default 30, max 300). dir: optional working directory. No interactive commands (no vim, top, less). Output truncated to 4000 chars.`,
+	// 	Handler:     func(args map[string]string) ToolResponse { return ToolResponse{Text: execTool(args)} },
+	// })
+	_ = webTool  // silence unused-function warnings — keep the impls
+	_ = execTool // around so re-enabling is just uncommenting above
 }
 
 // NewScopedRegistry creates a minimal registry containing only the specified tools
