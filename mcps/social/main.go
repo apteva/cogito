@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -172,8 +173,17 @@ func handleToolCall(id int64, name string, args map[string]string) {
 		scheduledTime := args["scheduled_time"]
 		// Simulate API latency outside the lock so concurrent workers don't
 		// all serialise through the sleep. The lock only spans the actual
-		// read-modify-write of posts.json.
-		time.Sleep(500 * time.Millisecond)
+		// read-modify-write of posts.json. Latency is configurable via
+		// SOCIAL_POST_LATENCY_MS so scenario tests can force slow-tool
+		// behaviour and exercise the thinker's iter-boundary wait barrier
+		// + placeholder injection path.
+		latencyMs := 500
+		if envMs := os.Getenv("SOCIAL_POST_LATENCY_MS"); envMs != "" {
+			if parsed, perr := strconv.Atoi(envMs); perr == nil && parsed >= 0 {
+				latencyMs = parsed
+			}
+		}
+		time.Sleep(time.Duration(latencyMs) * time.Millisecond)
 
 		var resultMsg string
 		withPostsLock(func(posts []Post) []Post {

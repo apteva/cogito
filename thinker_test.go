@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -227,5 +228,194 @@ func TestThinkerStop(t *testing.T) {
 		// ok
 	default:
 		t.Error("quit channel should be closed")
+	}
+}
+
+// TestWaitForPendingTools_DrainsAllBeforeDeadline verifies that the
+// iter-boundary barrier drains every pending tool result that arrives
+// before the deadline. Baseline happy-path: 4 parallel tools all
+// finish within the window, waitForPendingTools returns with every
+// result appended and pendingTools empty.
+func TestWaitForPendingTools_DrainsAllBeforeDeadline(t *testing.T) {
+	bus := NewEventBus()
+	thinker := &Thinker{
+		bus:      bus,
+		sub:      bus.Subscribe("test", 100),
+		threadID: "test",
+		quit:     make(chan struct{}),
+	}
+
+	// Four in-flight tool dispatches.
+	ids := []string{"call-A", "call-B", "call-C", "call-D"}
+	for _, id := range ids {
+		thinker.pendingTools.Store(id, "mock_tool")
+	}
+
+	// Goroutines simulate each tool finishing at staggered times within
+	// the 3s window, publishing a ToolResult and clearing pendingTools.
+	for i, id := range ids {
+		go func(id string, delay time.Duration) {
+			time.Sleep(delay)
+			bus.Publish(Event{
+				Type: EventInbox, To: "test",
+				ToolResult: &ToolResult{CallID: id, Content: "ok-" + id},
+			})
+			thinker.pendingTools.Delete(id)
+		}(id, time.Duration(50+i*50)*time.Millisecond)
+	}
+
+	var toolResults []ToolResult
+	var consumed []string
+	var mediaParts []ContentPart
+	thinker.waitForPendingTools(&toolResults, &consumed, &mediaParts, 3*time.Second)
+
+	if len(toolResults) != 4 {
+		t.Fatalf("expected 4 tool results after drain, got %d", len(toolResults))
+	}
+	if n := thinker.pendingToolCount(); n != 0 {
+		t.Errorf("expected 0 pending after drain, got %d", n)
+	}
+	seen := map[string]bool{}
+	for _, tr := range toolResults {
+		seen[tr.CallID] = true
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			t.Errorf("missing tool result for %s", id)
+		}
+	}
+}
+
+// TestWaitForPendingTools_DeadlineThenPlaceholder verifies the critical
+// race fix: one tool is genuinely slow (2.5s > 800ms deadline), so the
+// barrier returns early and injectPlaceholdersForPending synthesises a
+// "⏳ in progress" result for the laggard. When the slow goroutine
+// eventually publishes its real result, the late-result routing in
+// executeTool sends it as a text [late-result] event instead of a
+// second ToolResult for the same id — so the model never sees two
+// paired tool_results and never retries the call.
+func TestWaitForPendingTools_DeadlineThenPlaceholder(t *testing.T) {
+	bus := NewEventBus()
+	thinker := &Thinker{
+		bus:      bus,
+		sub:      bus.Subscribe("test", 100),
+		threadID: "test",
+		quit:     make(chan struct{}),
+	}
+
+	ids := []string{"call-A", "call-B", "call-C", "call-SLOW"}
+	for _, id := range ids {
+		thinker.pendingTools.Store(id, "mock_tool")
+	}
+
+	// A, B, C finish fast (50-150ms). SLOW finishes at 2.5s — long
+	// after the 800ms barrier deadline. We drive tools.go-style
+	// publish logic manually so we can exercise the late-result path
+	// end-to-end without a real registry.
+	publishResult := func(id string, delay time.Duration) {
+		go func() {
+			time.Sleep(delay)
+			if _, has := thinker.placeholdersSent.LoadAndDelete(id); has {
+				bus.Publish(Event{
+					Type: EventInbox, To: "test",
+					Text: "[late-result] Tool mock_tool (call id=" + id + ") completed: ok-" + id,
+				})
+			} else {
+				bus.Publish(Event{
+					Type: EventInbox, To: "test",
+					ToolResult: &ToolResult{CallID: id, Content: "ok-" + id},
+				})
+			}
+			thinker.pendingTools.Delete(id)
+		}()
+	}
+	publishResult("call-A", 50*time.Millisecond)
+	publishResult("call-B", 100*time.Millisecond)
+	publishResult("call-C", 150*time.Millisecond)
+	publishResult("call-SLOW", 2500*time.Millisecond)
+
+	var toolResults []ToolResult
+	var consumed []string
+	var mediaParts []ContentPart
+	// Short deadline so SLOW doesn't land in time — forces placeholder.
+	thinker.waitForPendingTools(&toolResults, &consumed, &mediaParts, 800*time.Millisecond)
+
+	if len(toolResults) != 3 {
+		t.Fatalf("expected 3 real tool results (A/B/C) before deadline, got %d", len(toolResults))
+	}
+	if thinker.pendingToolCount() != 1 {
+		t.Fatalf("expected 1 tool still pending after deadline, got %d", thinker.pendingToolCount())
+	}
+
+	// Inject placeholder for the laggard.
+	thinker.injectPlaceholdersForPending(&toolResults)
+
+	if len(toolResults) != 4 {
+		t.Fatalf("expected 4 tool results after placeholder injection, got %d", len(toolResults))
+	}
+	// The placeholder must carry the SLOW call id and the in-progress marker.
+	var found bool
+	for _, tr := range toolResults {
+		if tr.CallID == "call-SLOW" && strings.Contains(tr.Content, "In progress") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("placeholder for call-SLOW not found in toolResults")
+	}
+	if _, ok := thinker.placeholdersSent.Load("call-SLOW"); !ok {
+		t.Error("placeholdersSent missing call-SLOW entry")
+	}
+
+	// Now wait for SLOW to actually finish. Its late result should be
+	// routed through the text-event path (prefix [late-result]) and
+	// the placeholdersSent entry cleared.
+	deadline := time.After(5 * time.Second)
+	var lateResultSeen bool
+	for !lateResultSeen {
+		select {
+		case ev := <-thinker.sub.C:
+			if ev.Type == EventInbox && strings.HasPrefix(ev.Text, "[late-result]") && strings.Contains(ev.Text, "call-SLOW") {
+				lateResultSeen = true
+				if ev.ToolResult != nil {
+					t.Error("late-result event must NOT carry a ToolResult — would create duplicate pair")
+				}
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for late-result event from slow tool")
+		}
+	}
+
+	if _, ok := thinker.placeholdersSent.Load("call-SLOW"); ok {
+		t.Error("placeholdersSent still contains call-SLOW after late-result delivery")
+	}
+}
+
+// TestPlaceholder_NoDuplicateOnSecondIteration asserts that if the
+// barrier runs again on a subsequent iteration while the same slow
+// tool is STILL pending, it does NOT re-inject another placeholder —
+// the original placeholder is already baked into message history.
+func TestPlaceholder_NoDuplicateOnSecondIteration(t *testing.T) {
+	bus := NewEventBus()
+	thinker := &Thinker{
+		bus:      bus,
+		sub:      bus.Subscribe("test", 100),
+		threadID: "test",
+		quit:     make(chan struct{}),
+	}
+
+	thinker.pendingTools.Store("call-HANG", "mock_tool")
+
+	var results []ToolResult
+	thinker.injectPlaceholdersForPending(&results)
+	if len(results) != 1 {
+		t.Fatalf("first inject: expected 1 placeholder, got %d", len(results))
+	}
+
+	// Second inject on the same iteration — same id already marked,
+	// placeholder must NOT be re-added.
+	thinker.injectPlaceholdersForPending(&results)
+	if len(results) != 1 {
+		t.Errorf("second inject: expected 1 placeholder total, got %d", len(results))
 	}
 }

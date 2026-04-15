@@ -926,6 +926,44 @@ func TestScenario_SocialTeam(t *testing.T) {
 	runScenario(t, s)
 }
 
+// TestScenario_SocialTeam_SlowPost stress-tests the iter-boundary wait
+// barrier and placeholder injection path by forcing the "post" tool to
+// take 5 seconds per call — longer than the 3-second barrier deadline.
+// When the social worker fires post, the iter following the dispatch
+// will hit the deadline with the result still pending, inject a
+// "⏳ in progress" placeholder, and receive the real answer as a
+// [late-result] text event on a subsequent iteration.
+//
+// The pipeline itself still has to succeed end-to-end: the social MCP
+// dedupes posts by (project, channel) and rejects duplicates with a
+// REJECTED error, so any retry loop would surface as the scenario
+// failing to reach the required post counts. Passing this test proves
+// the agent doesn't retry slow tools after placeholder injection.
+func TestScenario_SocialTeam_SlowPost(t *testing.T) {
+	scheduleBin := buildMCPBinary(t, "mcps/schedule")
+	creativeBin := buildMCPBinary(t, "mcps/creative")
+	socialBin := buildMCPBinary(t, "mcps/social")
+	t.Logf("built schedule: %s, creative: %s, social: %s", scheduleBin, creativeBin, socialBin)
+
+	s := socialTeamScenario
+	s.Name = "SocialTeam-SlowPost"
+	s.MCPServers = append([]MCPServerConfig(nil), socialTeamScenario.MCPServers...)
+	s.MCPServers[0].Command = scheduleBin
+	s.MCPServers[1].Command = creativeBin
+	s.MCPServers[2].Command = socialBin
+	// Clone the social server's env so we don't mutate the shared
+	// scenario definition across parallel test runs.
+	socialEnv := map[string]string{}
+	for k, v := range socialTeamScenario.MCPServers[2].Env {
+		socialEnv[k] = v
+	}
+	socialEnv["SOCIAL_POST_LATENCY_MS"] = "5000"
+	s.MCPServers[2].Env = socialEnv
+	// Give the pipeline more wall-clock because post is now 10x slower.
+	s.Timeout = 8 * time.Minute
+	runScenario(t, s)
+}
+
 var robotScenario = Scenario{
 	Name: "Robot",
 	Directive: `You control a small robot. Spawn two team members:

@@ -79,7 +79,8 @@ EVENT FORMAT:
 - [thread:id done] message — a thread finished and terminated.
 
 BEHAVIOR:
-- Spawn threads when needed for parallel or long-running tasks.
+- Before spawning, check [ACTIVE THREADS]: if an existing thread has matching tools and directive, send(id="...") to it instead. Spawn only when no existing thread fits, or when you need parallelism over independent inputs.
+- For recurring or scheduled work, separate "when" from "how". In a quiet system with one simple schedule, handle it yourself via pace. Once you have multiple schedules, long horizons, or noisy bus traffic, spawn a coordinator thread with tools="pace,send" (no MCPs) whose only job is to wake on a timer and delegate to the domain workers that own the execution.
 - Additional tools may appear in [available tools] blocks based on context. If you need a tool you don't see, describe what you need.
 
 SPAWNING THREADS — critical rules:
@@ -374,7 +375,25 @@ type Thinker struct {
 	computer     computer.Computer // screen-based environment (nil = no computer use)
 	pendingTools sync.Map         // tool call IDs with pending async results
 
+	// Placeholders injected for tool calls that didn't finish within the
+	// iter-boundary wait barrier. Keyed by call id → placeholderInfo.
+	// When the real result eventually arrives, the tools.go publish path
+	// routes it through a "late-result" text message instead of a
+	// ToolResult (the tool_use is already paired with the placeholder).
+	placeholdersSent sync.Map
+
 	// Multimodal — parts waiting to be attached to next message
+}
+
+// placeholderInfo tracks a synthesised "⏳ in progress" tool_result that
+// was injected at the iteration boundary because its real result didn't
+// land in time. Used to (a) route late arrivals through the text-event
+// path and (b) let the stale-placeholder sweeper emit a synthetic timeout
+// message if the goroutine never returns.
+type placeholderInfo struct {
+	iteration    int
+	toolName     string
+	dispatchedAt time.Time
 }
 
 func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
@@ -920,6 +939,26 @@ func (t *Thinker) Run() {
 			}
 		}
 
+		// --- Iter-boundary wait barrier for parallel async tool calls ---
+		// Without this, when the previous iteration dispatched N parallel
+		// tool calls and only some of their results landed before the
+		// first Wake, the half-finished batch would reach think() and
+		// the model would retry the "missing" ones. The barrier drains
+		// additional events as they arrive, up to a short deadline, and
+		// for anything still pending after the deadline it injects a
+		// placeholder tool_result (see injectPlaceholdersForPending) so
+		// the tool_use is properly paired and the model is told not to
+		// retry.
+		t.waitForPendingTools(&toolResults, &consumed, &mediaParts, 3*time.Second)
+		if t.pendingToolCount() > 0 {
+			injectedBefore := len(toolResults)
+			t.injectPlaceholdersForPending(&toolResults)
+			if injected := len(toolResults) - injectedBefore; injected > 0 {
+				logMsg("RUN", fmt.Sprintf("[%s] injected %d in-progress placeholders for tools still running", t.threadID, injected))
+			}
+		}
+		t.sweepStalePlaceholders()
+
 		if len(consumed) > 0 {
 			logMsg("RUN", fmt.Sprintf("[%s] drained %d events (media_parts=%d)", t.threadID, len(consumed), len(mediaParts)))
 			for i, ev := range consumed {
@@ -1392,6 +1431,152 @@ func (t *Thinker) drainEvents() []drainedEvent {
 	}
 }
 
+// pendingToolCount returns the number of in-flight async tool calls.
+// Used by the iteration wait barrier to decide whether to poll.
+func (t *Thinker) pendingToolCount() int {
+	n := 0
+	t.pendingTools.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+// waitForPendingTools implements the iteration-boundary barrier that
+// prevents the parallel-tool-call retry bug. Scenario:
+//
+//  1. LLM fires N parallel tool calls in one assistant message.
+//  2. Goroutine A finishes fast, publishes its ToolResult.
+//  3. The publish wakes sub.Wake → iter N+1 starts immediately.
+//  4. drainEvents is non-blocking → captures only A's result.
+//  5. Goroutines B, C, D are still running upstream at this instant.
+//  6. iter N+1's think() sends a half-finished context to the LLM.
+//  7. LLM rationalises "B/C/D missing results" as "retry B/C/D."
+//
+// This barrier inserts a bounded wait before think() runs: if any tool
+// from the previous iteration is still in pendingTools, drain the bus
+// repeatedly (absorbing events as they arrive) until either pendingTools
+// is empty or the deadline fires. Any extracted events are appended to
+// the caller's slices so they end up in t.messages as usual.
+//
+// Bounded to keep genuine long-running tools from freezing the main
+// loop. When the deadline fires and some tools are still pending, the
+// caller is expected to inject placeholder tool_results for them (see
+// injectPlaceholdersForPending).
+func (t *Thinker) waitForPendingTools(
+	toolResults *[]ToolResult,
+	consumed *[]string,
+	mediaParts *[]ContentPart,
+	deadline time.Duration,
+) {
+	if t.pendingToolCount() == 0 {
+		return
+	}
+	start := time.Now()
+	poll := time.NewTicker(20 * time.Millisecond)
+	defer poll.Stop()
+	deadlineCh := time.After(deadline)
+	for {
+		// Drain whatever's in the bus right now.
+		for {
+			select {
+			case ev := <-t.sub.C:
+				if ev.Type == EventInbox {
+					if ev.ToolResult != nil {
+						*toolResults = append(*toolResults, *ev.ToolResult)
+					}
+					if ev.Text != "" {
+						*consumed = append(*consumed, ev.Text)
+					}
+					if len(ev.Parts) > 0 {
+						*mediaParts = append(*mediaParts, ev.Parts...)
+					}
+					continue
+				}
+			case <-t.sub.Wake:
+				continue
+			default:
+			}
+			break
+		}
+		if t.pendingToolCount() == 0 {
+			logMsg("RUN", fmt.Sprintf("[%s] pending tools drained in %s", t.threadID, time.Since(start)))
+			return
+		}
+		select {
+		case <-deadlineCh:
+			logMsg("RUN", fmt.Sprintf("[%s] pending tool wait deadline (%s) — %d still in-flight, injecting placeholders", t.threadID, deadline, t.pendingToolCount()))
+			return
+		case <-poll.C:
+			continue
+		case <-t.quit:
+			return
+		}
+	}
+}
+
+// injectPlaceholdersForPending synthesises a "⏳ in progress" ToolResult
+// for every tool id still in pendingTools at the iteration boundary. This
+// keeps each tool_use paired with a tool_result for API legality AND
+// tells the model explicitly not to retry. When the real result later
+// arrives from the goroutine, tools.go routes it through a distinct
+// "late-result" text message (see late-result routing below) instead of
+// appending a second ToolResult for the same id.
+func (t *Thinker) injectPlaceholdersForPending(toolResults *[]ToolResult) {
+	t.pendingTools.Range(func(k, v any) bool {
+		id, ok := k.(string)
+		if !ok || id == "" {
+			return true
+		}
+		// Skip ids that already have a placeholder from an earlier
+		// iteration — those are still in-flight, their placeholder is
+		// already in the assistant/user message pair in history.
+		if _, existed := t.placeholdersSent.Load(id); existed {
+			return true
+		}
+		toolName, _ := v.(string)
+		*toolResults = append(*toolResults, ToolResult{
+			CallID:  id,
+			Content: "⏳ In progress — this tool is still running from an earlier iteration. A [late-result] message will be delivered as soon as it completes. DO NOT call this tool again with the same arguments.",
+		})
+		t.placeholdersSent.Store(id, placeholderInfo{
+			iteration:    t.iteration,
+			toolName:     toolName,
+			dispatchedAt: time.Now(),
+		})
+		return true
+	})
+}
+
+// sweepStalePlaceholders emits a synthetic timeout late-result for any
+// placeholder whose real goroutine never completed. Runs once per
+// iteration; the default thresholds (5 minutes wall-clock or 20
+// iterations) match the worst-case retry/backoff envelope of upstream
+// MCP calls. Prevents placeholdersSent from growing unbounded when a
+// tool genuinely hangs.
+func (t *Thinker) sweepStalePlaceholders() {
+	now := time.Now()
+	var stale []string
+	t.placeholdersSent.Range(func(k, v any) bool {
+		id, ok1 := k.(string)
+		info, ok2 := v.(placeholderInfo)
+		if !ok1 || !ok2 {
+			return true
+		}
+		if now.Sub(info.dispatchedAt) > 5*time.Minute || t.iteration-info.iteration > 20 {
+			stale = append(stale, id)
+			t.Inject(fmt.Sprintf("[late-result] Tool %s (call id=%s, dispatched iter %d) timed out after %s — no result ever arrived. Treat as failure.",
+				info.toolName, id, info.iteration, now.Sub(info.dispatchedAt).Round(time.Second)))
+		}
+		return true
+	})
+	for _, id := range stale {
+		t.placeholdersSent.Delete(id)
+		// Don't delete from pendingTools — the goroutine may still
+		// complete and we want its late-result path to fire naturally.
+	}
+}
+
 func (t *Thinker) logAPI(ev APIEvent) {
 	if t.apiNotify == nil || t.apiLog == nil {
 		return
@@ -1601,7 +1786,7 @@ func normalizeComputerAction(args map[string]string) computer.Action {
 // executeComputerAction runs a computer_use action and injects the result as a proper ToolResult.
 func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 	if ntc.ID != "" {
-		t.pendingTools.Store(ntc.ID, true)
+		t.pendingTools.Store(ntc.ID, ntc.Name)
 		defer t.pendingTools.Delete(ntc.ID)
 	}
 	logMsg("COMPUTER", fmt.Sprintf("action=%s args=%v", ntc.Name, ntc.Args))

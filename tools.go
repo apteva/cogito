@@ -73,9 +73,12 @@ func executeTool(t *Thinker, call toolCall) {
 		})
 	}
 
-	// Track pending async tool call
+	// Track pending async tool call. Value carries the tool name so the
+	// iter-boundary placeholder injector can label its synthetic
+	// tool_result and the stale-placeholder sweeper can emit a useful
+	// timeout message if the goroutine never returns.
 	if call.NativeID != "" {
-		t.pendingTools.Store(call.NativeID, true)
+		t.pendingTools.Store(call.NativeID, call.Name)
 	}
 
 	go func() {
@@ -153,6 +156,26 @@ func executeTool(t *Thinker, call toolCall) {
 		if call.Name == "channels_respond" {
 			resultText = "ok"
 		}
+
+		// Late-result routing. If the iter-boundary barrier already
+		// injected a placeholder tool_result for this call id (because
+		// this goroutine didn't finish in time), we CANNOT publish a
+		// second ToolResult for the same id — the tool_use is already
+		// paired with the placeholder, and adding a second result
+		// recreates the exact duplicate-pair state that confuses the
+		// model. Instead, publish the real result as a text event
+		// prefixed [late-result] so it lands as a plain user message in
+		// the next drain. The model gets the real answer with a clear
+		// "this is the delayed result" label.
+		if _, hasPlaceholder := t.placeholdersSent.LoadAndDelete(call.NativeID); hasPlaceholder {
+			lateText := fmt.Sprintf("[late-result] Tool %s (call id=%s) completed: %s", call.Name, call.NativeID, resultText)
+			t.bus.Publish(Event{
+				Type: EventInbox, To: t.threadID,
+				Text: lateText,
+			})
+			return
+		}
+
 		t.bus.Publish(Event{
 			Type: EventInbox, To: t.threadID,
 			Text: fmt.Sprintf("[tool:%s] %s", call.Name, resultText),
