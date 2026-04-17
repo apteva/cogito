@@ -361,7 +361,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 					Description: fmt.Sprintf("[%s] %s", mcpName, tool.Description),
 					Syntax:      buildMCPSyntax(fullName, tool.InputSchema),
 					Rules:       fmt.Sprintf("Provided by MCP server '%s'.", mcpName),
-					Handler:     mcpProxyHandler(srv, tool.Name),
+					Handler:     mcpProxyHandler(srv, tool.Name, tm.parent.blobs),
 					InputSchema: tool.InputSchema,
 					MCP:         false, // not filtered — this IS the thread's registry
 					MCPServer:   mcpName,

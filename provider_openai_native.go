@@ -146,7 +146,7 @@ type oaiComputerAction struct {
 	Keys      []string `json:"keys,omitempty"`   // modifier keys
 }
 
-func (p *OpenAINativeProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onToolChunk func(string, string)) (ChatResponse, error) {
+func (p *OpenAINativeProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string)) (ChatResponse, error) {
 	// Convert messages to Responses API input items
 	input := p.buildInput(messages)
 

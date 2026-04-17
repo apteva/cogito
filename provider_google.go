@@ -185,7 +185,7 @@ type geminiStreamResponse struct {
 	} `json:"usageMetadata"`
 }
 
-func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onToolChunk func(string, string)) (ChatResponse, error) {
+func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string)) (ChatResponse, error) {
 	// Track active model for cost calculation
 	p.activeModel = model
 

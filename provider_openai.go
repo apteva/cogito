@@ -184,7 +184,7 @@ func toOpenAIMessages(messages []Message) []any {
 	return out
 }
 
-func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onToolChunk func(string, string)) (ChatResponse, error) {
+func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string)) (ChatResponse, error) {
 	// Build request
 	reqMap := map[string]any{
 		"model":    model,
@@ -296,11 +296,10 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 			delta := event.Choices[0].Delta
 			// Fireworks/DeepSeek-style reasoning models emit chain-of-thought
 			// in `reasoning_content` on the delta, separate from `content`.
-			// We stream it through the same onChunk hook so the UI's Thoughts
-			// panel shows it. Reasoning tokens are NOT appended to `full`
-			// because they shouldn't end up in the assistant message history.
-			if delta.ReasoningContent != "" && onChunk != nil {
-				onChunk(delta.ReasoningContent)
+			// Streamed via onThinking (not onChunk) so the UI can distinguish
+			// reasoning from output. NOT appended to `full`.
+			if delta.ReasoningContent != "" && onThinking != nil {
+				onThinking(delta.ReasoningContent)
 			}
 			if delta.Content != "" {
 				full.WriteString(delta.Content)

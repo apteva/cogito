@@ -175,6 +175,8 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		prompt += "\n\n" + skills
 	}
 
+	prompt += blobPromptHint
+
 	prompt += "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
 	return prompt
 }
@@ -370,6 +372,11 @@ type Thinker struct {
 
 	// Live MCP connections — servers connected at runtime
 	mcpServers []MCPConn
+	// In-process blob store. Used by mcpProxyHandler to intercept
+	// binary tool results (rewriting them to compact handles the LLM
+	// can reference) and to rehydrate those references on outbound
+	// tool calls. Nil = passthrough (no binary-handle indirection).
+	blobs *BlobStore
 	// MCP server catalog — lightweight metadata for prompt (name + tool count)
 	mcpCatalog []MCPServerInfo
 	computer     computer.Computer // screen-based environment (nil = no computer use)
@@ -450,6 +457,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		threadID:   "main",
 		maxHistory: maxHistoryMain,
 		telemetry:  NewTelemetry(),
+		blobs:      NewBlobStore(DefaultBlobMaxTotal, DefaultBlobTTL),
 	}
 	t.threads = NewThreadManager(t)
 	t.registry = NewToolRegistry(apiKey)
@@ -488,7 +496,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		}
 		// Fully connect main_access servers (gateway, channels, etc.)
 		if len(mainServers) > 0 {
-			t.mcpServers = connectAndRegisterMCP(mainServers, t.registry, t.memory)
+			t.mcpServers = connectAndRegisterMCP(mainServers, t.registry, t.memory, t.blobs)
 		}
 		// Discover catalog servers (connect, count tools, keep connection for thread reuse)
 		for _, cfg := range catalogServers {
@@ -833,7 +841,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 									Description: fmt.Sprintf("[%s] %s", name, tool.Description),
 									Syntax:      syntax,
 									Rules:       fmt.Sprintf("Provided by MCP server '%s'.", name),
-									Handler:     mcpProxyHandler(srv, tool.Name),
+									Handler:     mcpProxyHandler(srv, tool.Name, t.blobs),
 									InputSchema: tool.InputSchema,
 									MCP:         true,
 									MCPServer:   name,
@@ -1386,6 +1394,14 @@ func (t *Thinker) think() (ChatResponse, error) {
 		}
 	}
 
+	onThinking := func(chunk string) {
+		if t.telemetry != nil && chunk != "" {
+			t.telemetry.EmitLive("llm.thinking", t.threadID, map[string]any{
+				"text": chunk, "iteration": t.iteration,
+			})
+		}
+	}
+
 	onToolChunk := func(toolName, chunk string) {
 		t.bus.Publish(Event{Type: EventToolChunk, From: t.threadID, Text: chunk, ToolName: toolName, Iteration: t.iteration})
 		if t.telemetry != nil {
@@ -1395,7 +1411,16 @@ func (t *Thinker) think() (ChatResponse, error) {
 		}
 	}
 
-	return t.provider.Chat(t.messages, t.modelID(), nativeTools, onChunk, onToolChunk)
+	// Emit llm.start so the UI can show a "thinking" indicator before
+	// any tokens arrive. Live-only — not stored in the DB.
+	if t.telemetry != nil {
+		t.telemetry.EmitLive("llm.start", t.threadID, map[string]any{
+			"model":     t.modelID(),
+			"iteration": t.iteration,
+		})
+	}
+
+	return t.provider.Chat(t.messages, t.modelID(), nativeTools, onChunk, onThinking, onToolChunk)
 }
 
 // drainEvents reads all pending events and wake signals from this thinker's bus subscription.

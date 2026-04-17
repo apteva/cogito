@@ -17,8 +17,19 @@ func joinOrNone(s []string) string {
 	return strings.Join(s, ",")
 }
 
-// Version is set at build time via -ldflags.
-var Version = "dev"
+// Version fields are injected at build time via -ldflags "-X main.Xxx=...".
+// Core shares the umbrella Version with the rest of the monorepo; the
+// other fields exist so core + server can be built with the same
+// -ldflags string without the linker erroring on unknown symbols.
+// Core itself only reads Version and BuildTime; the rest are ignored.
+var (
+	Version             = "dev"
+	BuildTime           = "dev"
+	CLIVersion          = "dev"
+	DashboardVersion    = "dev"
+	IntegrationsVersion = "dev"
+	CoreVersion         = "dev"
+)
 
 // ContentPart represents a multimodal content block (OpenAI Chat Completions format).
 type ContentPart struct {

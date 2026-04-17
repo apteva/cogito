@@ -73,9 +73,10 @@ type LLMProvider interface {
 	// Chat sends messages and streams the response.
 	// tools: native tool definitions to include in the request (nil = no tools).
 	// onChunk is called for each text token chunk as it arrives.
+	// onThinking is called for each reasoning/thinking token (separate from output).
 	// onToolChunk is called for each tool argument chunk as it streams (toolName, argChunk).
 	// Returns ChatResponse with text, tool calls, and usage.
-	Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onToolChunk func(toolName, chunk string)) (ChatResponse, error)
+	Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(toolName, chunk string)) (ChatResponse, error)
 
 	// Models returns model IDs for each tier.
 	Models() map[ModelTier]string

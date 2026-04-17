@@ -208,24 +208,45 @@ func (t *Telemetry) StoredEvents(since int) ([]TelemetryEvent, int) {
 	return events, len(t.log)
 }
 
-// forwardLoop batches stored events and POSTs them to the server for DB persistence.
+// forwardLoop batches stored events and POSTs them to the server for DB
+// persistence. On transient failures (network error, non-2xx) the cursor
+// does NOT advance and the same batch is re-sent after an exponential
+// backoff (1s → 30s). The server dedups by event.id PRIMARY KEY (INSERT
+// OR IGNORE) so retries are safe and never double-insert.
+//
+// Backoff resets to the base interval on any successful POST. The stored
+// event log is bounded (truncated in emit() past 2000 entries); if the
+// server is unreachable long enough for truncation to run, StoredEvents()
+// resets the cursor to 0 so we drain whatever remains rather than stalling.
 func (t *Telemetry) forwardLoop() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	const (
+		baseInterval = 1 * time.Second
+		maxInterval  = 30 * time.Second
+	)
+	interval := baseInterval
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 
 	var lastSent int
+	var consecutiveFailures int
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	logMsg("TELEMETRY", fmt.Sprintf("forwardLoop started, url=%s", t.telemetryURL))
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
+			// Default: reset to base cadence. Overridden below if this
+			// iteration fails.
+			next := baseInterval
+
 			if t.telemetryURL == "" {
+				timer.Reset(next)
 				continue
 			}
 			events, total := t.StoredEvents(lastSent)
 			if len(events) == 0 {
+				timer.Reset(next)
 				continue
 			}
 
@@ -237,37 +258,70 @@ func (t *Telemetry) forwardLoop() {
 
 			body, err := json.Marshal(events)
 			if err != nil {
-				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: marshal error: %v", err))
+				// Marshal failure is deterministic — retrying won't help.
+				// Advance past this batch so we don't spin forever.
+				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: marshal error (dropping batch): %v", err))
+				lastSent = total
+				timer.Reset(next)
 				continue
 			}
 
-			req, err := http.NewRequest("POST", t.telemetryURL, bytes.NewReader(body))
-			if err != nil {
-				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: request error: %v", err))
-				continue
+			ok := t.postBatch(client, body)
+			if ok {
+				lastSent = total
+				if consecutiveFailures > 0 {
+					logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: recovered after %d failures", consecutiveFailures))
+				}
+				consecutiveFailures = 0
+				interval = baseInterval
+			} else {
+				consecutiveFailures++
+				// Exponential backoff, capped. Log every failure so
+				// outages are visible in the logs.
+				interval *= 2
+				if interval > maxInterval {
+					interval = maxInterval
+				}
+				next = interval
+				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: retry in %s (consecutive failures=%d, queued=%d)",
+					next, consecutiveFailures, len(events)))
 			}
-			req.Header.Set("Content-Type", "application/json")
-			if t.instanceSecret != "" {
-				req.Header.Set("X-Instance-Secret", t.instanceSecret)
-			}
-
-			resp, err := client.Do(req)
-			if err != nil {
-				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST error: %v", err))
-				continue
-			}
-			respBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode != 200 {
-				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST %s status=%d body=%s", t.telemetryURL, resp.StatusCode, string(respBody)))
-			}
-			// Always advance cursor — don't retry failed batches forever
-			lastSent = total
+			timer.Reset(next)
 
 		case <-t.quit:
 			return
 		}
 	}
+}
+
+// postBatch POSTs a serialized batch of events. Returns true on 2xx.
+// Any network error or non-2xx status is treated as a retryable failure —
+// the caller keeps lastSent unchanged so the same batch is re-sent after
+// backoff.
+func (t *Telemetry) postBatch(client *http.Client, body []byte) bool {
+	req, err := http.NewRequest("POST", t.telemetryURL, bytes.NewReader(body))
+	if err != nil {
+		logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: request error: %v", err))
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if t.instanceSecret != "" {
+		req.Header.Set("X-Instance-Secret", t.instanceSecret)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST error: %v", err))
+		return false
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST %s status=%d body=%s",
+			t.telemetryURL, resp.StatusCode, string(respBody)))
+		return false
+	}
+	return true
 }
 
 // --- Convenience emitters with typed data ---

@@ -56,7 +56,7 @@ func TestAudioInput(t *testing.T) {
 	var fullText strings.Builder
 	resp, err := provider.Chat(messages, model, nil, func(chunk string) {
 		fullText.WriteString(chunk)
-	}, nil)
+	}, nil, nil)
 	duration := time.Since(start)
 
 	if err != nil {

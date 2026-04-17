@@ -707,7 +707,7 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 					Description: fmt.Sprintf("[%s] %s", cfg.Name, tool.Description),
 					Syntax:      syntax,
 					Rules:       fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
-					Handler:     mcpProxyHandler(srv, tool.Name),
+					Handler:     mcpProxyHandler(srv, tool.Name, t.blobs),
 					InputSchema: tool.InputSchema,
 					MCP:         !cfg.MainAccess,
 					MCPServer:   cfg.Name,

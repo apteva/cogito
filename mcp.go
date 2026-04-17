@@ -267,12 +267,23 @@ func (s *MCPServer) Close() {
 	s.cmd.Wait()
 }
 
-// mcpProxyHandler returns a tool handler that proxies calls to an MCP server
-func mcpProxyHandler(server MCPConn, toolName string) func(args map[string]string) ToolResponse {
+// mcpProxyHandler returns a tool handler that proxies calls to an MCP
+// server. If blobs is non-nil, the handler transparently rehydrates
+// file-ref arguments into real _binary envelopes before dispatch and
+// rewrites any _binary envelope returned by the tool into a compact
+// _file handle — so large binaries never traverse the LLM context.
+// Pass nil for blobs to get straight proxy behaviour (legacy path).
+func mcpProxyHandler(server MCPConn, toolName string, blobs *BlobStore) func(args map[string]string) ToolResponse {
 	return func(args map[string]string) ToolResponse {
+		if blobs != nil {
+			args = blobs.RehydrateFileRefs(args)
+		}
 		result, err := server.CallTool(toolName, args)
 		if err != nil {
 			return ToolResponse{Text: fmt.Sprintf("error: %v", err)}
+		}
+		if blobs != nil {
+			result = blobs.RewriteBinaryToHandle(result)
 		}
 		return ToolResponse{Text: result}
 	}
@@ -305,8 +316,11 @@ func connectAnyMCP(cfg MCPServerConfig) (MCPConn, error) {
 	return connectMCP(cfg)
 }
 
-// connectAndRegisterMCP connects to MCP servers from config and registers tools
-func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, memory *MemoryStore) []MCPConn {
+// connectAndRegisterMCP connects to MCP servers from config and registers
+// tools. If blobs is non-nil, every registered tool is wrapped so that
+// binary arguments and results flow through the blob store (see
+// mcpProxyHandler). Pass nil for blobs to register plain proxies.
+func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, memory *MemoryStore, blobs *BlobStore) []MCPConn {
 	var servers []MCPConn
 	for _, cfg := range configs {
 		srv, err := connectAnyMCP(cfg)
@@ -332,7 +346,7 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, me
 				Description: fmt.Sprintf("[%s] %s", cfg.Name, tool.Description),
 				Syntax:      syntax,
 				Rules:       fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
-				Handler:     mcpProxyHandler(srv, tool.Name),
+				Handler:     mcpProxyHandler(srv, tool.Name, blobs),
 				InputSchema: tool.InputSchema,
 				MCP:         !cfg.MainAccess,
 				MCPServer:   cfg.Name,

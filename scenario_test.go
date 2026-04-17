@@ -274,7 +274,7 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 	}
 
 	if len(mcpServers) > 0 {
-		servers := connectAndRegisterMCP(mcpServers, thinker.registry, memStore)
+		servers := connectAndRegisterMCP(mcpServers, thinker.registry, memStore, thinker.blobs)
 		t.Cleanup(func() {
 			for _, s := range servers {
 				s.Close()
