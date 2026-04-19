@@ -104,7 +104,11 @@ func (c *ConsoleLogger) render(ev TelemetryEvent) {
 		)
 
 	case "llm.error":
-		errMsg := conTruncate(conGetString(data, "error"), 70)
+		// Errors are the one place truncation actively hides what we
+		// need. Print the full payload — providers return JSON error
+		// bodies that explain quota, schema mismatches, oversized
+		// context, etc. and a 70-char prefix masks all of it.
+		errMsg := conGetString(data, "error")
 		fmt.Fprintf(os.Stderr, "  %s%s │%s %s✗ %s%s\n",
 			ansiDim, ts, ansiReset,
 			ansiRed, errMsg, ansiReset,

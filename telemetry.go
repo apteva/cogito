@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -337,9 +338,14 @@ type LLMDoneData struct {
 	Rate         string  `json:"rate"`
 	ContextMsgs  int     `json:"context_msgs"`
 	ContextChars int     `json:"context_chars"`
-	MemoryCount  int     `json:"memory_count"`
-	ThreadCount  int     `json:"thread_count"`
-	Message      string  `json:"message,omitempty"`
+	// MaxContextTokens is the model's advertised input-context window
+	// (in tokens). Comes from a static lookup keyed on the model id —
+	// see ModelContextWindow. 0 when the model isn't in the table; UI
+	// should treat 0 as "unknown" and skip percentage rendering.
+	MaxContextTokens int `json:"max_context_tokens,omitempty"`
+	MemoryCount      int `json:"memory_count"`
+	ThreadCount      int `json:"thread_count"`
+	Message          string `json:"message,omitempty"`
 }
 
 type LLMChunkData struct {
@@ -397,6 +403,84 @@ const (
 	costCachedPerMillion = 0.10
 	costOutputPerMillion = 3.00
 )
+
+// ModelContextWindow returns the advertised input-context window (in
+// tokens) for a given model id. Pure static lookup — no network, no
+// API call, ~hundreds of nanoseconds. Returns 0 if the model isn't in
+// the table; the UI treats 0 as "unknown" and skips the % display.
+//
+// Numbers come from each provider's own model documentation. Update
+// when a new model ships or a provider changes a limit. Match is by
+// substring so we tolerate the various id forms providers use
+// (e.g. "claude-opus-4-7", "claude-opus-4-7-20251119", "claude-opus-4-7[1m]").
+//
+// Order matters: longer / more specific keys checked first so
+// "claude-opus-4-7[1m]" matches the 1M variant before falling through
+// to the generic "claude-opus-4-7" 200K entry.
+func ModelContextWindow(modelID string) int {
+	if modelID == "" {
+		return 0
+	}
+	// Order longest-prefix first to win over shorter substrings.
+	table := []struct {
+		match  string
+		tokens int
+	}{
+		// --- Anthropic (Claude) ---
+		// 1M-context variants are explicitly tagged.
+		{"claude-opus-4-7[1m]", 1_000_000},
+		{"claude-opus-4-6[1m]", 1_000_000},
+		{"claude-opus-4-5[1m]", 1_000_000},
+		{"claude-sonnet-4-6[1m]", 1_000_000},
+		{"claude-sonnet-4-5[1m]", 1_000_000},
+		// Standard 200K Claude family.
+		{"claude-opus-4", 200_000},
+		{"claude-sonnet-4", 200_000},
+		{"claude-haiku-4", 200_000},
+		{"claude-3-5-sonnet", 200_000},
+		{"claude-3-5-haiku", 200_000},
+		{"claude-3-opus", 200_000},
+		{"claude-3-sonnet", 200_000},
+		{"claude-3-haiku", 200_000},
+
+		// --- Fireworks (Moonshot Kimi) ---
+		// Kimi K2.5 turbo via Fireworks router is 256K input context.
+		{"kimi-k2p5", 256_000},
+		{"kimi-k2", 128_000},
+
+		// --- OpenAI ---
+		{"gpt-4.1", 1_000_000},
+		{"gpt-4o-mini", 128_000},
+		{"gpt-4o", 128_000},
+		{"gpt-4-turbo", 128_000},
+		{"gpt-4", 8_192},
+		{"gpt-3.5", 16_385},
+		{"o3-mini", 200_000},
+		{"o3", 200_000},
+		{"o1-mini", 128_000},
+		{"o1", 200_000},
+
+		// --- Google (Gemini) ---
+		{"gemini-2.5-pro", 2_000_000},
+		{"gemini-2.5-flash", 1_000_000},
+		{"gemini-2.0-pro", 2_000_000},
+		{"gemini-2.0-flash", 1_000_000},
+		{"gemini-1.5-pro", 2_000_000},
+		{"gemini-1.5-flash", 1_000_000},
+
+		// --- Local / generic ---
+		{"llama3.1", 128_000},
+		{"llama-3.1", 128_000},
+		{"llama3", 8_192},
+	}
+	low := strings.ToLower(modelID)
+	for _, e := range table {
+		if strings.Contains(low, strings.ToLower(e.match)) {
+			return e.tokens
+		}
+	}
+	return 0
+}
 
 func calculateCost(usage TokenUsage) float64 {
 	uncached := usage.PromptTokens - usage.CachedTokens

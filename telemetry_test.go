@@ -179,6 +179,45 @@ func TestTelemetry_ThreadMessageData(t *testing.T) {
 	}
 }
 
+func TestModelContextWindow(t *testing.T) {
+	cases := []struct {
+		model string
+		want  int
+	}{
+		// Fireworks Kimi router — what the prod deployment actually
+		// runs against, so this row is the canary.
+		{"accounts/fireworks/routers/kimi-k2p5-turbo", 256_000},
+		{"accounts/fireworks/models/kimi-k2-instruct", 128_000},
+		// Anthropic — both default and 1M-context variants.
+		{"claude-opus-4-7", 200_000},
+		{"claude-opus-4-7[1m]", 1_000_000},
+		{"claude-sonnet-4-6", 200_000},
+		{"claude-sonnet-4-5[1m]", 1_000_000},
+		{"claude-haiku-4-5-20251001", 200_000},
+		{"claude-3-5-sonnet-20241022", 200_000},
+		// OpenAI.
+		{"gpt-4o", 128_000},
+		{"gpt-4o-mini", 128_000},
+		{"gpt-4.1", 1_000_000},
+		{"o1-preview", 200_000}, // matches "o1" prefix
+		{"o3-mini", 200_000},
+		// Gemini.
+		{"gemini-1.5-pro-002", 2_000_000},
+		{"gemini-2.5-flash", 1_000_000},
+		// Local.
+		{"llama3.1:8b", 128_000},
+		// Unknown — must return 0 (UI uses 0 as the "no max known" sentinel).
+		{"some-future-model-9000", 0},
+		{"", 0},
+	}
+	for _, c := range cases {
+		got := ModelContextWindow(c.model)
+		if got != c.want {
+			t.Errorf("ModelContextWindow(%q) = %d, want %d", c.model, got, c.want)
+		}
+	}
+}
+
 func TestCalculateCost(t *testing.T) {
 	usage := TokenUsage{
 		PromptTokens:     1000,

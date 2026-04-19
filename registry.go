@@ -92,10 +92,19 @@ func (tr *ToolRegistry) registerDefaults() {
 
 	tr.Register(&ToolDef{
 		Name:        "remember",
-		Description: "Store something in persistent memory. Use for important facts, user preferences, lessons learned, decisions made. Memories survive restarts and are auto-recalled by relevance.",
-		Syntax:      `[[remember text="Important fact to remember"]]`,
-		Rules:       `Be selective — only store what you'd want to recall in future sessions. Not for transient state.`,
-		Core:        true,
+		Description: "Store something in persistent memory. Memories survive restarts and are auto-recalled by vector similarity when similar context shows up in later turns. The more you remember, the less you'll need to ask or re-derive.",
+		Syntax:      `[[remember text="[preference] exec: user OK with shell commands on their own server"]]`,
+		Rules: `Tag every memory with a bracketed category at the start so recall surfaces the right kind when the same context reappears. Standard tags:
+  [preference] — user's permanent choice about how to handle a tool/situation
+  [correction] — "don't do X", "stop doing Y", style/tone feedback
+  [decision]   — a concrete choice made with the user's approval
+  [fact]       — durable information about the user, their systems, accounts
+  [user]       — identity, role, location, time zone, contact details
+
+Write memories so they match FUTURE queries — include the tool name, the kind of target, and the outcome in plain words. Good: "[preference] browser: logging into banking sites — never". Bad: "user doesn't like it" (no embedding signal).
+
+Remember liberally. Storage is cheap; a missed memory forces the user to correct you twice. DO NOT store transient state (current task progress, temporary counters, in-flight values) — that belongs in thread state, not persistent memory.`,
+		Core: true,
 	})
 
 	// Main-only tools

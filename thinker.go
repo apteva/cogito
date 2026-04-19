@@ -163,11 +163,46 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 	prompt += "\n\n[SAFETY MODE: " + string(mode) + "]\n"
 	switch mode {
 	case ModeCautious:
-		prompt += `Before executing any tool that modifies state (exec, write, deploy, restart, delete), first tell the user what you plan to do and why via channels_respond, then wait for their confirmation in the next message. Read-only tools (web, query, list) can be used freely. If unsure whether an action is safe, ask. Learn from user feedback — use remember to store their preferences.`
+		prompt += `You act carefully. Read-only tools (screenshot, list, query, read_file, web search, memory_scan) are free — use them at will.
+
+Before any STATE-CHANGING tool (exec, write, delete, deploy, restart, purchase, send-as-user, browser actions on logged-in sites):
+- Send one concise channels_respond explaining action + target + why (one sentence each).
+- Wait for the user's next message before executing. Don't chain tool calls.
+- If unsure whether an action is state-changing, ask. Asking is cheap; undoing is expensive.
+
+Remember liberally — every correction, preference, or approved decision. Use consistent bracketed tags ([correction], [preference], [decision], [fact]) so recall surfaces the right memory next time. The more you remember, the fewer times you'll need to ask.`
 	case ModeLearn:
-		prompt += `You are learning the user's preferences. For EVERY new type of tool call you haven't done before, ask the user first via channels_respond whether they're comfortable with it. Once they confirm, remember their preference with remember so you don't need to ask again. Over time you'll build up a profile of what's OK and what needs checking. Always explain what you're about to do.`
+		prompt += `You are learning the user's preferences through conversation. You're soft-gated: nothing blocks you — the quality of this mode depends on YOU actually pausing, asking, and remembering.
+
+BEFORE A NEW KIND OF ACTION:
+1. Check what memories the recall system already surfaced this turn. If a [preference] or [correction] already covers this action + target, follow it silently.
+2. Otherwise, if the action could affect the user (state-changing, external, touches their data/accounts, irreversible), send ONE short channels_respond:
+   "About to <verb> <target>. Reason: <one sentence>. OK?"
+   Wait for their answer before proceeding.
+3. Skip asking for obviously-safe tools (screenshot, list, read_file, web search, memory_scan, pace, think-only actions).
+
+AFTER THE USER ANSWERS, ALWAYS remember their decision in a consistent structured form so recall actually surfaces it next time:
+  [[remember text="[preference] <tool>: <when it applies> — <user's decision>"]]
+Good examples:
+  [preference] exec: shell commands on user's own server — OK without asking
+  [preference] delete_file: any path under /work — always ask first
+  [preference] browser: logging into banking sites — never
+  [correction] tone: user prefers terse replies, no headings
+  [correction] email: don't send email before 8am user-local
+  [fact] user's server: 46.224.160.146, alias "worker-d0e70653"
+  [decision] approved: daily 9am digest via Telegram
+
+Remember MORE than you think you should. Corrections especially — any "no", "don't", "stop", "I didn't want that" becomes a [correction] memory IMMEDIATELY. User tone/style, project context, recurring tasks, names and deadlines — all worth storing.
+
+The point of learn mode is that asking frequency DROPS OVER TIME. If you keep asking about the same thing, you didn't remember it well enough — rewrite the memory more specifically.`
 	default: // ModeAutonomous
-		prompt += `You operate freely and make your own decisions about tool use. Assess risk yourself — if something seems dangerous or irreversible, consider asking the user first. Learn from feedback: if a user tells you to stop doing something, remember it with remember. You are trusted to act independently.`
+		prompt += `You operate independently and are trusted to act. Use that trust to get things done.
+
+- For irreversible or high-blast-radius actions (mass delete, publish externally, spend money, send as user), tell the user briefly before acting — don't ask, inform.
+- Assess risk honestly. If genuinely unsure, ask.
+- When the user corrects or pushes back, stop and adjust immediately — don't argue.
+
+Remember actively. Every correction, preference, and consequential decision gets a [[remember]] with a bracketed tag ([correction], [preference], [decision], [fact]) so recall surfaces it on future turns. Remember liberally — storage is cheap, confusion is expensive.`
 	}
 
 	// Inject learned skills if any exist
@@ -1295,20 +1330,22 @@ func (t *Thinker) Run() {
 
 		// Telemetry: llm.done with full data
 		if t.telemetry != nil {
+			model := t.modelID()
 			t.telemetry.Emit("llm.done", t.threadID, LLMDoneData{
-				Model:        t.modelID(),
-				TokensIn:     usage.PromptTokens,
-				TokensCached: usage.CachedTokens,
-				TokensOut:    usage.CompletionTokens,
-				DurationMs:   duration.Milliseconds(),
-				CostUSD:      calculateCostForProvider(t.provider, usage),
-				Iteration:    t.iteration,
-				Rate:         formatSleep(sleepDur),
-				ContextMsgs:  len(t.messages),
-				ContextChars: ctxChars,
-				MemoryCount:  t.memory.Count(),
-				ThreadCount:  threadCount,
-				Message:      thoughtLog,
+				Model:            model,
+				TokensIn:         usage.PromptTokens,
+				TokensCached:     usage.CachedTokens,
+				TokensOut:        usage.CompletionTokens,
+				DurationMs:       duration.Milliseconds(),
+				CostUSD:          calculateCostForProvider(t.provider, usage),
+				Iteration:        t.iteration,
+				Rate:             formatSleep(sleepDur),
+				ContextMsgs:      len(t.messages),
+				ContextChars:     ctxChars,
+				MaxContextTokens: ModelContextWindow(model),
+				MemoryCount:      t.memory.Count(),
+				ThreadCount:      threadCount,
+				Message:          thoughtLog,
 			})
 		}
 

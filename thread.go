@@ -236,14 +236,20 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if tm.parent.registry != nil {
 		coreDocs = "\n" + tm.parent.registry.CoreDocs(false)
 	}
-	// Inject safety mode from parent config
+	// Inject safety mode from parent config. Child-thread wording is a
+	// tighter version of the main-thread prompt: the child escalates to
+	// its PARENT (not the user directly), and shares the same memory
+	// store — so [[remember]] from a child is visible to every future
+	// turn in main and siblings too.
 	mode := tm.parent.config.GetMode()
 	modeBlock := ""
 	switch mode {
 	case ModeCautious:
-		modeBlock = "\n\n[SAFETY MODE: cautious]\nBefore executing any tool that modifies state, send a message to your parent explaining what you plan to do. Wait for confirmation before proceeding. Read-only tools can be used freely."
+		modeBlock = "\n\n[SAFETY MODE: cautious]\nRead-only tools are free. Before any state-changing tool (exec, write, delete, deploy, restart, external send), send one concise `send` to your parent with action + target + why, and wait for their next message. If unsure whether an action is state-changing, ask. Use [[remember]] with bracketed tags ([correction], [preference], [decision], [fact]) on every correction or preference — memories are shared with main + siblings."
 	case ModeLearn:
-		modeBlock = "\n\n[SAFETY MODE: learn]\nFor every new type of tool call, send a message to your parent asking if the user is comfortable with it. Remember their preferences."
+		modeBlock = "\n\n[SAFETY MODE: learn]\nSoft gate — no runtime block, the discipline is on you. For any new kind of state-changing / external / user-affecting action, first check memories the recall system surfaced this turn; if nothing covers it, `send` a one-line check to your parent and wait. Obviously-safe tools (screenshot, list, read, web search, memory_scan) don't need asking. After every answer, [[remember]] with a structured tag ([preference] <tool>: <scope> — <outcome> / [correction] ... / [decision] ...) so recall surfaces it next time. Remember MORE than you think — every correction, tone feedback, and approved decision."
+	default: // ModeAutonomous
+		modeBlock = "\n\n[SAFETY MODE: autonomous]\nDecide yourself. For irreversible or high-blast-radius actions, inform your parent briefly before acting. Stop and adjust the moment a correction comes back. Use [[remember]] liberally on every correction / preference / decision with bracketed tags — shared with main + siblings via embedding recall."
 	}
 	threadSystemPrompt := basePrompt + coreDocs + modeBlock + "\n\n[DIRECTIVE]\n" + directive
 

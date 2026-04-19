@@ -30,7 +30,7 @@ func GetComputerToolDef(display DisplaySize) ToolDefinition {
 		Syntax: `[[computer_use action="screenshot"]]`,
 		Rules: "Actions: screenshot, click (coordinate=\"x,y\"), double_click (coordinate=\"x,y\"), " +
 			"type (text=\"...\"), key (key=\"Enter\"/\"Escape\"/\"ctrl+c\"), " +
-			"scroll (direction=\"up\"/\"down\", amount=3), mouse_move (coordinate=\"x,y\"), wait (duration=1000ms). " +
+			"scroll (direction=\"up\"/\"down\"/\"left\"/\"right\", amount=3, optional coordinate=\"x,y\" to scroll a specific element), mouse_move (coordinate=\"x,y\"), wait (duration=1000ms). " +
 			"WORKFLOW: 1) screenshot to see page 2) click/type based on coordinates you see 3) screenshot again to verify.",
 		Parameters: map[string]any{
 			"type": "object",
@@ -53,7 +53,7 @@ func GetComputerToolDef(display DisplaySize) ToolDefinition {
 				},
 				"direction": map[string]any{
 					"type":        "string",
-					"description": "Scroll direction: up, down",
+					"description": "Scroll direction: up, down, left, right",
 				},
 				"amount": map[string]any{
 					"type":        "string",

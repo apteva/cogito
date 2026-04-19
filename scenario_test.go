@@ -5997,74 +5997,70 @@ func TestScenario_EmailBurst(t *testing.T) {
 	runScenario(t, s)
 }
 
-// --- RubricLearning Scenario ---
+// --- RubricLearning Scenario (multi-center) ---
 //
-// The agent is given a sales-call grading rubric and 6 labeled training
-// transcripts. It must:
-//   1. Read the rubric and every training call (with ground-truth ratings).
-//   2. Identify the patterns that distinguish a 1 from a 5 on each of the
-//      5 dimensions, and encode them via [[remember]] entries.
-//   3. Compress the rubric + heuristics into its directive via [[evolve]].
-//   4. After studying, rate 3 brand-new test transcripts via submit_rating.
-//      The MCP server scores each submission against hidden ground truth
-//      and returns per-dimension deltas (±1 = match).
+// The agent coordinates QA across multiple call centers. Each center
+// has its own rubric (different dimensions reflecting its domain — SaaS
+// demo calls, outbound telesales, support-recovery calls), its own pool
+// of labeled training calls, and its own held-out test calls.
 //
-// Pass criteria: all 3 test calls submitted, ≥4/5 dimensions matched on
-// each, ≥5 memory entries written during learning, directive evolved.
+// The main thread is a dispatcher: it discovers centers via
+// list_centers, then spawns one sub-thread per center. Each sub-thread
+// gets isolated memory + directive scope so heuristics for SaaS-demo
+// grading don't pollute telesales grading. Sub-threads execute the
+// classic STUDY → RATE flow on their own center, then return.
 //
-// This is a different shape from LearningAgent: that scenario learns by
-// trial-and-error from action failures, while RubricLearning learns from
-// pre-labeled examples (few-shot calibration). The pattern matters for
-// any QA / grading / classification workflow.
+// Pass criteria (per center): every test call submitted, ≥3/5 of the
+// center's dimensions within ±1 of ground truth on each call, ≥60%
+// dims matched overall.
 var rubricLearningScenario = Scenario{
 	Name: "RubricLearning",
-	Directive: `You are a sales-call QA analyst learning to apply a grading rubric from
-labeled training examples, then rating new calls.
+	Directive: `You coordinate sales-call QA across multiple call centers. Each
+center has its OWN rubric, dimension set, training pool, and test
+pool. Your job is to dispatch — you do NOT grade calls yourself.
 
-The sales_qa MCP server gives you these tools:
-  - get_rubric                  — the 5-dimension rubric (each 1-5)
-  - list_training_calls         — id+title only
-  - get_training_call(id)       — transcript + ground-truth ratings + notes
-  - list_test_calls             — held-out calls (id+title only)
-  - get_test_call(id)           — transcript only, no ratings
-  - submit_rating(call_id, discovery, objection, next_steps, pricing, energy)
-    — server scores you against hidden ground truth, returns per-dimension deltas
+The sales_qa MCP server is shared across centers. Every tool except
+list_centers takes a center id.
 
-YOUR PROCESS — execute autonomously:
+YOUR PROCESS:
 
-PHASE A — STUDY:
-  1. Call get_rubric to learn the 5 dimensions and their level-by-level criteria.
-  2. Call list_training_calls, then get_training_call for EVERY id in the list.
-     For each example, study the transcript + the ground-truth ratings + the
-     grader notes. The notes are the single most valuable signal — they tell
-     you WHY this call got the score it did.
-  3. After reading all examples, identify the patterns. For each dimension,
-     ask: "what specific behaviors take a call from 1 to 5?" Use the notes
-     to ground your heuristics in observable evidence (e.g. "discovery=5
-     requires 4+ open questions AND surfacing concrete numbers").
-  4. Call [[remember]] with each heuristic — at least one per dimension,
-     more is fine. Memory persists across iterations; conversation does not.
-  5. Call [[evolve]] to rewrite your directive with: (a) the rubric inline,
-     (b) the heuristics you discovered. Future iterations need to be able
-     to grade purely from the directive + memory if conversation history
-     is lost.
+1. Call list_centers to see what's available. Note each center's id
+   and dimension set — they differ deliberately.
 
-PHASE B — RATE TEST CALLS:
-  6. Call list_test_calls. For EACH test call:
-     a. Call get_test_call(id) to read the transcript.
-     b. Apply your heuristics dimension by dimension. Be specific in your
-        thought — quote evidence from the transcript for each rating.
-     c. Call submit_rating with all 5 dimensions as integers 1-5.
-     d. Read the server's feedback. If you matched <4/5 dimensions on a
-        call, that's a signal your heuristics are off — refine them with
-        another [[remember]] before you grade the next call.
-  7. After all 3 test calls are submitted, you are done. Pace down to sleep
-     and wait.
+2. For EACH center returned, spawn ONE sub-thread:
+   [[spawn id="qa-<center_id>" mcp="sales_qa" tools="remember,evolve" directive="<directive below, with <center_id> filled in>"]]
 
-CRITICAL: The agent's job is calibration, not pure inference. You CANNOT
-rely on conversation history surviving — only [[remember]] entries and
-the evolved directive will be available on later iterations. Encode
-generously.`,
+   Sub-thread directive template (substitute <center_id> in 3 places):
+
+   You are a QA analyst calibrating to call center "<center_id>". Use
+   the sales_qa MCP, always passing center="<center_id>".
+
+   PHASE A — STUDY:
+     1. get_rubric(center="<center_id>") — learn the dimension criteria.
+     2. list_training_calls(center="<center_id>"), then get_training_call
+        for EVERY id. Read the transcript + ratings + notes. The notes
+        are the most valuable signal — they tell you WHY each call
+        scored what it did.
+     3. Identify per-dimension patterns. What distinguishes a 1 from a 5?
+     4. [[remember]] each heuristic — at least one per dimension.
+
+   PHASE B — RATE TEST CALLS:
+     5. list_test_calls(center="<center_id>"). For each test call:
+        a. get_test_call(center="<center_id>", id=...).
+        b. Quote concrete evidence for each rating dimension.
+        c. submit_rating(center="<center_id>", call_id=..., ratings={...})
+           where ratings is an OBJECT with one integer per dimension
+           in this center's dimension set.
+        d. Read server feedback. If <3 dims matched, refine heuristics
+           with [[remember]] before grading the next call.
+     6. After every test call has a submission, pace down. You're done.
+
+3. After spawning all centers, pace down. Wait for the sub-threads to
+   finish. Do NOT call the rubric/training/test/submit tools yourself.
+
+CRITICAL for sub-threads: pass center="<center_id>" on EVERY tool call.
+The MCP rejects calls missing the center arg. The dimension set varies
+per center — never copy heuristics or dimension names across centers.`,
 	MCPServers: []MCPServerConfig{
 		{Name: "sales_qa", Command: "", Env: map[string]string{"SALES_QA_DATA_DIR": "{{dataDir}}"}, MainAccess: true},
 	},
@@ -6074,33 +6070,47 @@ generously.`,
 	},
 	Phases: []Phase{
 		{
-			// One unified phase. The scenario's point is end-to-end accuracy:
-			// given rubric + labeled examples, can the agent rate new calls
-			// correctly? Whether it uses remember/evolve or just in-context
-			// reasoning is up to the model — both are valid answers as long
-			// as the ratings are accurate.
-			Name:    "Study rubric + training calls, then rate 3 held-out test calls",
-			Timeout: 8 * time.Minute,
+			Name:    "Dispatch sub-threads per center, study + rate all test calls",
+			Timeout: 20 * time.Minute,
 			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				// Done when submissions.jsonl has at least 3 distinct
-				// call_ids (latest submission wins per call).
+				// Done when every center has at least one submission per
+				// of its test calls. Expected counts are baked into the
+				// MCP binary; rather than re-import them, we hard-code
+				// here. Keeping this in sync with the MCP is the test
+				// author's job — drifting it is loud (timeout vs. silent
+				// pass) so it's easy to catch.
+				expected := map[string]int{
+					"saas_demo":        3,
+					"telesales":        2,
+					"support_recovery": 2,
+				}
 				data, err := os.ReadFile(filepath.Join(dir, "submissions.jsonl"))
 				if err != nil {
 					return false
 				}
-				seen := make(map[string]bool)
+				seen := make(map[string]map[string]bool) // center → call_id → seen
 				for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 					if strings.TrimSpace(ln) == "" {
 						continue
 					}
 					var row struct {
+						Center string `json:"center"`
 						CallID string `json:"call_id"`
 					}
-					if err := json.Unmarshal([]byte(ln), &row); err == nil {
-						seen[row.CallID] = true
+					if err := json.Unmarshal([]byte(ln), &row); err != nil {
+						continue
+					}
+					if seen[row.Center] == nil {
+						seen[row.Center] = map[string]bool{}
+					}
+					seen[row.Center][row.CallID] = true
+				}
+				for center, want := range expected {
+					if len(seen[center]) < want {
+						return false
 					}
 				}
-				return len(seen) >= 3
+				return true
 			},
 			Verify: func(t *testing.T, dir string, th *Thinker) {
 				data, err := os.ReadFile(filepath.Join(dir, "submissions.jsonl"))
@@ -6108,17 +6118,18 @@ generously.`,
 					t.Fatalf("submissions.jsonl missing: %v", err)
 				}
 				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-				t.Logf("total submissions: %d", len(lines))
+				t.Logf("total submissions: %d (across all centers)", len(lines))
 
-				// Track latest submission per call_id — the agent may
-				// resubmit after seeing feedback, and the latest attempt
-				// is what we grade.
 				type submission struct {
+					Center      string         `json:"center"`
 					CallID      string         `json:"call_id"`
 					Submitted   map[string]int `json:"submitted"`
 					GroundTruth map[string]int `json:"ground_truth"`
 					Deltas      map[string]int `json:"deltas"`
 				}
+				// Latest submission per (center, call_id) — agents may
+				// resubmit after seeing feedback; only the last attempt
+				// counts.
 				latest := make(map[string]submission)
 				for _, ln := range lines {
 					if strings.TrimSpace(ln) == "" {
@@ -6128,57 +6139,73 @@ generously.`,
 					if err := json.Unmarshal([]byte(ln), &s); err != nil {
 						continue
 					}
-					latest[s.CallID] = s
+					latest[s.Center+"|"+s.CallID] = s
 				}
 
-				if len(latest) < 3 {
-					gotIDs := make([]string, 0, len(latest))
-					for k := range latest {
-						gotIDs = append(gotIDs, k)
+				// Group by center for per-center reporting + thresholds.
+				expectedTests := map[string]int{
+					"saas_demo":        3,
+					"telesales":        2,
+					"support_recovery": 2,
+				}
+				perCenter := make(map[string][]submission)
+				for _, s := range latest {
+					perCenter[s.Center] = append(perCenter[s.Center], s)
+				}
+
+				for center, want := range expectedTests {
+					subs := perCenter[center]
+					t.Logf("center=%s: %d/%d submissions", center, len(subs), want)
+					if len(subs) < want {
+						gotIDs := make([]string, 0, len(subs))
+						for _, s := range subs {
+							gotIDs = append(gotIDs, s.CallID)
+						}
+						t.Errorf("center=%s: missing submissions, got %v want %d", center, gotIDs, want)
 					}
-					t.Errorf("expected submissions for all 3 test calls, got %d (got: %v)",
-						len(latest), gotIDs)
-				}
 
-				// Per-call accuracy: count dimensions where delta ≤ 1.
-				// Log every submission regardless of pass/fail so failing
-				// runs produce actionable output.
-				totalMatches := 0
-				totalDims := 0
-				for callID, s := range latest {
-					matches := 0
-					for _, delta := range s.Deltas {
-						totalDims++
-						if delta <= 1 {
-							matches++
-							totalMatches++
+					totalMatches := 0
+					totalDims := 0
+					for _, s := range subs {
+						matches := 0
+						dims := 0
+						for _, delta := range s.Deltas {
+							dims++
+							if delta <= 1 {
+								matches++
+							}
+						}
+						totalDims += dims
+						totalMatches += matches
+						t.Logf("  %s/%s: %d/%d within ±1 — submitted=%v truth=%v deltas=%v",
+							center, s.CallID, matches, dims, s.Submitted, s.GroundTruth, s.Deltas)
+						// Per-call floor: at least 3/N dims within ±1 (more
+						// forgiving than the old 4/5 because dim counts
+						// vary per center; 3/5 = 60%, applied as ratio).
+						if dims > 0 && matches*5 < dims*3 {
+							t.Errorf("%s/%s: only %d/%d dims matched (need ≥60%%)", center, s.CallID, matches, dims)
 						}
 					}
-					t.Logf("  %s: %d/5 within ±1 — submitted=%v truth=%v deltas=%v",
-						callID, matches, s.Submitted, s.GroundTruth, s.Deltas)
-					if matches < 3 {
-						t.Errorf("%s: only %d/5 dimensions matched (need ≥3)", callID, matches)
-					}
-				}
-				if totalDims > 0 {
-					accuracy := float64(totalMatches) / float64(totalDims) * 100
-					t.Logf("overall: %d/%d dimensions matched (%.1f%%)", totalMatches, totalDims, accuracy)
-					if totalMatches < 10 { // 10/15 = 66% floor
-						t.Errorf("overall accuracy too low: %d/15 (need ≥10)", totalMatches)
+					if totalDims > 0 {
+						pct := float64(totalMatches) / float64(totalDims) * 100
+						t.Logf("center=%s overall: %d/%d dims matched (%.1f%%)",
+							center, totalMatches, totalDims, pct)
+						// Center-level floor: 60% of dims across all test calls.
+						if totalMatches*5 < totalDims*3 {
+							t.Errorf("center=%s overall accuracy too low: %d/%d (need ≥60%%)",
+								center, totalMatches, totalDims)
+						}
 					}
 				}
 
-				// Bonus: log whether the agent ALSO used remember/evolve.
-				// Not required for pass, just informational — if future
-				// iterations without context can still rate correctly,
-				// that's a stronger signal of learning.
-				t.Logf("bonus: memory=%d entries, directive=%d chars",
+				t.Logf("bonus: memory=%d entries on main, directive=%d chars",
 					th.memory.Count(), len(th.config.GetDirective()))
 			},
 		},
 	},
-	Timeout:    15 * time.Minute,
-	MaxThreads: 3,
+	Timeout: 30 * time.Minute,
+	// 1 main + 1 sub per center. Sub-threads run in parallel.
+	MaxThreads: 4,
 }
 
 func TestScenario_RubricLearning(t *testing.T) {
