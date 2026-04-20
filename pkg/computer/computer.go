@@ -14,6 +14,11 @@ type Action struct {
 	Amount    int    `json:"amount,omitempty"`    // scroll amount
 	URL       string `json:"url,omitempty"`       // for "navigate"
 	Duration  int    `json:"duration,omitempty"`  // for "wait" (milliseconds)
+	// Label: Set-of-Mark target. When non-zero, click/double_click
+	// resolve the target via the label→bbox map populated by the
+	// most recent screenshot. Takes precedence over X/Y when set.
+	// Implementations that don't support SoM fall back to X/Y.
+	Label int `json:"label,omitempty"`
 }
 
 // DisplaySize holds screen dimensions.

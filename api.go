@@ -50,6 +50,11 @@ func startAPI(thinker *Thinker, addr string) error {
 	mux.HandleFunc("/pause", api.apiAuth(api.pause))
 	mux.HandleFunc("/event", api.apiAuth(api.postEvent))
 	mux.HandleFunc("/config", api.apiAuth(api.config))
+	// Memory inspection/editing. GET lists, DELETE + PUT target a
+	// single entry by zero-based index (matching memory_scan output
+	// so UI indices line up with the agent's internal view).
+	mux.HandleFunc("/memory", api.apiAuth(api.memoryList))
+	mux.HandleFunc("/memory/", api.apiAuth(api.memoryItem))
 	mux.Handle("/", http.FileServer(http.Dir("web")))
 	return http.ListenAndServe(addr, mux)
 }
@@ -750,4 +755,105 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
+}
+
+// memoryListItem is the UI-facing projection of a MemoryEntry.
+// Embeddings are omitted (useless to the UI, ~6KB per entry), and
+// the index is attached so callers can DELETE/PUT without guessing.
+// tag is a best-effort extraction of the leading bracketed marker
+// ("[preference]", "[correction]", etc.) the remember-tool guidance
+// asks the agent to use — the UI uses it to color-group rows.
+type memoryListItem struct {
+	Index     int       `json:"index"`
+	Text      string    `json:"text"`
+	Tag       string    `json:"tag,omitempty"`
+	Namespace string    `json:"namespace,omitempty"`
+	Session   string    `json:"session,omitempty"`
+	Time      time.Time `json:"time"`
+}
+
+func extractTag(text string) string {
+	s := strings.TrimSpace(text)
+	if len(s) < 3 || s[0] != '[' {
+		return ""
+	}
+	end := strings.IndexByte(s, ']')
+	if end <= 1 {
+		return ""
+	}
+	return s[1:end]
+}
+
+// GET /memory — return every memory entry in store order.
+func (a *APIServer) memoryList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.thinker.memory == nil {
+		writeJSON(w, []memoryListItem{})
+		return
+	}
+	entries := a.thinker.memory.List()
+	out := make([]memoryListItem, len(entries))
+	for i, e := range entries {
+		out[i] = memoryListItem{
+			Index:     i,
+			Text:      e.Text,
+			Tag:       extractTag(e.Text),
+			Namespace: e.Namespace,
+			Session:   e.Session,
+			Time:      e.Time,
+		}
+	}
+	writeJSON(w, out)
+}
+
+// /memory/{index} — DELETE prunes, PUT rewrites + recomputes embedding.
+func (a *APIServer) memoryItem(w http.ResponseWriter, r *http.Request) {
+	if a.thinker.memory == nil {
+		http.Error(w, "memory store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	idxStr := strings.TrimPrefix(r.URL.Path, "/memory/")
+	idxStr = strings.TrimSuffix(idxStr, "/")
+	if idxStr == "" {
+		http.Error(w, "index required", http.StatusBadRequest)
+		return
+	}
+	var idx int
+	if _, err := fmt.Sscanf(idxStr, "%d", &idx); err != nil {
+		http.Error(w, "invalid index", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodDelete:
+		// Delete is range-checked internally; silent no-op on bad index
+		// matches the memory_prune tool's behavior so the UX is the same.
+		a.thinker.memory.Delete(idx)
+		writeJSON(w, map[string]any{"ok": true, "count": a.thinker.memory.Count()})
+
+	case http.MethodPut:
+		var body struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		text := strings.TrimSpace(body.Text)
+		if text == "" {
+			http.Error(w, "text required", http.StatusBadRequest)
+			return
+		}
+		if err := a.thinker.memory.Update(idx, text); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }

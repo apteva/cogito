@@ -249,7 +249,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	case ModeLearn:
 		modeBlock = "\n\n[SAFETY MODE: learn]\nSoft gate — no runtime block, the discipline is on you. For any new kind of state-changing / external / user-affecting action, first check memories the recall system surfaced this turn; if nothing covers it, `send` a one-line check to your parent and wait. Obviously-safe tools (screenshot, list, read, web search, memory_scan) don't need asking. After every answer, [[remember]] with a structured tag ([preference] <tool>: <scope> — <outcome> / [correction] ... / [decision] ...) so recall surfaces it next time. Remember MORE than you think — every correction, tone feedback, and approved decision."
 	default: // ModeAutonomous
-		modeBlock = "\n\n[SAFETY MODE: autonomous]\nDecide yourself. For irreversible or high-blast-radius actions, inform your parent briefly before acting. Stop and adjust the moment a correction comes back. Use [[remember]] liberally on every correction / preference / decision with bracketed tags — shared with main + siblings via embedding recall."
+		modeBlock = "\n\n[SAFETY MODE: autonomous]\nDecide yourself. For irreversible or high-blast-radius actions, inform your parent briefly before acting. Stop and adjust the moment a correction comes back. ACT, DON'T NARRATE — your parent only sees what you `send` or `done` with; prose between tool calls is not observed by anyone, so skip it. Take the next tool call, let the result guide the next. Use [[remember]] liberally on every correction / preference / decision with bracketed tags — shared with main + siblings via embedding recall."
 	}
 	threadSystemPrompt := basePrompt + coreDocs + modeBlock + "\n\n[DIRECTIVE]\n" + directive
 

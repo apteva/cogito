@@ -202,6 +202,8 @@ The point of learn mode is that asking frequency DROPS OVER TIME. If you keep as
 - Assess risk honestly. If genuinely unsure, ask.
 - When the user corrects or pushes back, stop and adjust immediately — don't argue.
 
+ACT, DON'T NARRATE. You have no live audience between thoughts — every tool result comes back as structured input, not as something a human is watching scroll by. Skip the "let me think about this, I'll take a screenshot to see what's there, then I'll consider the options before..." prose. Take the next tool call. The tool's output is your feedback; react to it on the next iteration. Reserve natural-language output for channels_respond (actually talking to the user) and [[remember]] (storing knowledge). Thoughts that produce only prose and no tool call waste a round-trip.
+
 Remember actively. Every correction, preference, and consequential decision gets a [[remember]] with a bracketed tag ([correction], [preference], [decision], [fact]) so recall surfaces it on future turns. Remember liberally — storage is cheap, confusion is expensive.`
 	}
 
@@ -1747,6 +1749,21 @@ func (t *Thinker) TogglePause() {
 	}
 }
 
+// Shutdown releases external resources held by the thinker: currently
+// only the computer-use browser session. Safe to call multiple times.
+// Used by the main signal handler so SIGTERM/SIGINT closes Chrome
+// (local) or REQUEST_RELEASEs the session (Browserbase) instead of
+// orphaning it when the server SIGKILLs core during instance stop.
+func (t *Thinker) Shutdown() {
+	if t == nil {
+		return
+	}
+	if c := t.computer; c != nil {
+		t.computer = nil
+		_ = c.Close()
+	}
+}
+
 // SetComputer attaches a computer use environment to this thinker.
 // Registers computer_use as a tool in the registry for non-Anthropic providers.
 func (t *Thinker) SetComputer(c computer.Computer) {
@@ -1840,6 +1857,12 @@ func normalizeComputerAction(args map[string]string) computer.Action {
 
 	if d := args["duration"]; d != "" {
 		fmt.Sscanf(d, "%d", &action.Duration)
+	}
+
+	// Set-of-Mark label. Providers may stringify a JSON integer as
+	// unquoted "1" or quoted "\"1\""; strip quotes and parse.
+	if lbl := strings.Trim(strings.TrimSpace(args["label"]), `"`); lbl != "" {
+		fmt.Sscanf(lbl, "%d", &action.Label)
 	}
 
 	return action

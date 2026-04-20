@@ -265,6 +265,60 @@ func (ms *MemoryStore) Count() int {
 	return len(ms.entries)
 }
 
+// List returns a snapshot of every memory entry, in store order
+// (oldest first). The returned slice is a copy so callers can iterate
+// without holding the lock. Embeddings are NOT populated on the copy
+// — they're 768 floats each, roughly 6KB per entry, and nothing
+// outside the store uses them once the embedding has been written.
+func (ms *MemoryStore) List() []MemoryEntry {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	out := make([]MemoryEntry, len(ms.entries))
+	for i, e := range ms.entries {
+		out[i] = MemoryEntry{
+			Text:      e.Text,
+			Time:      e.Time,
+			Session:   e.Session,
+			Namespace: e.Namespace,
+			// Embedding intentionally omitted.
+		}
+	}
+	return out
+}
+
+// Update replaces the text of the memory at `index`, recomputes the
+// embedding so recall stays consistent with the new wording, and
+// rewrites the JSONL file. Returns an error if the index is out of
+// range or the embedding call fails.
+func (ms *MemoryStore) Update(index int, newText string) error {
+	ms.mu.Lock()
+	if index < 0 || index >= len(ms.entries) {
+		ms.mu.Unlock()
+		return fmt.Errorf("index %d out of range (have %d entries)", index, len(ms.entries))
+	}
+	ms.mu.Unlock()
+
+	if ms.apiKey == "" {
+		return fmt.Errorf("no API key for embeddings")
+	}
+	emb, err := ms.embed(newText)
+	if err != nil {
+		return fmt.Errorf("embedding failed: %w", err)
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	// Re-check after re-acquiring: a concurrent Delete could have shifted things.
+	if index < 0 || index >= len(ms.entries) {
+		return fmt.Errorf("index %d out of range after lock", index)
+	}
+	ms.entries[index].Text = newText
+	ms.entries[index].Embedding = emb
+	ms.entries[index].Time = time.Now() // bump so "recently edited" is visible
+	ms.rewrite()
+	return nil
+}
+
 func (ms *MemoryStore) Recent(n int) []MemoryEntry {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()

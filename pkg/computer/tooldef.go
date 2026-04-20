@@ -3,6 +3,7 @@ package computer
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -22,16 +23,30 @@ func GetComputerToolDef(display DisplaySize) ToolDefinition {
 	return ToolDefinition{
 		Name: "computer_use",
 		Description: fmt.Sprintf(
-			"Control a browser (%dx%d). Every action returns a screenshot. "+
-				"ALWAYS screenshot first to see the page, then click/type based on what you see. "+
-				"This is your PRIMARY tool for all browser interaction.",
+			"Interact with the rendered browser page (%dx%d). One tool, many actions. "+
+				"Every action returns a fresh screenshot — use it as your ground truth, "+
+				"don't over-narrate between actions.",
 			display.Width, display.Height,
 		),
 		Syntax: `[[computer_use action="screenshot"]]`,
-		Rules: "Actions: screenshot, click (coordinate=\"x,y\"), double_click (coordinate=\"x,y\"), " +
-			"type (text=\"...\"), key (key=\"Enter\"/\"Escape\"/\"ctrl+c\"), " +
-			"scroll (direction=\"up\"/\"down\"/\"left\"/\"right\", amount=3, optional coordinate=\"x,y\" to scroll a specific element), mouse_move (coordinate=\"x,y\"), wait (duration=1000ms). " +
-			"WORKFLOW: 1) screenshot to see page 2) click/type based on coordinates you see 3) screenshot again to verify.",
+		Rules: "" +
+			"DEFAULT WORKFLOW (use this unless the task says otherwise):\n" +
+			"  1. action=screenshot — see the current state. If Set-of-Mark is active you'll\n" +
+			"     see small colored numeric badges on every interactive element:\n" +
+			"       blue = link   |   green = button   |   orange = input/textarea/select   |   gray = other\n" +
+			"  2. To click, read the badge number and use action=click, label=N.\n" +
+			"     Never estimate pixels when a badge is visible — labels are reliable, coordinates aren't.\n" +
+			"  3. To enter text, first click the input (action=click, label=N — this focuses the field),\n" +
+			"     then action=type, text=\"...\" — the text goes into whichever field is focused.\n" +
+			"  4. For keys like Enter / Escape / Tab / ctrl+c use action=key, key=\"Enter\".\n" +
+			"  5. To reveal content below or above the viewport use action=scroll,\n" +
+			"     direction=up|down|left|right, amount=3 (≈3 wheel ticks). After any scroll\n" +
+			"     take a fresh screenshot — badges are re-enumerated for whatever's now visible.\n" +
+			"\n" +
+			"ACTIONS: screenshot | click | double_click | type | key | scroll | mouse_move | wait.\n" +
+			"\n" +
+			"FALLBACK: action=click + coordinate=\"x,y\" still works, but only use it when the target\n" +
+			"has no badge (canvas, WebGL, custom widgets). Prefer label otherwise.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -63,6 +78,10 @@ func GetComputerToolDef(display DisplaySize) ToolDefinition {
 					"type":        "string",
 					"description": "Wait duration in milliseconds (default 1000)",
 				},
+				"label": map[string]any{
+					"type":        "string",
+					"description": "Set-of-Mark target: integer label shown on a colored numeric badge in the screenshot. Alternative to coordinate for click/double_click. Use this when badges are visible.",
+				},
 			},
 			"required": []string{"action"},
 		},
@@ -72,11 +91,18 @@ func GetComputerToolDef(display DisplaySize) ToolDefinition {
 // GetSessionToolDef returns the browser_session tool definition.
 func GetSessionToolDef() ToolDefinition {
 	return ToolDefinition{
-		Name: "browser_session",
-		Description: "Navigate to a URL, check status, or close the browser. Does NOT return screenshots — take a screenshot after opening a URL to see the page.",
-		Syntax: `[[browser_session action="open" url="https://example.com"]]`,
-		Rules: "Actions: open (navigates to URL), close (ends session), status (returns current URL), resume (reconnect to session). " +
-			"After opening a URL, ALWAYS take a screenshot to see the page. Do NOT use status to check what happened — take a screenshot instead.",
+		Name:        "browser_session",
+		Description: "Session lifecycle only: open a URL, close the browser, resume. Does NOT return screenshots — take one with computer_use afterward to see the page.",
+		Syntax:      `[[browser_session action="open" url="https://example.com"]]`,
+		Rules: "" +
+			"ACTIONS:\n" +
+			"  open   — navigate to a URL. Follow with computer_use(action=screenshot).\n" +
+			"  close  — end the session. Use when the task is finished.\n" +
+			"  resume — reconnect to a previously-created session (Browserbase only).\n" +
+			"  status — read current URL + viewport. Rarely needed: every computer_use\n" +
+			"           action already returns a fresh screenshot and you can see the URL\n" +
+			"           bar there. Don't call status between every other action — it's\n" +
+			"           a round-trip that adds no information the screenshot doesn't show.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -145,6 +171,21 @@ func HandleComputerAction(comp Computer, args map[string]string) (text string, s
 
 	action := Action{Type: actionType}
 	parseCoordinate(args["coordinate"], &action)
+	// SoM: label=N is an alternative to coordinate="x,y" for click /
+	// double_click. The Computer implementation resolves it against
+	// the label map populated by the most recent screenshot. Accept
+	// integer, string, or JSON-numeric forms (providers differ in
+	// how they stringify numeric tool-call args).
+	if lbl := strings.TrimSpace(args["label"]); lbl != "" {
+		// Strip surrounding quotes if provider passed "1" through JSON.
+		lbl = strings.Trim(lbl, `"`)
+		if n, err := strconv.Atoi(lbl); err == nil {
+			action.Label = n
+			fmt.Fprintf(os.Stderr, "[tooldef] parsed label=%d from args\n", n)
+		} else {
+			fmt.Fprintf(os.Stderr, "[tooldef] label raw=%q atoi failed: %v\n", lbl, err)
+		}
+	}
 	action.Text = args["text"]
 	action.Key = args["key"]
 

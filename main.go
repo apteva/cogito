@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	aptcomputer "github.com/apteva/computer"
@@ -173,6 +175,23 @@ func main() {
 			}
 		}()
 	}
+
+	// Trap SIGTERM/SIGINT so a server-initiated instance stop (or a
+	// manual Ctrl+C in headless mode) can release the local Chrome
+	// process or Browserbase session before the process exits. Without
+	// this, SIGKILL from the server's Stop() leaks Chrome (reparented
+	// to PID 1) and leaks paid Browserbase minutes. First signal runs
+	// Shutdown() and exits cleanly; a second signal after the deadline
+	// exits immediately in case Chrome's own SIGTERM hangs.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigCh
+		logMsg("SHUTDOWN", "signal received, releasing computer session")
+		thinker.Shutdown()
+		logMsg("SHUTDOWN", "done")
+		os.Exit(0)
+	}()
 
 	// Check for --headless flag or NO_TUI env var
 	headless := os.Getenv("NO_TUI") != ""
