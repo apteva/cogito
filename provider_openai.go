@@ -386,9 +386,9 @@ func NewFireworksProvider(apiKey string) LLMProvider {
 		url:        "https://api.fireworks.ai/inference/v1/chat/completions",
 		authHeader: "Bearer",
 		models: map[ModelTier]string{
-			ModelLarge:  "accounts/fireworks/routers/kimi-k2p5-turbo",
-			ModelMedium: "accounts/fireworks/routers/kimi-k2p5-turbo",
-			ModelSmall:  "accounts/fireworks/routers/kimi-k2p5-turbo",
+			ModelLarge:  "accounts/fireworks/models/kimi-k2p5",
+			ModelMedium: "accounts/fireworks/models/kimi-k2p5",
+			ModelSmall:  "accounts/fireworks/models/kimi-k2p5",
 		},
 		inputCost:  0.60,
 		cachedCost: 0.10,
