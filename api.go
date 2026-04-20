@@ -544,30 +544,7 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 //   - main_access=false entries get their tools listed once, the connection
 //     closed, and only an mcpCatalog row kept.
 //   - main_access=true entries get fully registered.
-// systemMCPNames are entries injected by the server at spawn time
-// (apteva-server gateway + per-instance channels MCP). The dashboard's GET
-// /config returns them as summaries (name + connected only) because they
-// carry dynamic URLs that aren't user-editable. If a client later PUTs the
-// mcp_servers list back, those system entries come back in stripped form —
-// reconcile must leave them untouched so we don't disconnect them and then
-// fail to reconnect from incomplete configs. Users attach/detach only
-// *their* MCP servers through the dashboard; system entries stay put.
-var systemMCPNames = map[string]bool{
-	"apteva-server":   true,
-	"channels":        true,
-	"apteva-channels": true,
-}
-
 func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
-	// Strip system entries from the desired list so reconcile ignores them.
-	filtered := make([]MCPServerConfig, 0, len(desired))
-	for _, c := range desired {
-		if systemMCPNames[c.Name] {
-			continue
-		}
-		filtered = append(filtered, c)
-	}
-	desired = filtered
 
 	names := make([]string, len(desired))
 	for i, c := range desired {
@@ -628,10 +605,6 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 	var kept []MCPConn
 	for _, srv := range t.mcpServers {
 		name := srv.GetName()
-		if systemMCPNames[name] {
-			kept = append(kept, srv)
-			continue
-		}
 		desiredCfg, stillWant := want[name]
 		if stillWant && !changed(currentCfg[name], desiredCfg) {
 			kept = append(kept, srv)
@@ -653,10 +626,6 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 	// touched.
 	var newCatalog []MCPServerInfo
 	for _, info := range t.mcpCatalog {
-		if systemMCPNames[info.Name] {
-			newCatalog = append(newCatalog, info)
-			continue
-		}
 		desiredCfg, stillWant := want[info.Name]
 		if stillWant && !changed(currentCfg[info.Name], desiredCfg) && !desiredCfg.MainAccess {
 			newCatalog = append(newCatalog, info)

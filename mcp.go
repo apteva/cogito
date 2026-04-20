@@ -61,6 +61,13 @@ type MCPServerConfig struct {
 	Transport  string            `json:"transport,omitempty"`  // "stdio" (default) or "http"
 	URL        string            `json:"url,omitempty"`        // http transport
 	MainAccess bool              `json:"main_access,omitempty"` // if true, tools are callable by main thread (not just sub-threads)
+	// NoSpawn, when true, forbids sub-threads from attaching this MCP via
+	// spawn(mcp="..."). Used for infrastructure-level servers the host
+	// wires in for main-thread-only responsibilities (management gateway,
+	// outbound channel bridges) where letting a worker attach would be a
+	// privilege escalation. Core has no knowledge of which names are
+	// "system" — the host sets this flag when registering those entries.
+	NoSpawn bool `json:"no_spawn,omitempty"`
 }
 
 // MCPConn is the interface for any MCP server connection (stdio or HTTP)

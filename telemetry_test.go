@@ -15,8 +15,8 @@ func TestTelemetry_Emit(t *testing.T) {
 	tel.Emit("llm.done", "main", LLMDoneData{
 		Model:    "test-model",
 		TokensIn: 100, TokensOut: 50,
-		DurationMs: 1500, CostUSD: 0.001,
-		Iteration: 1,
+		DurationMs: 1500,
+		Iteration:  1,
 	})
 
 	events, cursor := tel.Events(0)
@@ -45,9 +45,6 @@ func TestTelemetry_Emit(t *testing.T) {
 	}
 	if data.TokensIn != 100 {
 		t.Errorf("expected 100, got %d", data.TokensIn)
-	}
-	if data.CostUSD != 0.001 {
-		t.Errorf("expected 0.001, got %f", data.CostUSD)
 	}
 }
 
@@ -111,7 +108,7 @@ func TestTelemetry_AllEventTypes(t *testing.T) {
 	// LLM events
 	tel.Emit("llm.done", "main", LLMDoneData{
 		Model: "m", TokensIn: 10, TokensOut: 5, DurationMs: 100,
-		CostUSD: 0.0001, Iteration: 1, Rate: "normal",
+		Iteration: 1, Rate: "normal",
 	})
 	tel.Emit("llm.error", "main", LLMErrorData{
 		Model: "m", Error: "timeout", Iteration: 2,

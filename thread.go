@@ -158,14 +158,17 @@ func (tm *ThreadManager) SpawnWithOpts(id, directive string, tools []string, opt
 }
 
 func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opts SpawnOpts) error {
+	logMsg("SPAWN", fmt.Sprintf("enter id=%q parent=%q depth=%d tools=%v mcps=%v", id, opts.ParentID, opts.Depth, tools, opts.MCPNames))
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	if _, exists := tm.threads[id]; exists {
+		logMsg("SPAWN", fmt.Sprintf("reject id=%q: already exists in this manager", id))
 		return fmt.Errorf("thread %q already exists", id)
 	}
 	// Also check the entire tree — prevent duplicates across hierarchy levels
 	if threadExistsInTree(tm, id) {
+		logMsg("SPAWN", fmt.Sprintf("reject id=%q: already exists elsewhere in tree", id))
 		return fmt.Errorf("thread %q already exists in tree", id)
 	}
 
@@ -282,7 +285,30 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// Build thread-local registry: core tools + allowed local tools + MCP tools
 	// Auto-detect MCP server names from tool prefixes if not explicitly set.
 	// e.g. tools="store_get_inventory,web" → auto-detects "store" as MCP server needed.
+	//
+	// Strip any MCP whose config carries no_spawn=true. The host marks
+	// infrastructure-level servers (gateways, outbound bridges) with
+	// that flag so a worker spawned by the LLM can't escalate by
+	// attaching them via spawn(mcp="..."). Core has no opinion about
+	// which names are privileged — it only honors the flag.
 	mcpNames := opts.MCPNames
+	if len(mcpNames) > 0 && tm.parent.config != nil {
+		noSpawn := map[string]bool{}
+		for _, sc := range tm.parent.config.GetMCPServers() {
+			if sc.NoSpawn {
+				noSpawn[sc.Name] = true
+			}
+		}
+		filtered := mcpNames[:0]
+		for _, n := range mcpNames {
+			if noSpawn[n] {
+				logMsg("SPAWN", fmt.Sprintf("%s: refusing no-spawn MCP %q on sub-thread", id, n))
+				continue
+			}
+			filtered = append(filtered, n)
+		}
+		mcpNames = filtered
+	}
 	if len(mcpNames) == 0 && tm.parent.config != nil {
 		knownServers := map[string]bool{}
 		for _, sc := range tm.parent.config.GetMCPServers() {
@@ -503,7 +529,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 
 	// Start the thinking loop (unless deferred for batch respawn)
 	if !opts.DeferRun {
+		logMsg("SPAWN", fmt.Sprintf("starting Run() for id=%q tools=%d mcps=%d", id, len(toolSet), len(threadMCPServers)))
 		go thinker.Run()
+	} else {
+		logMsg("SPAWN", fmt.Sprintf("deferred Run() for id=%q (batch respawn)", id))
 	}
 
 	provName := "unknown"

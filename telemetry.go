@@ -333,7 +333,12 @@ type LLMDoneData struct {
 	TokensCached int     `json:"tokens_cached"`
 	TokensOut    int     `json:"tokens_out"`
 	DurationMs   int64   `json:"duration_ms"`
-	CostUSD      float64 `json:"cost_usd"`
+	// cost_usd is no longer populated by core — pricing lives in the
+	// server, which enriches llm.done events with a canonical
+	// cost_usd on ingest. Removing the field from the Go type keeps
+	// core free of pricing data, but the wire format is still the
+	// same map-of-strings consumed by dashboards and persisted by
+	// the server.
 	Iteration    int     `json:"iteration"`
 	Rate         string  `json:"rate"`
 	ContextMsgs  int     `json:"context_msgs"`
@@ -443,10 +448,15 @@ func ModelContextWindow(modelID string) int {
 		{"claude-3-sonnet", 200_000},
 		{"claude-3-haiku", 200_000},
 
-		// --- Fireworks (Moonshot Kimi) ---
-		// Kimi K2.5 turbo via Fireworks router is 256K input context.
+		// --- Fireworks ---
+		// Kimi K2.5 (and turbo router) on Fireworks: 256K input context.
 		{"kimi-k2p5", 256_000},
 		{"kimi-k2", 128_000},
+		// MiniMax on Fireworks — 196,608 (192K) tokens per the provider's
+		// published spec (fireworks.ai/models/fireworks/minimax-m2p7).
+		{"minimax-m2p7", 196_608},
+		{"minimax-m2p5", 196_608},
+		{"minimax-m2", 196_608},
 
 		// --- OpenAI ---
 		{"gpt-4.1", 1_000_000},

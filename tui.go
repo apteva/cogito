@@ -885,9 +885,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case ev.Type == "llm.done":
 					var d LLMDoneData
 					if json.Unmarshal(ev.Data, &d) == nil {
-						line = fmt.Sprintf("%s %s %s %d→%d tok %dms $%.4f #%d",
+						line = fmt.Sprintf("%s %s %s %d→%d tok %dms #%d",
 							ts, telemetryLLMStyle.Render("llm.done"), ev.ThreadID,
-							d.TokensIn, d.TokensOut, d.DurationMs, d.CostUSD, d.Iteration)
+							d.TokensIn, d.TokensOut, d.DurationMs, d.Iteration)
 					}
 				case ev.Type == "llm.error":
 					var d LLMErrorData

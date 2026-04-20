@@ -667,6 +667,13 @@ func mainToolHandler(t *Thinker) ToolHandler {
 		var replies []string
 		var toolNames []string
 		var results []ToolResult
+		if len(calls) > 0 {
+			names := make([]string, len(calls))
+			for i, c := range calls {
+				names[i] = c.Name
+			}
+			logMsg("TOOLS", fmt.Sprintf("[%s] handling %d tool call(s): %v", t.threadID, len(calls), names))
+		}
 		for _, call := range calls {
 			// Check if this is an inline tool (handled here) or registry tool (handled by executeTool)
 			isInline := true
@@ -739,7 +746,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						}
 					}
 				}
-				if id != "" && directive != "" {
+				if id == "" || directive == "" {
+					logMsg("SPAWN", fmt.Sprintf("skip: missing id=%q or directive_len=%d in LLM call", id, len(directive)))
+				} else {
+					logMsg("SPAWN", fmt.Sprintf("LLM-requested id=%q tools=%v mcp=%v provider=%q builtins=%v directive_len=%d",
+						id, tools, mcpNames, providerName, builtinTools, len(directive)))
 					err := t.threads.SpawnWithOpts(id, directive, tools, SpawnOpts{
 						MediaParts:   mediaParts,
 						ProviderName: providerName,
@@ -749,8 +760,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						BuiltinTools: builtinTools,
 					})
 					if err != nil {
+						logMsg("SPAWN", fmt.Sprintf("FAILED id=%q: %v", id, err))
 						addResult(fmt.Sprintf("error: %v", err))
 					} else {
+						logMsg("SPAWN", fmt.Sprintf("OK id=%q", id))
 						t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames})
 						addResult(fmt.Sprintf("thread %s spawned", id))
 					}
@@ -1339,7 +1352,9 @@ func (t *Thinker) Run() {
 				TokensCached:     usage.CachedTokens,
 				TokensOut:        usage.CompletionTokens,
 				DurationMs:       duration.Milliseconds(),
-				CostUSD:          calculateCostForProvider(t.provider, usage),
+				// cost_usd intentionally omitted — server enriches with
+				// canonical pricing at ingest so we're not double-booking
+				// the model→cost knowledge in core.
 				Iteration:        t.iteration,
 				Rate:             formatSleep(sleepDur),
 				ContextMsgs:      len(t.messages),
@@ -1459,7 +1474,16 @@ func (t *Thinker) think() (ChatResponse, error) {
 		})
 	}
 
-	return t.provider.Chat(t.messages, t.modelID(), nativeTools, onChunk, onThinking, onToolChunk)
+	// Bracket the provider call with enter/exit logs so we can see when
+	// we go in and how long until we come out. Any "hang" on a spawn
+	// request shows up here as an unbalanced enter with no exit.
+	callStart := time.Now()
+	logMsg("THINK", fmt.Sprintf("[%s] provider.Chat enter model=%s msgs=%d tools=%d",
+		t.threadID, t.modelID(), len(t.messages), len(nativeTools)))
+	resp, err := t.provider.Chat(t.messages, t.modelID(), nativeTools, onChunk, onThinking, onToolChunk)
+	logMsg("THINK", fmt.Sprintf("[%s] provider.Chat exit model=%s dur=%s tool_calls=%d err=%v",
+		t.threadID, t.modelID(), time.Since(callStart).Round(time.Millisecond), len(resp.ToolCalls), err))
+	return resp, err
 }
 
 // drainEvents reads all pending events and wake signals from this thinker's bus subscription.
