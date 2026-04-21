@@ -544,7 +544,7 @@ func copyAndInjectReason(schema map[string]any) map[string]any {
 	}
 	props["_reason"] = map[string]any{
 		"type":        "string",
-		"description": "Brief reason for this tool call — what you're doing and why (for observability)",
+		"description": "Short action label — what this call is doing. 3-6 words, imperative (e.g. \"find ventes sheet id\", \"update Score cell\"). No \"to …\" clauses, no justification.",
 	}
 	out["properties"] = props
 	// Add _reason to required list

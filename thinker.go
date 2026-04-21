@@ -867,7 +867,50 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				argsStr := call.Args["args"]
 				url := call.Args["url"]
 				transport := call.Args["transport"]
-				if name != "" && (command != "" || url != "") {
+				toolNames = append(toolNames, call.Raw)
+
+				func() {
+					if name == "" {
+						// Silent no-op was hiding model confusion —
+						// always emit a result so the tool_use is paired
+						// and the model sees the error on its next turn.
+						addResult("error: connect requires name=\"<server>\"")
+						return
+					}
+					// Catalog fallback: if the model omitted command/url
+					// but we already know this server from config (the
+					// catalog shown to main in [AVAILABLE MCP SERVERS]),
+					// use the stored config. This is what the model
+					// usually "means" when it tries connect name=<catalog
+					// name> — promote the server to main instead of
+					// asking it to re-guess transport details the host
+					// already knows.
+					if command == "" && url == "" && t.config != nil {
+						for _, sc := range t.config.GetMCPServers() {
+							if sc.Name == name {
+								command = sc.Command
+								url = sc.URL
+								transport = sc.Transport
+								if len(sc.Args) > 0 && argsStr == "" {
+									argsStr = strings.Join(sc.Args, ",")
+								}
+								break
+							}
+						}
+					}
+					if command == "" && url == "" {
+						addResult(fmt.Sprintf("error: unknown server %q — either pass command=... (stdio) or url=... (http), or use a name listed in [AVAILABLE MCP SERVERS]", name))
+						return
+					}
+					// Reject re-connect of an already-attached server so
+					// the model gets a clear "already done" signal
+					// instead of silently duplicating state.
+					for _, srv := range t.mcpServers {
+						if srv.GetName() == name {
+							addResult(fmt.Sprintf("already connected to %s (use list_connected to see current servers)", name))
+							return
+						}
+					}
 					var mcpArgs []string
 					if argsStr != "" {
 						mcpArgs = strings.Split(argsStr, ",")
@@ -876,47 +919,46 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					srv, err := connectAnyMCP(cfg)
 					if err != nil {
 						addResult(fmt.Sprintf("error: %v", err))
-					} else {
-						tools, err := srv.ListTools()
-						if err != nil {
-							addResult(fmt.Sprintf("error: %v", err))
-							srv.Close()
-						} else {
-							t.mcpServers = append(t.mcpServers, srv)
-							for _, tool := range tools {
-								fullName := name + "_" + tool.Name
-								syntax := buildMCPSyntax(fullName, tool.InputSchema)
-								t.registry.Register(&ToolDef{
-									Name:        fullName,
-									Description: fmt.Sprintf("[%s] %s", name, tool.Description),
-									Syntax:      syntax,
-									Rules:       fmt.Sprintf("Provided by MCP server '%s'.", name),
-									Handler:     mcpProxyHandler(srv, tool.Name, t.blobs),
-									InputSchema: tool.InputSchema,
-									MCP:         true,
-									MCPServer:   name,
-								})
-							}
-							if t.memory != nil {
-								go func(srvName string, srvTools []mcpToolDef) {
-									for _, tl := range srvTools {
-										fullName := srvName + "_" + tl.Name
-										emb, err := t.memory.embed(fullName + ": " + tl.Description)
-										if err == nil {
-											td := t.registry.Get(fullName)
-											if td != nil {
-												td.Embedding = emb
-											}
-										}
-									}
-								}(name, tools)
-							}
-							t.config.SaveMCPServer(cfg)
-							addResult(fmt.Sprintf("connected to %s: %d tools", name, len(tools)))
-						}
+						return
 					}
-				}
-				toolNames = append(toolNames, call.Raw)
+					tools, err := srv.ListTools()
+					if err != nil {
+						srv.Close()
+						addResult(fmt.Sprintf("error: %v", err))
+						return
+					}
+					t.mcpServers = append(t.mcpServers, srv)
+					for _, tool := range tools {
+						fullName := name + "_" + tool.Name
+						syntax := buildMCPSyntax(fullName, tool.InputSchema)
+						t.registry.Register(&ToolDef{
+							Name:        fullName,
+							Description: fmt.Sprintf("[%s] %s", name, tool.Description),
+							Syntax:      syntax,
+							Rules:       fmt.Sprintf("Provided by MCP server '%s'.", name),
+							Handler:     mcpProxyHandler(srv, tool.Name, t.blobs),
+							InputSchema: tool.InputSchema,
+							MCP:         true,
+							MCPServer:   name,
+						})
+					}
+					if t.memory != nil {
+						go func(srvName string, srvTools []mcpToolDef) {
+							for _, tl := range srvTools {
+								fullName := srvName + "_" + tl.Name
+								emb, err := t.memory.embed(fullName + ": " + tl.Description)
+								if err == nil {
+									td := t.registry.Get(fullName)
+									if td != nil {
+										td.Embedding = emb
+									}
+								}
+							}
+						}(name, tools)
+					}
+					t.config.SaveMCPServer(cfg)
+					addResult(fmt.Sprintf("connected to %s: %d tools", name, len(tools)))
+				}()
 			case "disconnect":
 				name := call.Args["name"]
 				if name != "" {

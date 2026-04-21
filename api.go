@@ -150,13 +150,60 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
-	// Extract thread ID from path: /threads/{id}
-	id := strings.TrimPrefix(r.URL.Path, "/threads/")
-	if id == "" {
+	// Path is /threads/{id} or /threads/{id}/context.
+	path := strings.TrimPrefix(r.URL.Path, "/threads/")
+	if path == "" {
 		http.Error(w, "thread ID required", http.StatusBadRequest)
 		return
 	}
-	logMsg("API", fmt.Sprintf("%s /threads/%s", r.Method, id))
+	id, sub := path, ""
+	if i := strings.Index(path, "/"); i >= 0 {
+		id, sub = path[:i], path[i+1:]
+	}
+	logMsg("API", fmt.Sprintf("%s /threads/%s/%s", r.Method, id, sub))
+
+	if sub == "context" {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		t := findThinkerByID(a.thinker, id)
+		if t == nil {
+			http.Error(w, "thread not found", http.StatusNotFound)
+			return
+		}
+		// Copy the slice so the caller doesn't race with Run()
+		// appending to it on the next iteration. Individual Message
+		// fields remain shared — acceptable for a read-only inspect
+		// endpoint, same convention as ThreadManager.List().
+		msgs := make([]Message, len(t.messages))
+		copy(msgs, t.messages)
+		iter := t.iteration
+		model := t.modelID()
+		totalChars := 0
+		for _, m := range msgs {
+			totalChars += len(m.Content)
+			for _, p := range m.Parts {
+				totalChars += len(p.Text)
+			}
+		}
+		composition := buildComposition(t, msgs)
+		writeJSON(w, map[string]any{
+			"id":          id,
+			"iteration":   iter,
+			"model":       model,
+			"count":       len(msgs),
+			"total_chars": totalChars,
+			"messages":    msgs,
+			"composition": composition,
+		})
+		return
+	}
+
+	if sub != "" {
+		http.Error(w, fmt.Sprintf("unknown sub-path %q", sub), http.StatusNotFound)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodDelete:
@@ -170,6 +217,33 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "DELETE only", http.StatusMethodNotAllowed)
 	}
+}
+
+// findThinkerByID returns main or any sub-thread's Thinker by id, or nil.
+func findThinkerByID(main *Thinker, id string) *Thinker {
+	if id == "main" || id == main.threadID {
+		return main
+	}
+	if main.threads == nil {
+		return nil
+	}
+	return findInManager(main.threads, id)
+}
+
+func findInManager(tm *ThreadManager, id string) *Thinker {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	for _, t := range tm.threads {
+		if t.ID == id {
+			return t.Thinker
+		}
+		if t.Children != nil {
+			if th := findInManager(t.Children, id); th != nil {
+				return th
+			}
+		}
+	}
+	return nil
 }
 
 func (a *APIServer) events(w http.ResponseWriter, r *http.Request) {
