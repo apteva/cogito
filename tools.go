@@ -2,12 +2,9 @@ package main
 
 import (
 	"fmt"
-	"io"
-	"net/http"
 	"regexp"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 const maxToolResultLen = 4000
@@ -109,19 +106,7 @@ func executeTool(t *Thinker, call toolCall) {
 				resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name)}
 			}
 		} else {
-			// Fallback for tests without registry
-			switch call.Name {
-			case "web":
-				resp = ToolResponse{Text: webTool(call.Args)}
-			case "write_file":
-				resp = ToolResponse{Text: writeFileTool(call.Args)}
-			case "read_file":
-				resp = ToolResponse{Text: readFileTool(call.Args)}
-			case "list_files":
-				resp = ToolResponse{Text: listFilesTool(call.Args)}
-			default:
-				resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name)}
-			}
+			resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name)}
 		}
 
 		resultPreview := resp.Text
@@ -186,57 +171,6 @@ func executeTool(t *Thinker, call toolCall) {
 			},
 		})
 	}()
-}
-
-func webTool(args map[string]string) string {
-	url := args["url"]
-	if url == "" {
-		return "error: missing url argument"
-	}
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Sprintf("error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Sprintf("error: HTTP %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 100_000))
-	if err != nil {
-		return fmt.Sprintf("error reading body: %v", err)
-	}
-
-	text := stripHTML(string(body))
-	text = collapseWhitespace(text)
-
-	if utf8.RuneCountInString(text) > maxToolResultLen {
-		runes := []rune(text)
-		text = string(runes[:maxToolResultLen]) + "\n[truncated]"
-	}
-
-	return text
-}
-
-var reScript = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
-var reStyle = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
-var reTag = regexp.MustCompile(`<[^>]+>`)
-
-func stripHTML(s string) string {
-	s = reScript.ReplaceAllString(s, "")
-	s = reStyle.ReplaceAllString(s, "")
-	s = reTag.ReplaceAllString(s, " ")
-	// Decode common entities
-	s = strings.ReplaceAll(s, "&amp;", "&")
-	s = strings.ReplaceAll(s, "&lt;", "<")
-	s = strings.ReplaceAll(s, "&gt;", ">")
-	s = strings.ReplaceAll(s, "&quot;", `"`)
-	s = strings.ReplaceAll(s, "&#39;", "'")
-	s = strings.ReplaceAll(s, "&nbsp;", " ")
-	return s
 }
 
 func collapseWhitespace(s string) string {

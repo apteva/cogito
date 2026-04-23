@@ -237,7 +237,14 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	coreDocs := ""
 	if tm.parent.registry != nil {
-		coreDocs = "\n" + tm.parent.registry.CoreDocs(false)
+		// Same compact-vs-full trade-off as buildSystemPrompt: if the
+		// sub-thread's provider supports native tools, the schemas are
+		// already in tools[] and we skip duplicating them in prose.
+		if poolSupportsNativeTools(tm.parent.pool) {
+			coreDocs = "\n" + tm.parent.registry.CoreDocsSummary(false)
+		} else {
+			coreDocs = "\n" + tm.parent.registry.CoreDocs(false)
+		}
 	}
 	// Inject safety mode from parent config. Child-thread wording is a
 	// tighter version of the main-thread prompt: the child escalates to
@@ -441,7 +448,11 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		rebuildPrompt: func(toolDocs string) string {
 			cd := ""
 			if threadRegistry != nil {
-				cd = "\n" + threadRegistry.CoreDocs(false)
+				if poolSupportsNativeTools(tm.parent.pool) {
+					cd = "\n" + threadRegistry.CoreDocsSummary(false)
+				} else {
+					cd = "\n" + threadRegistry.CoreDocs(false)
+				}
 			}
 			var bp string
 			if canSpawn {

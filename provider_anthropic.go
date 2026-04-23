@@ -501,18 +501,36 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 			}
 		case "message_start":
 			if event.Message != nil && event.Message.Usage != nil {
-				usage.PromptTokens = event.Message.Usage.InputTokens
-				usage.CachedTokens = event.Message.Usage.CacheRead
-				if usage.CachedTokens > 0 || event.Message.Usage.CacheCreation > 0 {
-					logMsg("ANTHROPIC", fmt.Sprintf("cache: read=%d creation=%d input=%d", event.Message.Usage.CacheRead, event.Message.Usage.CacheCreation, event.Message.Usage.InputTokens))
+				u := event.Message.Usage
+				// Anthropic reports three separate counts:
+				//   input_tokens                — NEW tokens not served from cache
+				//   cache_read_input_tokens     — tokens served from cache
+				//   cache_creation_input_tokens — tokens newly written to cache
+				// The real "prompt size" the model processed is the sum
+				// of all three. We historically set PromptTokens =
+				// input_tokens alone, which is wrong: on a turn with a
+				// big cached prefix the cached count was legitimately
+				// larger than "PromptTokens", making cached > in look
+				// impossible. Downstream pricing (uncached = in − cached)
+				// stays correct because we include creation in the
+				// uncached bucket (creation is billed at ~1.25× input;
+				// we approximate at 1×).
+				usage.PromptTokens = u.InputTokens + u.CacheRead + u.CacheCreation
+				usage.CachedTokens = u.CacheRead
+				if u.CacheRead > 0 || u.CacheCreation > 0 {
+					logMsg("ANTHROPIC", fmt.Sprintf("cache: read=%d creation=%d fresh=%d total=%d",
+						u.CacheRead, u.CacheCreation, u.InputTokens, usage.PromptTokens))
 				}
 			}
 		case "message_delta":
 			if event.Usage != nil {
 				usage.CompletionTokens = event.Usage.OutputTokens
-				// Cache tokens can also appear in message_delta
-				if event.Usage.CacheRead > 0 {
+				// Cache tokens can also appear in message_delta — refresh
+				// the prompt total too, not just the cached count, so
+				// we don't drift from message_start.
+				if event.Usage.CacheRead > 0 || event.Usage.CacheCreation > 0 {
 					usage.CachedTokens = event.Usage.CacheRead
+					usage.PromptTokens = event.Usage.InputTokens + event.Usage.CacheRead + event.Usage.CacheCreation
 				}
 			}
 		}

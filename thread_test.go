@@ -243,10 +243,14 @@ func TestThreadKill_Cleanup(t *testing.T) {
 func TestToolRegistry_Dispatch(t *testing.T) {
 	reg := NewToolRegistry("test")
 
-	// Known tool with handler — web needs a URL but we just check dispatch works
-	_, ok := reg.Dispatch("web", map[string]string{"url": ""})
+	// Stub a tool with a handler to verify dispatch works
+	reg.Register(&ToolDef{
+		Name:    "stub",
+		Handler: func(args map[string]string) ToolResponse { return ToolResponse{Text: "ok"} },
+	})
+	_, ok := reg.Dispatch("stub", nil)
 	if !ok {
-		t.Error("expected web to dispatch")
+		t.Error("expected stub to dispatch")
 	}
 
 	// Core tool (no handler)

@@ -1,10 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"sync"
 	"time"
 )
 
@@ -19,6 +23,120 @@ var llmHTTPClient = &http.Client{
 		}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 	},
+}
+
+// streamIdleTimeout is how long we wait between bytes on a streaming
+// provider response before declaring the stream stalled. Chosen above
+// typical reasoning-model think pauses (which can hit 30-40s on deep
+// chain-of-thought) but well below the point where a real user would
+// give up. Override with APTEVA_STREAM_IDLE_TIMEOUT=<seconds>.
+func streamIdleTimeout() time.Duration {
+	if v := os.Getenv("APTEVA_STREAM_IDLE_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 60 * time.Second
+}
+
+// extractProviderRequestIDs pulls known request-id headers from an
+// HTTP response so we can tag telemetry with values the provider's own
+// support can grep. Different vendors ship different headers:
+//   Fireworks:  x-request-id
+//   Anthropic:  request-id, x-request-id
+//   OpenAI:     openai-request-id, x-request-id
+//   Google:     x-request-id, x-goog-request-id
+// Return as a name=value map preserving order of known headers we
+// checked; keeps the logs readable.
+func extractProviderRequestIDs(h http.Header) map[string]string {
+	candidates := []string{
+		"x-request-id",
+		"x-fw-request-id",
+		"fireworks-request-id",
+		"openai-request-id",
+		"request-id",
+		"x-goog-request-id",
+	}
+	out := map[string]string{}
+	for _, name := range candidates {
+		if v := h.Get(name); v != "" {
+			out[name] = v
+		}
+	}
+	return out
+}
+
+// ErrStreamIdleTimeout is returned by a stream reader that went silent
+// for longer than the idle window. Callers can branch on it to tag
+// telemetry as a stall instead of a generic I/O error.
+var ErrStreamIdleTimeout = errors.New("stream idle timeout (provider went silent mid-response)")
+
+// idleReader wraps an io.ReadCloser with a per-read idle timer. Every
+// Read resets the timer; if the timer fires (no bytes for idleTimeout),
+// the underlying body is closed, the next Read returns
+// ErrStreamIdleTimeout, and the connection goroutine unblocks cleanly.
+//
+// We rely on the HTTP server eventually flushing SOMETHING on a healthy
+// stream (even an SSE comment `: keepalive\n\n` counts). A fully silent
+// stall that lasts past idleTimeout is by definition unrecoverable
+// from the client side — the right move is to abort and let the think
+// loop retry on the next iteration.
+type idleReader struct {
+	body        io.ReadCloser
+	timer       *time.Timer
+	idleTimeout time.Duration
+	onStall     func() // called when the timer fires; receiver can log
+	mu          sync.Mutex
+	closed      bool
+	stalled     bool
+}
+
+func newIdleReader(body io.ReadCloser, idleTimeout time.Duration, onStall func()) *idleReader {
+	ir := &idleReader{body: body, idleTimeout: idleTimeout, onStall: onStall}
+	ir.timer = time.AfterFunc(idleTimeout, ir.fireStall)
+	return ir
+}
+
+func (ir *idleReader) fireStall() {
+	ir.mu.Lock()
+	ir.stalled = true
+	ir.mu.Unlock()
+	if ir.onStall != nil {
+		ir.onStall()
+	}
+	// Closing the body causes the in-flight Read to unblock with an
+	// error immediately, which is what we want.
+	_ = ir.body.Close()
+}
+
+func (ir *idleReader) Read(p []byte) (int, error) {
+	n, err := ir.body.Read(p)
+	if n > 0 {
+		// Every byte resets the idle window — healthy activity keeps
+		// the connection alive indefinitely.
+		ir.timer.Reset(ir.idleTimeout)
+	}
+	if err != nil {
+		ir.mu.Lock()
+		stalled := ir.stalled
+		ir.mu.Unlock()
+		if stalled {
+			return n, ErrStreamIdleTimeout
+		}
+	}
+	return n, err
+}
+
+func (ir *idleReader) Close() error {
+	ir.mu.Lock()
+	if ir.closed {
+		ir.mu.Unlock()
+		return nil
+	}
+	ir.closed = true
+	ir.mu.Unlock()
+	ir.timer.Stop()
+	return ir.body.Close()
 }
 
 // NativeTool defines a tool sent to the provider API.

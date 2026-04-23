@@ -113,31 +113,6 @@ func TestStripToolCalls_NoTools(t *testing.T) {
 	}
 }
 
-func TestStripHTML(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		contains string
-		excludes string
-	}{
-		{"removes tags", "<p>Hello</p>", "Hello", "<p>"},
-		{"removes script", "<script>alert('x')</script>Text", "Text", "alert"},
-		{"removes style", "<style>body{}</style>Text", "Text", "body"},
-		{"decodes entities", "&amp; &lt; &gt; &quot; &#39;", "& < > \" '", "&amp;"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := stripHTML(tt.input)
-			if tt.contains != "" && !containsStr(result, tt.contains) {
-				t.Errorf("expected result to contain %q, got %q", tt.contains, result)
-			}
-			if tt.excludes != "" && containsStr(result, tt.excludes) {
-				t.Errorf("expected result to NOT contain %q, got %q", tt.excludes, result)
-			}
-		})
-	}
-}
-
 func TestCollapseWhitespace(t *testing.T) {
 	input := "line1\n\n\n\nline2\n\nline3"
 	result := collapseWhitespace(input)

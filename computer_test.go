@@ -292,7 +292,7 @@ func TestComputerUse_LocalSoMMultistep(t *testing.T) {
 	if apiKey == "" {
 		t.Skip("FIREWORKS_API_KEY not set")
 	}
-	t.Setenv("APTEVA_SOM", "1")
+	// SoM is package-default via TestMain — no per-test setenv needed.
 
 	comp, err := aptcomputer.New(aptcomputer.Config{
 		Type: "local", Width: 1600, Height: 900,
@@ -429,10 +429,8 @@ func TestComputerUse_LocalSoMMultistep(t *testing.T) {
 // end-to-end at 1600×900 with Kimi. With SoM on the agent sees
 // numeric badges on each interactive element and we expect it to
 // reply with label=1 instead of guessing coordinates. Same example.com
-// click-the-link task as LocalClick; the difference is the grounding.
-//
-// Activated via APTEVA_SOM=1 set inside the test so a one-off run
-// doesn't affect neighboring tests.
+// click-the-link task as the removed raw-pixel probe; the difference
+// is the grounding. SoM is the package-default path (TestMain).
 //
 //	RUN_COMPUTER_TESTS=1 FIREWORKS_API_KEY=fw_... \
 //	APTEVA_HEADLESS_BROWSER=1 \
@@ -445,9 +443,7 @@ func TestComputerUse_LocalSoMClick(t *testing.T) {
 	if apiKey == "" {
 		t.Skip("FIREWORKS_API_KEY not set")
 	}
-	// Activate SoM for this test only; defer clears so later tests
-	// keep their existing coordinate-based behavior.
-	t.Setenv("APTEVA_SOM", "1")
+	// SoM is package-default via TestMain — no per-test setenv needed.
 
 	comp, err := aptcomputer.New(aptcomputer.Config{
 		Type:   "local",
@@ -583,167 +579,10 @@ func TestComputerUse_LocalSoMClick(t *testing.T) {
 	comp = nil
 }
 
-// TestComputerUse_LocalClick is the middle-tier test between the
-// navigate-and-read (LocalThinkLoop) and the full form-fill
-// (LocalLoginFlow). It proves the click action actually routes
-// mouse-down events to the right DOM element and triggers the
-// click's side-effect (navigation, in this case).
-//
-// Target: example.com has a single link "More information…" pointing
-// at iana.org/domains/example. The agent has to:
-//   1) navigate
-//   2) screenshot
-//   3) click the link using coordinates read from the screenshot
-//   4) verify URL changed
-//
-// Proof is URL-based — we don't need the LLM to describe the landing
-// page, just to successfully cause a navigation by clicking.
-//
-// Runs:
-//
-//	RUN_COMPUTER_TESTS=1 FIREWORKS_API_KEY=fw_... \
-//	APTEVA_HEADLESS_BROWSER=1 \
-//	go test -v -run TestComputerUse_LocalClick -timeout 5m ./
-func TestComputerUse_LocalClick(t *testing.T) {
-	if os.Getenv("RUN_COMPUTER_TESTS") == "" {
-		t.Skip("skipping local-click test (set RUN_COMPUTER_TESTS=1 to enable)")
-	}
-	apiKey := os.Getenv("FIREWORKS_API_KEY")
-	if apiKey == "" {
-		t.Skip("FIREWORKS_API_KEY not set")
-	}
-
-	comp, err := aptcomputer.New(aptcomputer.Config{
-		Type:   "local",
-		Width:  1600,
-		Height: 800,
-	})
-	if err != nil {
-		t.Fatalf("failed to create local computer: %v", err)
-	}
-	defer func() {
-		if comp != nil {
-			comp.Close()
-		}
-	}()
-	t.Logf("local chrome connected: %dx%d", comp.DisplaySize().Width, comp.DisplaySize().Height)
-
-	provider, err := selectProvider(&Config{})
-	if err != nil {
-		t.Fatalf("no provider: %v", err)
-	}
-
-	cfg := &Config{
-		Directive: "You have a local browser. Follow user instructions from the console.",
-		Mode:      ModeAutonomous,
-	}
-
-	thinker := NewThinker(apiKey, provider, cfg)
-	thinker.SetComputer(comp)
-
-	thinker.InjectConsole(strings.Join([]string{
-		`Do the following and stop:`,
-		`1) browser_session(action=open, url=https://example.com)`,
-		`2) computer_use(action=screenshot) to see the page.`,
-		`3) The page has a single link labeled "More information..." near the bottom of the text. Click it using computer_use(action=click, coordinate="x,y") — estimate the coordinates from the screenshot.`,
-		`4) Once you see a new page load (the URL will contain "iana"), reply: RESULT: clicked.`,
-		`Do not call pace, do not spawn threads.`,
-	}, "\n"))
-
-	obs := thinker.bus.SubscribeAll("test-click", 500)
-	logFile, _ := os.Create("computer_test_click_chunks.log")
-	defer logFile.Close()
-
-	var sawClick, cheated bool
-	done := make(chan struct{})
-	closed := false
-	var buf strings.Builder
-
-	go func() {
-		for {
-			select {
-			case ev := <-obs.C:
-				if ev.Type == EventThinkDone {
-					fmt.Fprintf(logFile, "\n=== THOUGHT #%d DONE (tok=%d/%d) ===\n",
-						ev.Iteration, ev.Usage.PromptTokens, ev.Usage.CompletionTokens)
-				}
-				if ev.Type == EventChunk {
-					fmt.Fprintf(logFile, "%s", ev.Text)
-					buf.WriteString(ev.Text)
-					s := buf.String()
-					if strings.Contains(s, "action=click") {
-						sawClick = true
-					}
-					// Cheat detection: after at least one click attempt,
-					// any direct browser_session(action=open, url=...)
-					// that targets an iana URL means the agent gave up
-					// and navigated directly instead of making a click
-					// actually work. A silent URL check would report
-					// success; we surface the cheat so the test fails
-					// loudly when click-from-vision is broken.
-					if sawClick && strings.Contains(s, "action=open") &&
-						(strings.Contains(s, "iana.org") || strings.Contains(s, "url=https://iana") || strings.Contains(s, "url=https://www.iana")) {
-						cheated = true
-					}
-				}
-				// Success: a click caused a navigation off example.com
-				// to an iana.org page WITHOUT the agent cheating.
-				if sawClick && !cheated && strings.Contains(currentURL(comp), "iana") && !closed {
-					closed = true
-					close(done)
-					return
-				}
-				// If the agent cheated, stop early with a clear fail
-				// signal — no point watching it burn LLM tokens on a
-				// run that will fail the final assertion anyway.
-				if cheated && !closed {
-					closed = true
-					close(done)
-					return
-				}
-			case <-time.After(4 * time.Minute):
-				return
-			}
-		}
-	}()
-
-	go thinker.Run()
-
-	select {
-	case <-done:
-		t.Log("click caused navigation — stopping agent")
-	case <-time.After(3 * time.Minute):
-		t.Log("timeout — evaluating final state")
-	}
-
-	finalURL := currentURL(comp)
-	thinker.Stop()
-	time.Sleep(300 * time.Millisecond)
-	logFile.Sync()
-
-	logContent, _ := os.ReadFile("computer_test_click_chunks.log")
-	t.Logf("=== Chunks log ===\n%s", string(logContent))
-	t.Logf("=== Final URL: %s", finalURL)
-
-	if !sawClick {
-		t.Fatal("FAIL: agent never emitted a click action")
-	}
-	t.Log("✓ click action called")
-
-	if cheated {
-		t.Fatal("FAIL: agent gave up on click and navigated to iana via browser_session(open) instead — click-from-vision is not actually working")
-	}
-
-	if !strings.Contains(finalURL, "iana") {
-		t.Fatalf("FAIL: final URL is %q, expected to contain 'iana' (click didn't navigate)", finalURL)
-	}
-	t.Log("✓ click navigated to iana without cheating — click action proven end-to-end")
-
-	if err := comp.Close(); err != nil {
-		t.Errorf("comp.Close() returned error: %v", err)
-	}
-	comp = nil
-}
+// Raw-pixel click probe removed: TestComputerUse_LocalSoMClick covers
+// the shipping path (SoM labels). Kimi cannot reliably produce pixel
+// coordinates on 1600×800 screenshots — see computer_matrix_test.go
+// if you need to re-measure raw-pixel accuracy across configurations.
 
 // TestComputerUse_BrowserbaseLoginFlow mirrors LocalLoginFlow but
 // routes through Browserbase instead of local Chrome. Exercises the
@@ -781,8 +620,7 @@ func TestComputerUse_BrowserbaseLoginFlow(t *testing.T) {
 	if bbKey == "" || bbProject == "" {
 		t.Skip("BROWSERBASE_API_KEY / BROWSERBASE_PROJECT_ID not set")
 	}
-	// SoM on — this is the whole point of the test.
-	t.Setenv("APTEVA_SOM", "1")
+	// SoM is package-default via TestMain — no per-test setenv needed.
 
 	comp, err := aptcomputer.New(aptcomputer.Config{
 		Type:      "browserbase",
@@ -931,12 +769,9 @@ func TestComputerUse_LocalLoginFlow(t *testing.T) {
 		t.Skip("FIREWORKS_API_KEY not set")
 	}
 
-	// SoM on — this is the whole point of the test. Kimi sees numeric
-	// badges on the username/password inputs and the Submit button;
-	// clicks resolve via label→bbox map, coordinates never leave our
-	// code. t.Setenv unsets when the test ends so neighbouring tests
-	// keep their non-SoM behaviour.
-	t.Setenv("APTEVA_SOM", "1")
+	// SoM is package-default via TestMain. Kimi sees numeric badges
+	// on the username/password inputs and the Submit button; clicks
+	// resolve via label→bbox map, coordinates never leave our code.
 
 	comp, err := aptcomputer.New(aptcomputer.Config{
 		Type: "local",

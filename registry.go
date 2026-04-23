@@ -92,19 +92,9 @@ func (tr *ToolRegistry) registerDefaults() {
 
 	tr.Register(&ToolDef{
 		Name:        "remember",
-		Description: "Store something in persistent memory. Memories survive restarts and are auto-recalled by vector similarity when similar context shows up in later turns. The more you remember, the less you'll need to ask or re-derive.",
+		Description: "Store a fact for future turns. Prefix with a tag: [preference] [correction] [decision] [fact] [user]. Write memories that match FUTURE queries (include the tool, the target, the outcome). Remember liberally; skip transient in-flight state.",
 		Syntax:      `[[remember text="[preference] exec: user OK with shell commands on their own server"]]`,
-		Rules: `Tag every memory with a bracketed category at the start so recall surfaces the right kind when the same context reappears. Standard tags:
-  [preference] — user's permanent choice about how to handle a tool/situation
-  [correction] — "don't do X", "stop doing Y", style/tone feedback
-  [decision]   — a concrete choice made with the user's approval
-  [fact]       — durable information about the user, their systems, accounts
-  [user]       — identity, role, location, time zone, contact details
-
-Write memories so they match FUTURE queries — include the tool name, the kind of target, and the outcome in plain words. Good: "[preference] browser: logging into banking sites — never". Bad: "user doesn't like it" (no embedding signal).
-
-Remember liberally. Storage is cheap; a missed memory forces the user to correct you twice. DO NOT store transient state (current task progress, temporary counters, in-flight values) — that belongs in thread state, not persistent memory.`,
-		Core: true,
+		Core:        true,
 	})
 
 	// Main-only tools
@@ -154,35 +144,9 @@ Remember liberally. Storage is cheap; a missed memory forces the user to correct
 		MainOnly:    true,
 	})
 
-	// Local tools (web + exec) are intentionally NOT registered by default
-	// anymore. They're dangerous enough (raw shell access, arbitrary HTTP
-	// fetch to arbitrary hosts) that exposing them on every instance by
-	// default is a security footgun. A follow-up will add a per-instance
-	// `enabled_local_tools` config field and wire it through the server +
-	// dashboard so the user has to explicitly opt in. Until then, these
-	// lines stay commented out and any scenario or instance that needs
-	// them must be updated deliberately.
-	//
-	// Code intentionally preserved below for quick re-enable during
-	// debugging — uncomment both Register calls to restore the old
-	// always-on behaviour.
-	//
-	// tr.Register(&ToolDef{
-	// 	Name:        "web",
-	// 	Description: "Fetch a URL from the internet and return its text content. Use for research, looking up information, checking websites.",
-	// 	Syntax:      `[[web url="https://example.com"]]`,
-	// 	Rules:       `Only parameter is url. Results arrive as events in your next thought.`,
-	// 	Handler:     func(args map[string]string) ToolResponse { return ToolResponse{Text: webTool(args)} },
-	// })
-	// tr.Register(&ToolDef{
-	// 	Name:        "exec",
-	// 	Description: "Execute a shell command on the host machine and return stdout+stderr. Use for system administration, checking logs, running scripts, managing containers, inspecting files, git operations, deployments.",
-	// 	Syntax:      `[[exec command="ls -la /app" timeout="30" dir="/home"]]`,
-	// 	Rules:       `command: the shell command to run. timeout: seconds (default 30, max 300). dir: optional working directory. No interactive commands (no vim, top, less). Output truncated to 4000 chars.`,
-	// 	Handler:     func(args map[string]string) ToolResponse { return ToolResponse{Text: execTool(args)} },
-	// })
-	_ = webTool  // silence unused-function warnings — keep the impls
-	_ = execTool // around so re-enabling is just uncommenting above
+	// Capability tools (web, exec, files, code, pdf, …) live in the
+	// sibling github.com/apteva/tools module and are wired in by the
+	// instance config when enabled.
 }
 
 // NewScopedRegistry creates a minimal registry containing only the specified tools
@@ -248,6 +212,46 @@ func (tr *ToolRegistry) EmbedAll(ms *MemoryStore) {
 		}
 	}
 	tr.embedded = true
+}
+
+// CoreDocsSummary returns a one-line summary of core tool names,
+// sized for providers that receive full schemas via NativeTools in
+// their `tools[]` payload. Emitting the full prose here (see CoreDocs)
+// duplicates every tool's Description + Rules in the system prompt —
+// ~5k extra input chars per iteration on a typical main thread.
+//
+// Callers that target providers WITHOUT native-tool support should
+// keep using CoreDocs: those providers only see the prose and need
+// the rules in the system prompt to behave.
+//
+// Ordering matches CoreDocs so the two agree when comparing, and the
+// block is prefixed with the same marker so the composition breakdown
+// still identifies it as the "core_tools" segment.
+func (tr *ToolRegistry) CoreDocsSummary(includeMainOnly bool, includeSystemOnly ...bool) string {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+
+	sysOnly := len(includeSystemOnly) > 0 && includeSystemOnly[0]
+
+	var names []string
+	for _, name := range tr.sortedToolKeys() {
+		tool := tr.tools[name]
+		if !tool.Core {
+			continue
+		}
+		if tool.MainOnly && !includeMainOnly {
+			continue
+		}
+		if tool.SystemOnly && !sysOnly {
+			continue
+		}
+		names = append(names, tool.Name)
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return "CORE TOOLS — always available: " + strings.Join(names, ", ") +
+		"\n(full schemas appear in your tools[] payload; use exactly those names)\n"
 }
 
 // CoreDocs returns documentation for core tools, always included in prompts.
@@ -542,9 +546,13 @@ func copyAndInjectReason(schema map[string]any) map[string]any {
 			props[k] = v
 		}
 	}
+	// Short schema description — the full rule lives once in the system
+	// prompt's "TOOL CALL LABELS" section (see baseSystemPrompt). Keeping
+	// the per-schema description terse saves ~150 chars × N tools on
+	// every Chat call.
 	props["_reason"] = map[string]any{
 		"type":        "string",
-		"description": "Short action label — what this call is doing. 3-6 words, imperative (e.g. \"find ventes sheet id\", \"update Score cell\"). No \"to …\" clauses, no justification.",
+		"description": "Short action label (3-6 words, imperative).",
 	}
 	out["properties"] = props
 	// Add _reason to required list

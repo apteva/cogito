@@ -228,34 +228,6 @@ func TestIntegration_MemoryStoreAndRetrieve(t *testing.T) {
 	}
 }
 
-func TestIntegration_WebTool(t *testing.T) {
-	t.Parallel()
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	result := webTool(map[string]string{"url": "https://httpbin.org/get"})
-	if strings.Contains(result, "error") {
-		t.Fatalf("webTool error: %s", result)
-	}
-	if !strings.Contains(result, "httpbin") {
-		t.Errorf("expected httpbin content, got: %s", truncate(result, 200))
-	}
-	t.Logf("webTool result length: %d chars", len(result))
-}
-
-func TestIntegration_WebTool_BadURL(t *testing.T) {
-	t.Parallel()
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	result := webTool(map[string]string{"url": "https://thisdomaindoesnotexist12345.com"})
-	if !strings.Contains(result, "error") {
-		t.Error("expected error for bad URL")
-	}
-}
-
 // TestIntegration_NativeToolCallArrayArgs verifies that when the LLM returns
 // tool calls with array/object arguments, the provider preserves them as valid
 // JSON strings (not Go's %v representation). This prevents the bug where
@@ -453,9 +425,3 @@ func TestIntegration_NativeToolCallNestedArrayArgs(t *testing.T) {
 	t.Logf("text: %q", text)
 }
 
-func TestIntegration_WebTool_MissingURL(t *testing.T) {
-	result := webTool(map[string]string{})
-	if result != "error: missing url argument" {
-		t.Errorf("expected missing url error, got: %q", result)
-	}
-}

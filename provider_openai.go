@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -246,12 +247,34 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 	if err != nil {
 		return ChatResponse{}, err
 	}
-	defer resp.Body.Close()
+
+	// Capture provider-side request identifiers so a future stall /
+	// hang can be cross-referenced with the provider's own logs without
+	// another round-trip. Different vendors use different header names
+	// (Fireworks ships x-request-id; some return x-fw-request-id). Log
+	// whatever we find.
+	reqIDs := extractProviderRequestIDs(resp.Header)
+	if len(reqIDs) > 0 {
+		logMsg("PROVIDER", fmt.Sprintf("model=%s request_ids=%v", model, reqIDs))
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return ChatResponse{}, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		resp.Body.Close()
+		return ChatResponse{}, fmt.Errorf("API error %d: %s (request_ids=%v)", resp.StatusCode, string(respBody), reqIDs)
 	}
+
+	// Wrap the streaming body in an idle-read monitor. Any pause longer
+	// than streamIdleTimeout without a single byte arriving is treated
+	// as a provider stall — we close the body so the scanner unblocks
+	// with an error, and the caller returns ErrStreamIdleTimeout (with
+	// request_ids folded in) so the think loop can retry.
+	idleBody := newIdleReader(resp.Body, streamIdleTimeout(), func() {
+		logMsg("FIREWORKS-STALL", fmt.Sprintf("stream idle for %s on model=%s request_ids=%v — aborting",
+			streamIdleTimeout(), model, reqIDs))
+	})
+	resp.Body = idleBody
+	defer resp.Body.Close()
 
 	var full strings.Builder
 	var usage TokenUsage
@@ -342,6 +365,17 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 		}
 	}
 
+	// Surface any scanner error (stall, I/O error) with the request IDs
+	// attached so the operator can cross-reference with the provider's
+	// own logs. Idle-timeout stalls get a dedicated sentinel so callers
+	// (and tests) can tell them apart from transport errors.
+	if scerr := scanner.Err(); scerr != nil {
+		if errors.Is(scerr, ErrStreamIdleTimeout) {
+			return ChatResponse{}, fmt.Errorf("%w (model=%s request_ids=%v)", ErrStreamIdleTimeout, model, reqIDs)
+		}
+		return ChatResponse{}, fmt.Errorf("stream read error: %w (model=%s request_ids=%v)", scerr, model, reqIDs)
+	}
+
 	// Assemble completed tool calls
 	var toolCalls []NativeToolCall
 	for i := 0; i < len(pendingTools); i++ {
@@ -386,9 +420,9 @@ func NewFireworksProvider(apiKey string) LLMProvider {
 		url:        "https://api.fireworks.ai/inference/v1/chat/completions",
 		authHeader: "Bearer",
 		models: map[ModelTier]string{
-			ModelLarge:  "accounts/fireworks/models/kimi-k2p5",
-			ModelMedium: "accounts/fireworks/models/kimi-k2p5",
-			ModelSmall:  "accounts/fireworks/models/kimi-k2p5",
+			ModelLarge:  "accounts/fireworks/models/kimi-k2p6",
+			ModelMedium: "accounts/fireworks/models/kimi-k2p6",
+			ModelSmall:  "accounts/fireworks/models/kimi-k2p6",
 		},
 		inputCost:  0.60,
 		cachedCost: 0.10,

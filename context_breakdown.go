@@ -44,6 +44,7 @@ type PromptComposition struct {
 type SystemBreakdown struct {
 	Base            int `json:"base"`              // up to "CORE TOOLS — always available:"
 	CoreTools       int `json:"core_tools"`        // "CORE TOOLS — always available:" to next [ marker
+	RetrievedTools  int `json:"retrieved_tools"`   // [available tools — matched to your current context] block (RAG per-turn)
 	MCPServers      int `json:"mcp_servers"`       // [AVAILABLE MCP SERVERS] block
 	MCPToolDocs     int `json:"mcp_tool_docs"`     // [MCP TOOLS — available for sub-threads] block
 	Providers       int `json:"providers"`         // [AVAILABLE PROVIDERS] block
@@ -84,6 +85,7 @@ var sectionMarkers = []struct {
 	marker string
 	label  string
 }{
+	{"\n\n[available tools — matched to your current context]", "retrieved_tools"},
 	{"\n\n[AVAILABLE MCP SERVERS]", "mcp_servers"},
 	{"\n[MCP TOOLS — available for sub-threads]", "mcp_tool_docs"},
 	{"\n\n[AVAILABLE PROVIDERS]", "providers"},
@@ -202,6 +204,8 @@ func breakdownSystem(text string) SystemBreakdown {
 		}
 		size := end - h.start
 		switch h.label {
+		case "retrieved_tools":
+			out.RetrievedTools += size
 		case "mcp_servers":
 			out.MCPServers += size
 		case "mcp_tool_docs":
@@ -229,7 +233,7 @@ func breakdownSystem(text string) SystemBreakdown {
 	// Total. Anything off by rounding (shouldn't happen — slicing is
 	// exact) we bucket into Other so the UI's bar never lies about the
 	// total length.
-	sum := out.Base + out.CoreTools + out.MCPServers + out.MCPToolDocs +
+	sum := out.Base + out.CoreTools + out.RetrievedTools + out.MCPServers + out.MCPToolDocs +
 		out.Providers + out.ActiveThreads + out.SafetyMode + out.Skills +
 		out.BlobHint + out.PreviousContext + out.Directive + out.Other
 	if sum != out.Total {

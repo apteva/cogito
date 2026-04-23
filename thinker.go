@@ -63,57 +63,136 @@ func (t *Thinker) modelID() string {
 	return "unknown"
 }
 
+// shouldEmitBlobHint decides whether to include the [FILE HANDLES]
+// explainer. The hint is only actionable when the conversation
+// actually contains a blob handle or a tool likely to produce one.
+//
+// Prior heuristic (any MCP present → emit) was too generous: channels
+// is a text-only MCP and triggered the hint every turn for ~500 bytes
+// of dead weight. The new rule narrows to three concrete signals:
+//
+//  1. A blob reference already appears in the message history — the
+//     model is about to see a "blobref://" token and needs the rule
+//     to understand it. This is the strongest signal.
+//  2. A blob-producing local tool is registered (read_file, exec,
+//     computer_use, etc.) — these emit handles on the next call, so
+//     the hint needs to ride even before the first blob appears.
+//  3. An MCP whose name hints at binary content (media, audio,
+//     image, file, video, deepgram, pdf) is attached to this thread
+//     or an active sub-thread. Conservative allowlist — if an unknown
+//     MCP produces a handle and we didn't match, signal #1 kicks in
+//     on the turn AFTER so the model recovers within one iteration.
+func shouldEmitBlobHint(registry *ToolRegistry, messages []Message, activeThreads []ThreadInfo) bool {
+	// Signal 1: already a blob in context — always emit.
+	for _, m := range messages {
+		if strings.Contains(m.Content, "blobref://") {
+			return true
+		}
+		for _, tr := range m.ToolResults {
+			if strings.Contains(tr.Content, "blobref://") {
+				return true
+			}
+		}
+	}
+	if registry == nil {
+		return false
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	// Signal 2: local tool likely to produce binaries.
+	for _, t := range registry.tools {
+		switch t.Name {
+		case "read_file", "list_files", "write_file",
+			"exec", "computer_use", "browser_session":
+			return true
+		}
+	}
+	// Signal 3: MCP name on a known binary-producing server.
+	binaryMCPs := map[string]bool{
+		"media": true, "audio": true, "image": true,
+		"file": true, "files": true, "video": true,
+		"deepgram": true, "pdf": true, "storage": true,
+		"gdrive": true,
+	}
+	for _, t := range registry.tools {
+		if t.MCPServer != "" && binaryMCPs[t.MCPServer] {
+			return true
+		}
+	}
+	for _, th := range activeThreads {
+		for _, name := range th.MCPNames {
+			if binaryMCPs[name] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// poolSupportsNativeTools returns true if the pool's default provider
+// receives tool schemas via NativeTools. Used by buildSystemPrompt to
+// decide whether to emit full CoreDocs prose (text-only providers) or
+// the compact summary (native-tool providers already get the full
+// schemas in `tools[]`). nil pool → false so test callers without a
+// pool get the conservative full-prose path.
+func poolSupportsNativeTools(pool *ProviderPool) bool {
+	if pool == nil {
+		return false
+	}
+	p := pool.Default()
+	if p == nil {
+		return false
+	}
+	return p.SupportsNativeTools()
+}
+
 // baseSystemPrompt contains the fixed rules/tools. The editable directive is prepended at runtime.
 const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe all events, manage threads, and coordinate work.
 
-THINKING — every thought must contain meaningful text:
-- Always explain what you observe, what you're doing, and why — even briefly.
-- NEVER output only tool calls. Always include at least one sentence of reasoning.
-- When idle: briefly state your current status and what you're waiting for.
-- When busy: explain what you're working on and next steps.
-- Keep each thought concise — 1-2 short paragraphs max.
+THINKING:
+- Every thought has at least one sentence of reasoning. Never output only tool calls.
+- Keep thoughts short — 1-2 short paragraphs. Skip narration between calls; act.
 
-EVENT FORMAT:
-- [console] message — an external event or command. Incorporate into your thinking and take action as needed.
-- [from:id] message — a thread sent you a message via send.
-- [thread:id done] message — a thread finished and terminated.
-
-BEHAVIOR:
-- Before spawning, check [ACTIVE THREADS]: if an existing thread has matching tools and directive, send(id="...") to it instead. Spawn only when no existing thread fits, or when you need parallelism over independent inputs.
-- For recurring or scheduled work, separate "when" from "how". In a quiet system with one simple schedule, handle it yourself via pace. Once you have multiple schedules, long horizons, or noisy bus traffic, spawn a coordinator thread with tools="pace,send" (no MCPs) whose only job is to wake on a timer and delegate to the domain workers that own the execution.
-- Additional tools may appear in [available tools] blocks based on context. If you need a tool you don't see, describe what you need.
+EVENTS:
+- [console] message — external event/command; act on it.
+- [from:id] message — a thread sent this via send.
+- [thread:id done] message — a thread terminated.
+- NEVER invent events. If no [Events:] block arrived, do nothing except pace.
 
 SPAWNING THREADS — critical rules:
-- The "tools" parameter lists which tools the thread can use. ALWAYS include ALL tools the thread needs.
-- Tool names MUST match EXACTLY as shown in [available tools]. They include a prefix (e.g. "schedule_get_schedule", NOT "get_schedule"). Copy the exact name.
-- Example: tools="pushover_send_notification,schedule_get_schedule" — use the full prefixed name.
-- The "directive" parameter must be PLAIN NATURAL LANGUAGE describing the thread's goal and behavior.
-  NEVER put tool names or examples in the directive.
-  The thread already receives its own tool documentation — it knows what tools it has.
+- Before spawning, check [ACTIVE THREADS]: if an existing thread has matching tools and directive, send(id="...") to it instead. Spawn only when no existing thread fits, or when you need parallelism over independent inputs.
+- tools= lists which tools the worker can use. ALWAYS include EVERY tool the worker needs to carry out its directive — if the directive says "run a script", include exec; if "transcribe audio", include the deepgram tool. A missing tool = worker reports failure and can't act. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
+- directive= is PLAIN NATURAL LANGUAGE describing the thread's goal. Never put tool names in the directive — the thread already receives its own tool documentation.
   BAD:  directive="Call helpdesk_list_tickets to check for tickets"
-  GOOD: directive="Check for new support tickets periodically. When you find tickets, report them to main."
-- The "provider" parameter selects which LLM provider runs the thread (optional). Use a more capable/expensive provider for complex tasks like coding, and a cheaper one for coordination. If omitted, the thread inherits your provider. See [AVAILABLE PROVIDERS] for options.
+  GOOD: directive="Check for new support tickets periodically. Report findings to main."
+- provider= (optional) picks a specific LLM; omit to inherit. Use a stronger provider for complex tasks, a cheaper one for coordination. See [AVAILABLE PROVIDERS].
+- For recurring schedules with >1 timer or noisy traffic, spawn a pace,send-only coordinator thread that wakes on timer and delegates to the domain workers that own execution.
 
-PACING — critical:
-- Events ALWAYS wake you instantly, no matter how long your sleep is. There is ZERO cost to sleeping long.
-- Be aggressive about saving power: if you have no pending work, call pace with sleep="1h" model="small". Do NOT gradually increase — jump to long sleep immediately.
-- Only use short sleep (2-10s) when you are actively waiting for a tool result in the NEXT iteration.
-- Your pace persists until you change it. Do NOT call pace every thought — only when transitioning between active work and idle.
-- When an event wakes you, you automatically switch to large model and fast pace for that iteration. You do NOT need to manually set pace when events arrive.
+PACING:
+- Events wake you instantly regardless of sleep — including [from:id] worker replies and [thread:id done] notifications. Never short-sleep to "check" on a delegated worker; pace "1h" and let the reply wake you.
+- Sleep long ("1h", small model) the moment you have nothing actionable this iteration — delegating to a worker counts as nothing actionable.
+- Short sleep (2-10s) is ONLY for timer-driven polls you own yourself (e.g. retry a rate-limited API in N seconds). Not for waiting on another thread.
+- Pace persists — don't re-set it every thought. When an event wakes you, you auto-switch to large model for that turn.
 
-CRITICAL — never hallucinate events:
-- You ONLY receive events in [Events:] blocks. If there is no [Events:] block, NOTHING happened.
-- NEVER invent, imagine, or assume events that are not explicitly shown to you.
-- NEVER fabricate events that did not appear in the [Events:] block.
-- If no events arrived, your ONLY job is to set your pace and wait. Do not take any action.
-- Violating this rule causes real damage — spawning threads or sending notifications based on imagined events wastes resources and confuses users.
+TOOL CALLS:
+- Every tool takes a "_reason" string: 3-6 words, imperative, describing THIS call (e.g. "find ventes sheet id", "update Score cell"). No "to …" clauses — the thought above already holds the why.
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
 func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo, pool *ProviderPool, mcpCatalog []MCPServerInfo) string {
 	coreDocs := ""
 	if registry != nil {
-		coreDocs = "\n" + registry.CoreDocs(true)
+		// Prefer the compact summary when the thread's provider receives
+		// full tool schemas via NativeTools — the prose listing would
+		// just duplicate Description+Rules already in tools[]. Fall back
+		// to the full CoreDocs prose for providers without native tool
+		// support (ollama text-only, some local runners) so they keep
+		// seeing every rule they need to behave.
+		if poolSupportsNativeTools(pool) {
+			coreDocs = "\n" + registry.CoreDocsSummary(true)
+		} else {
+			coreDocs = "\n" + registry.CoreDocs(true)
+		}
 	}
 	prompt := baseSystemPrompt + coreDocs
 	if extraToolDocs != "" {
@@ -212,7 +291,15 @@ Remember actively. Every correction, preference, and consequential decision gets
 		prompt += "\n\n" + skills
 	}
 
-	prompt += blobPromptHint
+	// blobPromptHint explains the {"_file": true, ...} handle format.
+	// Only emit when a blob is already in context OR the scope has a
+	// tool likely to produce one — see shouldEmitBlobHint. Can't check
+	// the current messages from here (buildSystemPrompt is stateless)
+	// so we approximate via the registry and threads; callers with
+	// conversation context can override by setting a sentinel MCP.
+	if shouldEmitBlobHint(registry, nil, activeThreads) {
+		prompt += blobPromptHint
+	}
 
 	prompt += "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
 	return prompt
