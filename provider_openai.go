@@ -280,9 +280,10 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 	var usage TokenUsage
 	// Track streamed tool calls by index
 	pendingTools := make(map[int]*struct {
-		id       string
-		name     string
-		argsJSON strings.Builder
+		id         string
+		name       string
+		argsJSON   strings.Builder
+		pendingBuf strings.Builder
 	})
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -334,9 +335,10 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 				pt, ok := pendingTools[tc.Index]
 				if !ok {
 					pt = &struct {
-						id       string
-						name     string
-						argsJSON strings.Builder
+						id         string
+						name       string
+						argsJSON   strings.Builder
+						pendingBuf strings.Builder // chunks accumulated before tc.ID arrived
 					}{}
 					pendingTools[tc.Index] = pt
 				}
@@ -349,16 +351,20 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 					}
 					if tc.Function.Arguments != "" {
 						pt.argsJSON.WriteString(tc.Function.Arguments)
-						if onToolChunk != nil && pt.name != "" {
-							// Per-call id: prefer the upstream tool_call id when
-							// known, else fall back to the stable index-derived
-							// key so two concurrent calls of the same tool
-							// remain distinguishable.
-							callID := pt.id
-							if callID == "" {
-								callID = fmt.Sprintf("idx-%d", tc.Index)
+						// Only emit chunks once pt.id is known so the call_id
+						// on every llm.tool_chunk event matches the eventual
+						// tool.call (both use the upstream provider id). Using
+						// an index-based fallback split streaming rows in the
+						// dashboard because the fallback and the real id were
+						// different strings.
+						if pt.id == "" {
+							pt.pendingBuf.WriteString(tc.Function.Arguments)
+						} else if onToolChunk != nil && pt.name != "" {
+							if pt.pendingBuf.Len() > 0 {
+								onToolChunk(pt.name, pt.id, pt.pendingBuf.String())
+								pt.pendingBuf.Reset()
 							}
-							onToolChunk(pt.name, callID, tc.Function.Arguments)
+							onToolChunk(pt.name, pt.id, tc.Function.Arguments)
 						}
 					}
 				}
@@ -390,6 +396,14 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 		pt, ok := pendingTools[i]
 		if !ok {
 			continue
+		}
+		// Flush any chunks buffered before pt.id arrived. By now the stream
+		// is done so pt.id is either set (happy path — flush under real id)
+		// or never arrived (pathological provider — nothing to emit since
+		// the dashboard has no way to match anyway).
+		if onToolChunk != nil && pt.id != "" && pt.pendingBuf.Len() > 0 && pt.name != "" {
+			onToolChunk(pt.name, pt.id, pt.pendingBuf.String())
+			pt.pendingBuf.Reset()
 		}
 		args := make(map[string]string)
 		var raw map[string]any
