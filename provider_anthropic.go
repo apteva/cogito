@@ -194,7 +194,7 @@ type anthropicBlockStart struct {
 
 // --- Chat implementation ---
 
-func (p *AnthropicProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string)) (ChatResponse, error) {
+func (p *AnthropicProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	// Convert messages: extract system prompt, convert rest to Anthropic format
 	var system string
 	var anthropicMsgs []anthropicMessage
@@ -472,7 +472,7 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 					logMsg("ANTHROPIC-STREAM", fmt.Sprintf("tool=%s chunk_len=%d chunk=%q", currentTool.name, len(event.Delta.PartialJSON), truncateStr(event.Delta.PartialJSON, 80)))
 					currentTool.json.WriteString(event.Delta.PartialJSON)
 					if onToolChunk != nil {
-						onToolChunk(currentTool.name, event.Delta.PartialJSON)
+						onToolChunk(currentTool.name, currentTool.id, event.Delta.PartialJSON)
 					}
 				}
 			}

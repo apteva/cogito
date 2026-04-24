@@ -185,7 +185,7 @@ func toOpenAIMessages(messages []Message) []any {
 	return out
 }
 
-func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string)) (ChatResponse, error) {
+func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	// Build request
 	reqMap := map[string]any{
 		"model":    model,
@@ -350,7 +350,15 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 					if tc.Function.Arguments != "" {
 						pt.argsJSON.WriteString(tc.Function.Arguments)
 						if onToolChunk != nil && pt.name != "" {
-							onToolChunk(pt.name, tc.Function.Arguments)
+							// Per-call id: prefer the upstream tool_call id when
+							// known, else fall back to the stable index-derived
+							// key so two concurrent calls of the same tool
+							// remain distinguishable.
+							callID := pt.id
+							if callID == "" {
+								callID = fmt.Sprintf("idx-%d", tc.Index)
+							}
+							onToolChunk(pt.name, callID, tc.Function.Arguments)
 						}
 					}
 				}

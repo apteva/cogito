@@ -146,7 +146,7 @@ type oaiComputerAction struct {
 	Keys      []string `json:"keys,omitempty"`   // modifier keys
 }
 
-func (p *OpenAINativeProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string)) (ChatResponse, error) {
+func (p *OpenAINativeProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	// Convert messages to Responses API input items
 	input := p.buildInput(messages)
 
@@ -351,7 +351,7 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 }
 
 // streamResponse parses the Responses API SSE stream.
-func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(string), onToolChunk func(string, string)) (ChatResponse, error) {
+func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	var full strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
@@ -414,7 +414,7 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 			if ok {
 				pf.args.WriteString(delta.Delta)
 				if onToolChunk != nil && pf.name != "" {
-					onToolChunk(pf.name, delta.Delta)
+					onToolChunk(pf.name, delta.ItemID, delta.Delta)
 				}
 			}
 

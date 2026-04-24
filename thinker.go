@@ -1603,11 +1603,11 @@ func (t *Thinker) think() (ChatResponse, error) {
 		}
 	}
 
-	onToolChunk := func(toolName, chunk string) {
+	onToolChunk := func(toolName, callID, chunk string) {
 		t.bus.Publish(Event{Type: EventToolChunk, From: t.threadID, Text: chunk, ToolName: toolName, Iteration: t.iteration})
 		if t.telemetry != nil {
 			t.telemetry.EmitLive("llm.tool_chunk", t.threadID, map[string]any{
-				"tool": toolName, "chunk": chunk, "iteration": t.iteration,
+				"tool": toolName, "id": callID, "chunk": chunk, "iteration": t.iteration,
 			})
 		}
 	}
