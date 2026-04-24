@@ -37,12 +37,20 @@ type Telemetry struct {
 	instanceID     int64
 	seq            int64
 	quit           chan struct{}
+
+	// dropCount tracks live-forward events dropped because forwardCh was
+	// full. We still drop (blocking Emit from the thinker hot path would
+	// be worse), but we count drops and log every 50th one so the data
+	// loss is visible rather than invisible.
+	dropCount int64
 }
 
 func NewTelemetry() *Telemetry {
 	t := &Telemetry{
 		notify:    make(chan struct{}, 1),
-		forwardCh: make(chan TelemetryEvent, 500),
+		// 5000-slot buffer (was 500) to absorb bursts during heavy tool
+		// activity like transcription runs without dropping events.
+		forwardCh: make(chan TelemetryEvent, 5000),
 		quit:      make(chan struct{}),
 	}
 
@@ -136,9 +144,23 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 		select {
 		case t.forwardCh <- ev:
 		default:
-			logMsg("TELEMETRY", fmt.Sprintf("forwardCh FULL, dropping %s", eventType))
+			// Channel full — drop to avoid blocking the thinker hot path,
+			// but count drops and log periodically so the loss doesn't
+			// hide. Every 50th drop is loud enough to notice in logs
+			// without spamming when something goes badly wrong.
+			dropped := atomic.AddInt64(&t.dropCount, 1)
+			if dropped%50 == 1 {
+				logMsg("TELEMETRY", fmt.Sprintf("forwardCh FULL, dropped %s (total drops: %d)", eventType, dropped))
+			}
 		}
 	}
+}
+
+// DroppedLiveEvents returns the cumulative count of live-forward events
+// that were discarded because the buffer was full. Useful for health
+// checks and end-of-run diagnostics.
+func (t *Telemetry) DroppedLiveEvents() int64 {
+	return atomic.LoadInt64(&t.dropCount)
 }
 
 // liveForwardLoop drains the forwardCh sequentially — one HTTP POST at a time.
@@ -449,7 +471,12 @@ func ModelContextWindow(modelID string) int {
 		{"claude-3-haiku", 200_000},
 
 		// --- Fireworks ---
-		// Kimi K2.5 (and turbo router) on Fireworks: 256K input context.
+		// Kimi K2 family on Fireworks: 256K input context from K2.5
+		// onwards. Longer/more-specific variants come first so the
+		// generic "kimi-k2" fallback doesn't shadow them. Add new
+		// point-releases (k2p7, etc.) here as Fireworks ships them.
+		{"kimi-k2p7", 256_000},
+		{"kimi-k2p6", 256_000},
 		{"kimi-k2p5", 256_000},
 		{"kimi-k2", 128_000},
 		// MiniMax on Fireworks — 196,608 (192K) tokens per the provider's

@@ -116,18 +116,11 @@ func TestComputerUse_LocalThinkLoop(t *testing.T) {
 		t.Skip("FIREWORKS_API_KEY not set")
 	}
 
-	comp, err := aptcomputer.New(aptcomputer.Config{
-		Type:   "local",
-		// 1600×800 — exact 2:1 widescreen, same default the server
-		// picks for non-Anthropic providers (Fireworks/Kimi, OpenAI,
-		// Google). Matching production viewport avoids chasing
-		// coordinate bugs that don't exist in real runs.
-		Width:  1600,
-		Height: 800,
-	})
-	if err != nil {
-		t.Fatalf("failed to create local computer: %v", err)
-	}
+	// Backend selected via TEST_BROWSER (default: local). Any provider
+	// that implements the Computer interface works here since the test
+	// only exercises navigate + screenshot + vision round-trip — the
+	// universal path shared by all computer backends.
+	comp := buildComputerFromEnv(t)
 	// Explicit Close at the end to verify the shutdown path too —
 	// not via defer, so the test body can assert state post-close
 	// without relying on t.Cleanup ordering.
@@ -136,7 +129,7 @@ func TestComputerUse_LocalThinkLoop(t *testing.T) {
 			comp.Close()
 		}
 	}()
-	t.Logf("local chrome connected: %dx%d", comp.DisplaySize().Width, comp.DisplaySize().Height)
+	t.Logf("browser connected: backend=%s display=%dx%d", backendName(t), comp.DisplaySize().Width, comp.DisplaySize().Height)
 
 	provider, err := selectProvider(&Config{})
 	if err != nil {

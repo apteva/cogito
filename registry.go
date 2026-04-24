@@ -67,6 +67,16 @@ func (tr *ToolRegistry) registerDefaults() {
 		Syntax:      `[[pace sleep="5m" model="small" provider="anthropic"]]`,
 		Rules:       `sleep accepts any duration: "2s", "30s", "5m", "1h", "6h". Named aliases also work: rate="fast" (2s), rate="normal" (10s), rate="slow" (30s), rate="sleep" (2m). Models: "large", "medium", "small". provider: switch to a different LLM provider by name (optional, only when multiple providers are configured). Sleep long when idle — you'll be woken by events.`,
 		Core:        true,
+		// All fields optional — pace() with no args continues current state.
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sleep":    map[string]any{"type": "string", "description": "Duration like \"2s\", \"5m\", \"1h\". Mutually exclusive with rate."},
+				"rate":     map[string]any{"type": "string", "description": "Named alias: \"fast\" (2s), \"normal\" (10s), \"slow\" (30s), \"sleep\" (2m)."},
+				"model":    map[string]any{"type": "string", "description": "Model tier: \"large\", \"medium\", \"small\"."},
+				"provider": map[string]any{"type": "string", "description": "LLM provider name (optional)."},
+			},
+		},
 	})
 	tr.Register(&ToolDef{
 		Name:        "send",
@@ -74,6 +84,20 @@ func (tr *ToolRegistry) registerDefaults() {
 		Syntax:      `send(id="parent", message="...", media="url1 url2")`,
 		Rules:       `Use id="parent" for your parent thread. Use id="main" for the top coordinator. media is optional — space-separated URLs (audio, images, video). Media URLs are sent natively to the target thread's LLM for analysis. You MUST send results back to your parent after completing any task.`,
 		Core:        true,
+		// Explicit schema with required fields so the LLM is forced to
+		// include id and message. Without this, schemaFromSyntax would
+		// produce properties but no "required" array — we saw Kimi
+		// occasionally drop id, causing send to silently no-op and the
+		// parent thread to never receive the reply.
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id":      map[string]any{"type": "string", "description": "Target thread id — use \"parent\" for your spawner, \"main\" for the top coordinator, or a sibling / child id."},
+				"message": map[string]any{"type": "string", "description": "Message body."},
+				"media":   map[string]any{"type": "string", "description": "Optional space-separated media URLs (audio/image/video)."},
+			},
+			"required": []string{"id", "message"},
+		},
 	})
 	tr.Register(&ToolDef{
 		Name:        "done",
@@ -81,6 +105,13 @@ func (tr *ToolRegistry) registerDefaults() {
 		Syntax:      `[[done message="Final result"]]`,
 		Rules:       `PERMANENTLY kills this thread. Only use when truly complete. Do NOT use after a single reply in a conversation.`,
 		Core:        true,
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"message": map[string]any{"type": "string", "description": "Final message sent to parent before the thread shuts down."},
+			},
+			"required": []string{"message"},
+		},
 	})
 	tr.Register(&ToolDef{
 		Name:        "evolve",
@@ -88,6 +119,13 @@ func (tr *ToolRegistry) registerDefaults() {
 		Syntax:      `[[evolve directive="Updated directive"]]`,
 		Rules:       `Persisted to config. Use sparingly — only when you've learned something worth remembering in your directive.`,
 		Core:        true,
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"directive": map[string]any{"type": "string", "description": "New directive text that replaces the current one."},
+			},
+			"required": []string{"directive"},
+		},
 	})
 
 	tr.Register(&ToolDef{
@@ -95,6 +133,13 @@ func (tr *ToolRegistry) registerDefaults() {
 		Description: "Store a fact for future turns. Prefix with a tag: [preference] [correction] [decision] [fact] [user]. Write memories that match FUTURE queries (include the tool, the target, the outcome). Remember liberally; skip transient in-flight state.",
 		Syntax:      `[[remember text="[preference] exec: user OK with shell commands on their own server"]]`,
 		Core:        true,
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"text": map[string]any{"type": "string", "description": "Memory text, typically prefixed with a bracketed tag like [preference], [correction], [decision], [fact], [user]."},
+			},
+			"required": []string{"text"},
+		},
 	})
 
 	// Main-only tools
@@ -105,6 +150,18 @@ func (tr *ToolRegistry) registerDefaults() {
 		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated local tools (web, exec, read_file, etc). mcp: comma-separated MCP server names — thread gets its own connection and only sees those tools. provider: LLM provider name (optional). media: space-separated URLs (audio/image/video) — these are sent directly to the thread's LLM as native content for analysis. Use this when a user shares a media URL and you want a worker to analyze it.`,
 		Core:        true,
 		MainOnly:    true,
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id":        map[string]any{"type": "string", "description": "Unique thread id for the new worker."},
+				"directive": map[string]any{"type": "string", "description": "What the thread does — its system prompt / role."},
+				"tools":     map[string]any{"type": "string", "description": "Comma-separated local tool names (web, exec, read_file, ...). Optional."},
+				"mcp":       map[string]any{"type": "string", "description": "Comma-separated MCP server names. Optional."},
+				"provider":  map[string]any{"type": "string", "description": "LLM provider name. Optional."},
+				"media":     map[string]any{"type": "string", "description": "Space-separated media URLs passed to the new thread's LLM. Optional."},
+			},
+			"required": []string{"id", "directive"},
+		},
 	})
 	tr.Register(&ToolDef{
 		Name:        "kill",
@@ -112,6 +169,13 @@ func (tr *ToolRegistry) registerDefaults() {
 		Syntax:      `[[kill id="name"]]`,
 		Core:        true,
 		MainOnly:    true,
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id": map[string]any{"type": "string", "description": "Thread id to kill."},
+			},
+			"required": []string{"id"},
+		},
 	})
 	tr.Register(&ToolDef{
 		Name:        "update",
@@ -120,14 +184,39 @@ func (tr *ToolRegistry) registerDefaults() {
 		Rules:       `Provide directive, tools, or both. The thread is notified of directive changes. Tools replace the full set (builtins are always included).`,
 		Core:        true,
 		MainOnly:    true,
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id":        map[string]any{"type": "string", "description": "Target thread id."},
+				"directive": map[string]any{"type": "string", "description": "Replacement directive. Provide this, tools, or both."},
+				"tools":     map[string]any{"type": "string", "description": "Comma-separated tool names replacing the current set. Provide this, directive, or both."},
+			},
+			"required": []string{"id"},
+		},
 	})
 	tr.Register(&ToolDef{
 		Name:        "connect",
-		Description: "Connect to an MCP server at runtime. Supports stdio (command) or Streamable HTTP (url) transport. Discovers and registers all tools from the server.",
+		Description: "Register a NEW MCP server at runtime that isn't already in the instance catalog. For MCP servers already listed under [AVAILABLE MCP SERVERS] in your prompt, do NOT use connect — use spawn(mcp=\"name\", ...) to give a worker access to those tools. Only reach for connect when you need to hook up a brand-new server by URL.",
 		Syntax:      `[[connect name="server-name" url="http://host:port/mcp/1" transport="http"]]`,
-		Rules:       `For stdio: use command="path" args="arg1,arg2". For HTTP: use url="..." transport="http". Tools become available immediately after connecting.`,
+		Rules:       `HTTP only here: pass url and transport="http". Tools become available immediately after connecting. Stdio connect is an advanced path — use command/args, not covered by this schema.`,
 		Core:        true,
 		MainOnly:    true,
+		// Schema intentionally exposes ONLY the HTTP-connect path (the
+		// common case). Previously we included command/args as
+		// first-class fields; Kimi misread that as "pushover is a
+		// command" for catalog MCPs and called connect(command=pushover)
+		// instead of spawn(mcp=pushover). Stdio connect is still
+		// possible via raw bracket syntax for advanced use, it just
+		// isn't in the schema surface Kimi sees.
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name":      map[string]any{"type": "string", "description": "Friendly name for the new MCP server."},
+				"url":       map[string]any{"type": "string", "description": "HTTP endpoint for Streamable-HTTP transport."},
+				"transport": map[string]any{"type": "string", "description": "\"http\" for Streamable-HTTP."},
+			},
+			"required": []string{"name", "url", "transport"},
+		},
 	})
 	tr.Register(&ToolDef{
 		Name:        "disconnect",
@@ -135,6 +224,13 @@ func (tr *ToolRegistry) registerDefaults() {
 		Syntax:      `[[disconnect name="server-name"]]`,
 		Core:        true,
 		MainOnly:    true,
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name": map[string]any{"type": "string", "description": "Name of the MCP server to disconnect."},
+			},
+			"required": []string{"name"},
+		},
 	})
 	tr.Register(&ToolDef{
 		Name:        "list_connected",
@@ -142,6 +238,10 @@ func (tr *ToolRegistry) registerDefaults() {
 		Syntax:      `[[list_connected]]`,
 		Core:        true,
 		MainOnly:    true,
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		},
 	})
 
 	// Capability tools (web, exec, files, code, pdf, …) live in the

@@ -552,31 +552,12 @@ func asTelemetryInt(v interface{}) int {
 // convenience so phase callbacks don't close over the session.
 func (p *Phase) Inject(text string) { p.s.Inject(text) }
 
-// WaitUntil polls cond every pollInterval (minimum 500ms) and returns
-// when it returns true or when timeout elapses. A failure fatals the
-// test. desc is used in the timeout message so you can tell which
-// wait expired.
+// WaitUntil is the phase-scoped shim around Session.WaitUntil — it
+// exists so Phase callbacks can call p.WaitUntil without closing over
+// the session. New tests should prefer Session.WaitUntil directly.
 func (p *Phase) WaitUntil(timeout time.Duration, desc string, cond func() bool) {
 	p.t.Helper()
-	deadline := time.Now().Add(timeout)
-	poll := 500 * time.Millisecond
-	// Nudge every 15s so silent waits (e.g. waiting on deepgram_listen
-	// to return) don't look like a frozen test runner.
-	nudge := 15 * time.Second
-	nextNudge := time.Now().Add(nudge)
-	started := time.Now()
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		if time.Now().After(nextNudge) {
-			p.t.Logf("[wait %s] still waiting (%.0fs elapsed, %.0fs left): %s",
-				p.name, time.Since(started).Seconds(), time.Until(deadline).Seconds(), desc)
-			nextNudge = time.Now().Add(nudge)
-		}
-		time.Sleep(poll)
-	}
-	p.t.Fatalf("testkit: phase %q timeout after %v waiting for: %s", p.name, timeout, desc)
+	p.s.WaitUntil(timeout, desc, cond)
 }
 
 // Verify runs assertions. It's just a named wrapper so phase traces
@@ -585,6 +566,40 @@ func (p *Phase) WaitUntil(timeout time.Duration, desc string, cond func() bool) 
 func (p *Phase) Verify(desc string, fn func()) {
 	p.t.Helper()
 	p.t.Logf("    verify: %s", desc)
+	fn()
+}
+
+// WaitUntil polls cond every 500ms and returns when cond returns true
+// or when timeout elapses. On timeout it fatals the test. desc is used
+// in the timeout message and in the 15-second progress nudge so silent
+// waits don't look like a frozen test runner.
+func (s *Session) WaitUntil(timeout time.Duration, desc string, cond func() bool) {
+	s.t.Helper()
+	deadline := time.Now().Add(timeout)
+	poll := 500 * time.Millisecond
+	nudge := 15 * time.Second
+	nextNudge := time.Now().Add(nudge)
+	started := time.Now()
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		if time.Now().After(nextNudge) {
+			s.t.Logf("[wait] still waiting (%.0fs elapsed, %.0fs left): %s",
+				time.Since(started).Seconds(), time.Until(deadline).Seconds(), desc)
+			nextNudge = time.Now().Add(nudge)
+		}
+		time.Sleep(poll)
+	}
+	s.t.Fatalf("testkit: timeout after %v waiting for: %s", timeout, desc)
+}
+
+// Verify is the session-level counterpart of Phase.Verify — named
+// assertion block so test logs show which checks ran. Intended for
+// tests that don't use s.Run phases.
+func (s *Session) Verify(desc string, fn func()) {
+	s.t.Helper()
+	s.t.Logf("verify: %s", desc)
 	fn()
 }
 

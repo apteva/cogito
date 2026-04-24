@@ -18,8 +18,8 @@ const baseThreadPromptTemplate = `You are a SUB-THREAD (id="%s") in a continuous
 IDENTITY:
 - Your ID is "%s". You are NOT the main thread — you are a worker thread with a specific task.
 - You cannot spawn other threads. You cannot restructure the system.
-- You report results back to your parent via send(id="parent", message="...").
-- When done with current work, sleep until needed again: pace(sleep="5m") or pace(sleep="1h") etc.
+- You MUST report results to your parent via send(id="parent", message="...") BEFORE pacing to a long sleep. Your parent is waiting for that reply — silent completion leaves them blocked. A final send is mandatory at the end of every task, even if the work was trivial or everything was already done.
+- When done with current work AND after sending your result, sleep until needed again: pace(sleep="5m") or pace(sleep="1h") etc.
 - Only call done if you are certain this thread should never run again.
 
 BEHAVIOR:
@@ -51,8 +51,8 @@ const leaderThreadPromptTemplate = `You are a SUB-THREAD (id="%s") in a continuo
 
 IDENTITY:
 - Your ID is "%s". You are a team lead — you can spawn and manage your own sub-threads.
-- You report results back to your parent via send(id="parent", message="...").
-- When done with current work, sleep until needed again: pace(sleep="5m") or pace(sleep="1h") etc.
+- You MUST report results to your parent via send(id="parent", message="...") BEFORE pacing to a long sleep. Your parent is waiting for that reply — silent completion leaves them blocked. A final send is mandatory at the end of every task, even if the work was trivial or everything was already done.
+- When done with current work AND after sending your result, sleep until needed again: pace(sleep="5m") or pace(sleep="1h") etc.
 - Only call done if you are certain this thread should never run again.
 
 SPAWNING SUB-THREADS:
@@ -161,6 +161,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	logMsg("SPAWN", fmt.Sprintf("enter id=%q parent=%q depth=%d tools=%v mcps=%v", id, opts.ParentID, opts.Depth, tools, opts.MCPNames))
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
+	logMsg("SPAWN", fmt.Sprintf("acquired tm.mu id=%q", id))
 
 	if _, exists := tm.threads[id]; exists {
 		logMsg("SPAWN", fmt.Sprintf("reject id=%q: already exists in this manager", id))
@@ -171,6 +172,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		logMsg("SPAWN", fmt.Sprintf("reject id=%q: already exists elsewhere in tree", id))
 		return fmt.Errorf("thread %q already exists in tree", id)
 	}
+	logMsg("SPAWN", fmt.Sprintf("passed existence checks id=%q", id))
 
 	depth := opts.Depth
 	parentID := opts.ParentID
@@ -657,7 +659,13 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				id := call.Args["id"]
 				msg := call.Args["message"]
 				mediaStr := call.Args["media"]
-				if id != "" && msg != "" {
+				if id == "" || msg == "" {
+					// Silent no-op on missing args would leave the LLM
+					// believing it sent — and the parent thread waiting
+					// forever for a reply. Surface the mistake so the
+					// LLM retries next iteration.
+					emitResult(call, fmt.Sprintf("error: send requires both id and message (got id=%q, message_len=%d)", id, len(msg)))
+				} else {
 					tagged := fmt.Sprintf("[from:%s] %s", thread.ID, msg)
 					mediaParts := parseMediaURLs(mediaStr)
 					logMsg("THREAD", fmt.Sprintf("%s send to=%s msg=%q media=%d", thread.ID, id, msg, len(mediaParts)))
@@ -712,7 +720,9 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						}
 					}
 				}
-				if sid != "" && directive != "" {
+				if sid == "" || directive == "" {
+					emitResult(call, fmt.Sprintf("error: spawn requires both id and directive (got id=%q, directive_len=%d)", sid, len(directive)))
+				} else {
 					err := thread.Children.SpawnWithOpts(sid, directive, spawnTools, SpawnOpts{
 						ProviderName: providerName,
 						ParentID:     thread.ID,
@@ -733,7 +743,11 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				toolNames = append(toolNames, call.Raw)
 			case "kill":
 				sid := call.Args["id"]
-				if sid != "" && thread.Children != nil {
+				if sid == "" {
+					emitResult(call, "error: kill requires id")
+				} else if thread.Children == nil {
+					emitResult(call, "error: cannot kill (not a leader thread)")
+				} else {
 					thread.Children.Kill(sid)
 					t.config.RemoveThread(sid)
 					emitResult(call, fmt.Sprintf("thread %s killed", sid))
@@ -741,7 +755,11 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				toolNames = append(toolNames, call.Raw)
 			case "update":
 				sid := call.Args["id"]
-				if sid != "" && thread.Children != nil {
+				if sid == "" {
+					emitResult(call, "error: update requires id")
+				} else if thread.Children == nil {
+					emitResult(call, "error: cannot update (not a leader thread)")
+				} else {
 					directive := call.Args["directive"]
 					toolsStr := call.Args["tools"]
 					var updateTools []string
@@ -793,7 +811,10 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					emitResult(call, "ok")
 				}
 			case "evolve":
-				if d := call.Args["directive"]; d != "" {
+				d := call.Args["directive"]
+				if d == "" {
+					emitResult(call, "error: evolve requires directive")
+				} else {
 					thread.Directive = d
 					if t.rebuildPrompt != nil {
 						t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
@@ -806,14 +827,22 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					emitResult(call, "directive updated")
 				}
 			case "remember":
-				if text := call.Args["text"]; text != "" && t.memory != nil {
-					ns := thread.ID // namespace = thread ID
-					go func(txt, namespace string) {
-						if err := t.memory.StoreWithNamespace(txt, namespace); err != nil {
-							t.Inject(fmt.Sprintf("[remember] error: %v", err))
-						}
-					}(text, ns)
-					emitResult(call, "stored")
+				text := call.Args["text"]
+				if text == "" {
+					emitResult(call, "error: remember requires text")
+				} else if t.memory == nil {
+					emitResult(call, "error: memory is not configured")
+				} else {
+					// Run synchronously so the LLM learns whether the
+					// memory actually landed. The previous async pattern
+					// emitted "stored" before the embedding call, so a
+					// failed embed looked like success. Embed latency is
+					// typically <500ms; acceptable blocking.
+					if err := t.memory.StoreWithNamespace(text, thread.ID); err != nil {
+						emitResult(call, fmt.Sprintf("error: %v", err))
+					} else {
+						emitResult(call, "stored")
+					}
 				}
 			default:
 				executeTool(t, call)
@@ -1048,23 +1077,73 @@ func (tm *ThreadManager) cleanupThread(id string) {
 	}
 }
 
-// threadExistsInTree checks if a thread ID exists anywhere in the tree (all levels).
-// The caller must NOT hold tm.mu (this function locks child managers).
+// threadExistsInTree checks if a thread ID exists anywhere below root
+// (caller has already checked root's direct children).
+//
+// Locking contract: the caller of the TOP-level call holds root.mu
+// (spawnInternal does). We read `root.threads` without re-locking
+// (re-locking the same RWMutex that the caller's write-lock holds would
+// deadlock — Go's RWMutex is not re-entrant). For each child we take
+// that child's RLock strictly to inspect its map — never held across
+// the recursive call, so lock order stays top-down and there's no risk
+// of a concurrent cleanup that holds a child lock deadlocking us.
 func threadExistsInTree(root *ThreadManager, id string) bool {
-	// Already checked root's direct children in the caller — check children's children
+	// Snapshot child-TM pointers under whatever lock the caller already
+	// holds. Do NOT re-acquire root.mu here (spawnInternal owns the
+	// write lock and a nested RLock on the same mutex would deadlock).
+	children := make([]*ThreadManager, 0, len(root.threads))
 	for _, t := range root.threads {
 		if t.Children != nil {
-			t.Children.mu.RLock()
-			if _, exists := t.Children.threads[id]; exists {
-				t.Children.mu.RUnlock()
+			children = append(children, t.Children)
+		}
+	}
+
+	for _, childTM := range children {
+		// Short critical section: check presence, then release.
+		childTM.mu.RLock()
+		_, found := childTM.threads[id]
+		// Snapshot this child's grandchildren under the same lock so
+		// the recursion below can read them without re-locking.
+		grandchildren := make([]*ThreadManager, 0, len(childTM.threads))
+		for _, t := range childTM.threads {
+			if t.Children != nil {
+				grandchildren = append(grandchildren, t.Children)
+			}
+		}
+		childTM.mu.RUnlock()
+		if found {
+			return true
+		}
+		// Recurse outside the child's lock — each recursion acquires its
+		// own short RLock for its level.
+		for _, grand := range grandchildren {
+			if threadExistsInTreeLocked(grand, id) {
 				return true
 			}
-			// Recurse
-			if threadExistsInTree(t.Children, id) {
-				t.Children.mu.RUnlock()
-				return true
-			}
-			t.Children.mu.RUnlock()
+		}
+	}
+	return false
+}
+
+// threadExistsInTreeLocked is the helper used when recursing from a
+// caller that does NOT hold any lock. It acquires root.mu.RLock to
+// read root.threads, then delegates to the shared walking logic.
+func threadExistsInTreeLocked(root *ThreadManager, id string) bool {
+	root.mu.RLock()
+	if _, found := root.threads[id]; found {
+		root.mu.RUnlock()
+		return true
+	}
+	grandchildren := make([]*ThreadManager, 0, len(root.threads))
+	for _, t := range root.threads {
+		if t.Children != nil {
+			grandchildren = append(grandchildren, t.Children)
+		}
+	}
+	root.mu.RUnlock()
+	for _, grand := range grandchildren {
+		if threadExistsInTreeLocked(grand, id) {
+			return true
 		}
 	}
 	return false

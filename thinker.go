@@ -835,6 +835,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				}
 				if id == "" || directive == "" {
 					logMsg("SPAWN", fmt.Sprintf("skip: missing id=%q or directive_len=%d in LLM call", id, len(directive)))
+					addResult(fmt.Sprintf("error: spawn requires both id and directive (got id=%q, directive_len=%d)", id, len(directive)))
 				} else {
 					logMsg("SPAWN", fmt.Sprintf("LLM-requested id=%q tools=%v mcp=%v provider=%q builtins=%v directive_len=%d",
 						id, tools, mcpNames, providerName, builtinTools, len(directive)))
@@ -858,7 +859,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				toolNames = append(toolNames, call.Raw)
 			case "kill":
 				id := call.Args["id"]
-				if id != "" {
+				if id == "" {
+					addResult("error: kill requires id")
+				} else {
 					t.threads.Kill(id)
 					t.config.RemoveThread(id)
 					addResult(fmt.Sprintf("thread %s killed", id))
@@ -868,7 +871,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				id := call.Args["id"]
 				directive := call.Args["directive"]
 				toolsStr := call.Args["tools"]
-				if id != "" {
+				if id == "" {
+					addResult("error: update requires id")
+				} else {
 					var tools []string
 					if toolsStr != "" {
 						tools = strings.Split(toolsStr, ",")
@@ -887,7 +892,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				id := call.Args["id"]
 				msg := call.Args["message"]
 				mediaStr := call.Args["media"]
-				if id != "" && msg != "" {
+				if id == "" || msg == "" {
+					addResult(fmt.Sprintf("error: send requires both id and message (got id=%q, message_len=%d)", id, len(msg)))
+				} else {
 					parts := parseMediaURLs(mediaStr)
 					if !t.threads.SendWithParts(id, msg, parts) {
 						addResult(fmt.Sprintf("error: thread %q not found", id))
@@ -900,7 +907,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "evolve":
-				if d := call.Args["directive"]; d != "" {
+				d := call.Args["directive"]
+				if d == "" {
+					addResult("error: evolve requires directive")
+				} else {
 					t.config.SetDirective(d)
 					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
@@ -910,13 +920,21 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					addResult("directive updated")
 				}
 			case "remember":
-				if text := call.Args["text"]; text != "" && t.memory != nil {
-					go func(txt string) {
-						if err := t.memory.Store(txt); err != nil {
-							t.Inject(fmt.Sprintf("[remember] error: %v", err))
-						}
-					}(text)
-					addResult("stored")
+				text := call.Args["text"]
+				if text == "" {
+					addResult("error: remember requires text")
+				} else if t.memory == nil {
+					addResult("error: memory is not configured")
+				} else {
+					// Synchronous so the LLM actually learns whether the
+					// memory was stored. Previously async fire-and-forget
+					// would emit "stored" before the embedding call and
+					// silently drop failures.
+					if err := t.memory.Store(text); err != nil {
+						addResult(fmt.Sprintf("error: %v", err))
+					} else {
+						addResult("stored")
+					}
 				}
 			case "pace":
 				var parts []string

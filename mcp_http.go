@@ -41,7 +41,7 @@ func connectMCPHTTP(name, url string) (*MCPHTTPServer, error) {
 		Name: name,
 		url:  url,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 3 * time.Minute,
 			// Disable auto-redirects so we can re-issue POSTs with the body
 			// preserved. http.Client would otherwise follow 307/308 but drop
 			// the body for non-idempotent methods.

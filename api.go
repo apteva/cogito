@@ -200,6 +200,33 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if sub == "reset" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		t := findThinkerByID(a.thinker, id)
+		if t == nil {
+			http.Error(w, "thread not found", http.StatusNotFound)
+			return
+		}
+		// Drop persisted history (session.jsonl) and rebuild an empty
+		// session so subsequent iterations append to a clean file.
+		if t.session != nil {
+			t.session.Delete()
+			t.session = NewSession(".", id)
+		}
+		// Reset the in-memory message slice to just the system prompt.
+		// Iteration counter is preserved — the thread keeps its identity,
+		// it just forgets what it was talking about.
+		if len(t.messages) > 0 {
+			t.messages = t.messages[:1]
+		}
+		logMsg("API", fmt.Sprintf("reset thread %s: history wiped, messages=[system]", id))
+		writeJSON(w, map[string]any{"status": "reset", "id": id, "count": len(t.messages)})
+		return
+	}
+
 	if sub != "" {
 		http.Error(w, fmt.Sprintf("unknown sub-path %q", sub), http.StatusNotFound)
 		return

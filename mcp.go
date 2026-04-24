@@ -194,13 +194,20 @@ func (s *MCPServer) call(method string, params any) (json.RawMessage, error) {
 			return nil, fmt.Errorf("MCP error %d: %s", resp.Error.Code, resp.Error.Message)
 		}
 		return resp.Result, nil
-	case <-time.After(30 * time.Second):
+	case <-time.After(mcpCallTimeout):
 		s.pendMu.Lock()
 		delete(s.pending, id)
 		s.pendMu.Unlock()
-		return nil, fmt.Errorf("MCP call timed out after 30s")
+		return nil, fmt.Errorf("MCP call timed out after %s", mcpCallTimeout)
 	}
 }
+
+// mcpCallTimeout is the deadline for a single tool invocation. Bumped
+// from 30s because legitimate long-running tools (audio transcription,
+// large-file downloads, OCR) can legitimately take a minute or two.
+// Short enough that a hung MCP still surfaces as a timeout error within
+// a reasonable window for retry.
+const mcpCallTimeout = 3 * time.Minute
 
 func (s *MCPServer) notify(method string, params any) {
 	req := jsonRPCRequest{
