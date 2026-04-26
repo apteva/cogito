@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"fmt"
@@ -259,7 +259,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	case ModeCautious:
 		modeBlock = "\n\n[SAFETY MODE: cautious]\nRead-only tools are free. Before any state-changing tool (exec, write, delete, deploy, restart, external send), send one concise `send` to your parent with action + target + why, and wait for their next message. If unsure whether an action is state-changing, ask. Use [[remember]] with bracketed tags ([correction], [preference], [decision], [fact]) on every correction or preference — memories are shared with main + siblings."
 	case ModeLearn:
-		modeBlock = "\n\n[SAFETY MODE: learn]\nSoft gate — no runtime block, the discipline is on you. For any new kind of state-changing / external / user-affecting action, first check memories the recall system surfaced this turn; if nothing covers it, `send` a one-line check to your parent and wait. Obviously-safe tools (screenshot, list, read, web search, memory_scan) don't need asking. After every answer, [[remember]] with a structured tag ([preference] <tool>: <scope> — <outcome> / [correction] ... / [decision] ...) so recall surfaces it next time. Remember MORE than you think — every correction, tone feedback, and approved decision."
+		modeBlock = "\n\n[SAFETY MODE: learn]\nSoft gate — no runtime block, the discipline is on you. DEFAULT: before any action you haven't taken before this session (or that recall hasn't surfaced an approval for), `send` a one-line check to your parent — \"About to <verb> <target>. Reason: <one sentence>. OK?\" — and wait. This applies to EVERY tool — reads, file IO, exec, browser, thread spawning, channel sends — except `pace`, `[[remember]]`, and `recall`/`memory_scan` (loop control + own-state queries, never gated). Once approved on a scope, reuse freely on the same scope without re-asking. After every answer, [[remember]] with a structured tag ([preference] <tool>: <scope> — <outcome> / [correction] ... / [decision] ...) so recall surfaces it next time across main + siblings. Asking frequency MUST drop over time — if you keep asking the same thing, the memory wasn't specific enough."
 	default: // ModeAutonomous
 		modeBlock = "\n\n[SAFETY MODE: autonomous]\nDecide yourself. For irreversible or high-blast-radius actions, inform your parent briefly before acting. Stop and adjust the moment a correction comes back. ACT, DON'T NARRATE — your parent only sees what you `send` or `done` with; prose between tool calls is not observed by anyone, so skip it. Take the next tool call, let the result guide the next. Use [[remember]] liberally on every correction / preference / decision with bracketed tags — shared with main + siblings via embedding recall."
 	}
