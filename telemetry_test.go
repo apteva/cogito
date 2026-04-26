@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"encoding/json"
@@ -215,20 +215,6 @@ func TestModelContextWindow(t *testing.T) {
 	}
 }
 
-func TestCalculateCost(t *testing.T) {
-	usage := TokenUsage{
-		PromptTokens:     1000,
-		CachedTokens:     800,
-		CompletionTokens: 200,
-	}
-	cost := calculateCost(usage)
-
-	// 200 uncached * 0.60/1M + 800 cached * 0.10/1M + 200 output * 3.00/1M
-	expected := (200*0.60 + 800*0.10 + 200*3.00) / 1_000_000
-	if cost < expected*0.99 || cost > expected*1.01 {
-		t.Errorf("expected ~%f, got %f", expected, cost)
-	}
-}
 
 func TestTelemetry_EmitLive(t *testing.T) {
 	tel := &Telemetry{

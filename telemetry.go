@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"bytes"
@@ -423,14 +423,6 @@ type DirectiveChangeData struct {
 	New string `json:"new"`
 }
 
-// --- Cost calculation (matches TUI pricing) ---
-
-const (
-	costInputPerMillion  = 0.60
-	costCachedPerMillion = 0.10
-	costOutputPerMillion = 3.00
-)
-
 // ModelContextWindow returns the advertised input-context window (in
 // tokens) for a given model id. Pure static lookup — no network, no
 // API call, ~hundreds of nanoseconds. Returns 0 if the model isn't in
@@ -519,12 +511,3 @@ func ModelContextWindow(modelID string) int {
 	return 0
 }
 
-func calculateCost(usage TokenUsage) float64 {
-	uncached := usage.PromptTokens - usage.CachedTokens
-	if uncached < 0 {
-		uncached = 0
-	}
-	return (float64(uncached)*costInputPerMillion +
-		float64(usage.CachedTokens)*costCachedPerMillion +
-		float64(usage.CompletionTokens)*costOutputPerMillion) / 1_000_000
-}
