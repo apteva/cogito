@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"strings"
@@ -156,11 +156,12 @@ func TestMCPToolSummaryGenerated(t *testing.T) {
 	t.Logf("Summary:\n%s", summary)
 }
 
-// TestNoMCPToolsEmptySummary verifies that no summary is generated when there
-// are no MCP tools.
-// TestActiveThreadsInjectedInSystemPrompt verifies that active thread info
-// is included in the system prompt so main never forgets running threads.
-func TestActiveThreadsInjectedInSystemPrompt(t *testing.T) {
+// TestActiveThreadsInjectedInDynamicContext verifies that active thread
+// info reaches the agent via the per-turn dynamic context block — NOT
+// via the system prompt (where it used to live and busted the cache
+// every iteration). Both behaviors are checked: the system prompt is
+// thread-agnostic, the dynamic context carries the thread list.
+func TestActiveThreadsInjectedInDynamicContext(t *testing.T) {
 	reg := &ToolRegistry{tools: make(map[string]*ToolDef)}
 	reg.Register(&ToolDef{Name: "pace", Description: "Set pace", Core: true, Syntax: `[[pace]]`})
 
@@ -186,50 +187,61 @@ func TestActiveThreadsInjectedInSystemPrompt(t *testing.T) {
 	}
 
 	prompt := buildSystemPrompt("Test directive", ModeAutonomous, reg, "", nil, threads, nil, nil)
-
-	// Should contain ACTIVE THREADS section
-	if !strings.Contains(prompt, "[ACTIVE THREADS]") {
-		t.Error("prompt should contain [ACTIVE THREADS] section")
+	// Note: the literal string "[ACTIVE THREADS]" appears inside the
+	// evolve tool's description (it's documented as a section name the
+	// agent must avoid touching). The test for "section gone" is
+	// therefore "no rendered thread row" — directive bodies of the
+	// fake threads must NOT show up in the system prompt.
+	if strings.Contains(prompt, "Monitor stock prices") || strings.Contains(prompt, "Manage social media") {
+		t.Error("system prompt rendered active-thread bodies — they should only appear in the per-turn dynamic context")
 	}
 
-	// Should list both threads
-	if !strings.Contains(prompt, "price-monitor") {
-		t.Error("prompt should mention price-monitor thread")
+	// The agent still has to see them — just via the dynamic-context path.
+	dyn := buildDynamicTurnContext(threads, "", "")
+
+	if !strings.Contains(dyn, "[ACTIVE THREADS]") {
+		t.Error("dynamic context should contain [ACTIVE THREADS] section")
 	}
-	if !strings.Contains(prompt, "social-media-manager") {
-		t.Error("prompt should mention social-media-manager thread")
+	if !strings.Contains(dyn, "price-monitor") {
+		t.Error("dynamic context should mention price-monitor thread")
+	}
+	if !strings.Contains(dyn, "social-media-manager") {
+		t.Error("dynamic context should mention social-media-manager thread")
+	}
+	if !strings.Contains(dyn, "Monitor stock prices") {
+		t.Error("dynamic context should include price-monitor directive")
+	}
+	if !strings.Contains(dyn, "Manage social media") {
+		t.Error("dynamic context should include social-media-manager directive")
+	}
+	if !strings.Contains(dyn, "stocks_get_quote") {
+		t.Error("dynamic context should list price-monitor tools")
+	}
+	if !strings.Contains(dyn, "socialcast_create_post") {
+		t.Error("dynamic context should list social-media-manager tools")
 	}
 
-	// Should include directives
-	if !strings.Contains(prompt, "Monitor stock prices") {
-		t.Error("prompt should include price-monitor directive")
-	}
-	if !strings.Contains(prompt, "Manage social media") {
-		t.Error("prompt should include social-media-manager directive")
-	}
-
-	// Should include tools
-	if !strings.Contains(prompt, "stocks_get_quote") {
-		t.Error("prompt should list price-monitor tools")
-	}
-	if !strings.Contains(prompt, "socialcast_create_post") {
-		t.Error("prompt should list social-media-manager tools")
+	// The new format omits live-ticking values (age, iter, rate, model)
+	// because they busted the cache every second. Confirm they're gone.
+	for _, banned := range []string{"running 10m0s", "iter #15", "pace slow", "model small"} {
+		if strings.Contains(dyn, banned) {
+			t.Errorf("dynamic context should not contain volatile field %q", banned)
+		}
 	}
 
-	t.Logf("Prompt excerpt:\n%s", prompt[len(prompt)-500:])
+	t.Logf("Dynamic context:\n%s", dyn)
 }
 
-// TestNoActiveThreadsNoSection verifies no ACTIVE THREADS section when empty.
+// TestNoActiveThreadsNoSection verifies no ACTIVE THREADS section is
+// emitted in the dynamic-context block when there are no active threads.
+// The system prompt naturally never contains a rendered section after
+// the cache fix; the meaningful assertion is on buildDynamicTurnContext.
 func TestNoActiveThreadsNoSection(t *testing.T) {
-	reg := &ToolRegistry{tools: make(map[string]*ToolDef)}
-	prompt := buildSystemPrompt("Test", ModeAutonomous, reg, "", nil, nil, nil, nil)
-	if strings.Contains(prompt, "[ACTIVE THREADS]") {
-		t.Error("prompt should NOT contain [ACTIVE THREADS] when no threads")
+	if dyn := buildDynamicTurnContext(nil, "", ""); strings.Contains(dyn, "[ACTIVE THREADS]") {
+		t.Error("dynamic context should NOT contain [ACTIVE THREADS] when no threads")
 	}
-
-	prompt2 := buildSystemPrompt("Test", ModeAutonomous, reg, "", nil, []ThreadInfo{}, nil, nil)
-	if strings.Contains(prompt2, "[ACTIVE THREADS]") {
-		t.Error("prompt should NOT contain [ACTIVE THREADS] when empty slice")
+	if dyn := buildDynamicTurnContext([]ThreadInfo{}, "", ""); strings.Contains(dyn, "[ACTIVE THREADS]") {
+		t.Error("dynamic context should NOT contain [ACTIVE THREADS] when empty slice")
 	}
 }
 

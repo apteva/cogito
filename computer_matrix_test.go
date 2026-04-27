@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"bytes"
@@ -51,10 +51,8 @@ func TestComputerUse_LocalClickMatrix(t *testing.T) {
 	if os.Getenv("RUN_MATRIX") == "" {
 		t.Skip("set RUN_MATRIX=1 (this test runs many variants and is slow)")
 	}
-	apiKey := os.Getenv("FIREWORKS_API_KEY")
-	if apiKey == "" {
-		t.Skip("FIREWORKS_API_KEY not set")
-	}
+	tp := getTestProvider(t)
+	apiKey := tp.APIKey
 	// This matrix is the raw-pixel-click diagnostic — it intentionally
 	// opts out of the package's SoM default so each config measures
 	// Kimi's coordinate accuracy on unlabeled screenshots.

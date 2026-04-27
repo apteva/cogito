@@ -92,17 +92,41 @@ func GetComputerToolDef(display DisplaySize) ToolDefinition {
 func GetSessionToolDef() ToolDefinition {
 	return ToolDefinition{
 		Name:        "browser_session",
-		Description: "Session lifecycle only: open a URL, close the browser, resume. Does NOT return screenshots — take one with computer_use afterward to see the page.",
+		Description: "Session lifecycle: open a URL, attach to a persistent context, resume an existing session, close. Does NOT return screenshots — take one with computer_use afterward to see the page.",
 		Syntax:      `[[browser_session action="open" url="https://example.com"]]`,
 		Rules: "" +
 			"ACTIONS:\n" +
-			"  open   — navigate to a URL. Follow with computer_use(action=screenshot).\n" +
-			"  close  — end the session. Use when the task is finished.\n" +
-			"  resume — reconnect to a previously-created session (Browserbase only).\n" +
-			"  status — read current URL + viewport. Rarely needed: every computer_use\n" +
-			"           action already returns a fresh screenshot and you can see the URL\n" +
-			"           bar there. Don't call status between every other action — it's\n" +
-			"           a round-trip that adds no information the screenshot doesn't show.",
+			"  open    — open a session and navigate. Three shapes:\n" +
+			"              url=...                                fresh anonymous session, navigates.\n" +
+			"              url=... context_id=ctx_abc             fresh session bound to a persistent\n" +
+			"                                                     context (cookies, localStorage,\n" +
+			"                                                     IndexedDB pre-loaded — usually\n" +
+			"                                                     means you start already logged in).\n" +
+			"                                                     Add persist=false for a read-only\n" +
+			"                                                     attach (no writes saved back).\n" +
+			"              session_id=sess_xyz [url=...]          attach to an existing session.\n" +
+			"                                                     Skips nav when url is omitted —\n" +
+			"                                                     useful when the session is already\n" +
+			"                                                     on the right page.\n" +
+			"            Pass timeout=N (seconds) for long tasks (e.g. login flows that wait on an\n" +
+			"            emailed code). Default lease is short; if the session expires mid-task\n" +
+			"            you cannot recover. When unsure, pad it.\n" +
+			"            context_id and session_id are mutually exclusive.\n" +
+			"  resume  — sugar for open(session_id=...). Works with Browserbase (only when the\n" +
+			"            original session was keep-alive) and Browser Engine (live or snapshot\n" +
+			"            replay). Steel / local cannot resume — open with the same context_id\n" +
+			"            instead.\n" +
+			"  close   — end the session. Persists context state (when persist=true). After close\n" +
+			"            you cannot reopen the same session id, but you CAN open a new one bound\n" +
+			"            to the same context_id and pick up where you left off.\n" +
+			"  status  — current url + viewport + session_id + context_id + provider. Useful when\n" +
+			"            you need to record a session_id for a later resume. Don't poll between\n" +
+			"            every other action — the screenshot already shows the URL bar.\n" +
+			"\n" +
+			"WHEN TO USE A CONTEXT: any task that benefits from being already-logged-in (email,\n" +
+			"social, dashboards). The operator sets contexts up; you receive their ids in your\n" +
+			"directive or task brief and pass them to open. If you don't know a context id, open\n" +
+			"anonymously.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -112,11 +136,23 @@ func GetSessionToolDef() ToolDefinition {
 				},
 				"url": map[string]any{
 					"type":        "string",
-					"description": "URL to navigate to (for open action)",
+					"description": "URL to navigate to (for open). Optional when session_id is set and the existing session is already on the desired page.",
+				},
+				"context_id": map[string]any{
+					"type":        "string",
+					"description": "Persistent context id to bind the new session to (for open). Provider-scoped — use only ids the operator gave you. Mutually exclusive with session_id.",
+				},
+				"persist": map[string]any{
+					"type":        "string",
+					"description": "Whether to save context state at session close. \"true\" (default) writes back; \"false\" attaches read-only. Only meaningful with context_id.",
+				},
+				"timeout": map[string]any{
+					"type":        "integer",
+					"description": "Max session lifetime in seconds (for open). Use 1200+ for multi-step flows like email-code logins.",
 				},
 				"session_id": map[string]any{
 					"type":        "string",
-					"description": "Session ID to resume (for resume action, Browserbase only)",
+					"description": "Session id to attach to (for open / resume). Browserbase + Browser Engine only. Mutually exclusive with context_id.",
 				},
 			},
 			"required": []string{"action"},
@@ -245,17 +281,59 @@ func HandleSessionAction(comp Computer, args map[string]string) (text string, sc
 	switch actionType {
 	case "open":
 		url := args["url"]
-		if url == "" {
-			return "", nil, fmt.Errorf("url required for open action")
+		contextID := strings.TrimSpace(args["context_id"])
+		sessionID := strings.TrimSpace(args["session_id"])
+		if url == "" && sessionID == "" {
+			return "", nil, fmt.Errorf("url or session_id required for open action")
 		}
+		if contextID != "" && sessionID != "" {
+			return "", nil, fmt.Errorf("context_id and session_id are mutually exclusive (a context-bound session has its own id; pick one)")
+		}
+		// persist defaults true; explicit "false" / "0" opts out.
+		persist := true
+		if raw := strings.TrimSpace(args["persist"]); raw != "" {
+			lower := strings.ToLower(strings.Trim(raw, `"`))
+			if lower == "false" || lower == "0" || lower == "no" {
+				persist = false
+			}
+		}
+		var timeout int
+		if raw := strings.TrimSpace(args["timeout"]); raw != "" {
+			if secs, perr := strconv.Atoi(strings.Trim(raw, `"`)); perr == nil && secs > 0 {
+				timeout = secs
+			}
+		}
+
+		opts := OpenOptions{
+			URL:       url,
+			ContextID: contextID,
+			Persist:   persist,
+			SessionID: sessionID,
+			Timeout:   timeout,
+		}
+
+		so, ok := comp.(SessionOpener)
+		if !ok {
+			// Backend doesn't own session lifecycle (legacy path). It can
+			// still navigate; context_id / session_id are ignored.
+			if contextID != "" || sessionID != "" {
+				return "", nil, fmt.Errorf("this backend does not support context_id / session_id (only url is honored)")
+			}
+			start := time.Now()
+			_, navErr := comp.Execute(Action{Type: "navigate", URL: url})
+			if navErr != nil {
+				return fmt.Sprintf("Error navigating to %s: %v", url, navErr), nil, navErr
+			}
+			return fmt.Sprintf("Navigated to %s (%dms). Use computer_use with action=screenshot to see the page.",
+				url, time.Since(start).Milliseconds()), nil, nil
+		}
+
 		start := time.Now()
-		_, err = comp.Execute(Action{Type: "navigate", URL: url})
-		duration := time.Since(start)
-		if err != nil {
-			return fmt.Sprintf("Error navigating to %s: %v", url, err), nil, err
+		if err := so.OpenSession(opts); err != nil {
+			return fmt.Sprintf("Error opening session: %v", err), nil, err
 		}
-		text = fmt.Sprintf("Navigated to %s (%dms). Use computer_use with action=screenshot to see the page.",
-			url, duration.Milliseconds())
+		duration := time.Since(start)
+		text = describeOpenResult(opts, duration)
 		return text, nil, nil
 
 	case "close":
@@ -277,13 +355,26 @@ func HandleSessionAction(comp Computer, args map[string]string) (text string, sc
 				info += fmt.Sprintf(" URL: %s.", url)
 			}
 		}
+		if ci, ok := comp.(ContextInfo); ok {
+			if cid := ci.ContextID(); cid != "" {
+				info += fmt.Sprintf(" Context: %s.", cid)
+			}
+		}
 		return info, nil, nil
 
 	case "resume":
-		sessionID := args["session_id"]
+		sessionID := strings.TrimSpace(args["session_id"])
 		if sessionID == "" {
 			return "", nil, fmt.Errorf("session_id required for resume action")
 		}
+		// resume is sugar for open(session_id=...) — same SessionOpener path.
+		if so, ok := comp.(SessionOpener); ok {
+			if err := so.OpenSession(OpenOptions{SessionID: sessionID}); err != nil {
+				return fmt.Sprintf("Error resuming session: %v", err), nil, err
+			}
+			return fmt.Sprintf("Resumed session %s. Use computer_use with action=screenshot to see the page.", sessionID), nil, nil
+		}
+		// Legacy fallback for backends that only implement Resumable.
 		if r, ok := comp.(Resumable); ok {
 			if err := r.Resume(sessionID); err != nil {
 				return fmt.Sprintf("Error resuming session: %v", err), nil, err
@@ -297,6 +388,32 @@ func HandleSessionAction(comp Computer, args map[string]string) (text string, sc
 	}
 }
 
+// describeOpenResult builds the human-readable response for a successful
+// browser_session open. Distinguishes the three intent shapes (resume,
+// context-bound create, anonymous create) so the agent gets a clear
+// confirmation of which path ran.
+func describeOpenResult(opts OpenOptions, duration time.Duration) string {
+	var prefix string
+	switch {
+	case opts.SessionID != "":
+		prefix = fmt.Sprintf("Resumed session %s", opts.SessionID)
+	case opts.ContextID != "":
+		persistNote := ""
+		if !opts.Persist {
+			persistNote = " (read-only)"
+		}
+		prefix = fmt.Sprintf("Opened session bound to context %s%s", opts.ContextID, persistNote)
+	default:
+		prefix = "Opened anonymous session"
+	}
+	if opts.URL != "" {
+		return fmt.Sprintf("%s, navigated to %s (%dms). Use computer_use with action=screenshot to see the page.",
+			prefix, opts.URL, duration.Milliseconds())
+	}
+	return fmt.Sprintf("%s (%dms). Use computer_use with action=screenshot to see the page.",
+		prefix, duration.Milliseconds())
+}
+
 // SessionInfo is an optional interface for computers that can report session details.
 type SessionInfo interface {
 	SessionType() string // "local", "browserbase", "service"
@@ -304,9 +421,26 @@ type SessionInfo interface {
 	CurrentURL() string  // current page URL
 }
 
+// ContextInfo is an optional interface for computers attached to a
+// persistent context. status surfaces the bound context id so the agent
+// can confirm which identity it's running as. Implementations that do
+// not support contexts (or aren't currently bound) should not implement
+// this interface — the type assertion in status will simply skip it.
+type ContextInfo interface {
+	ContextID() string
+}
+
 // Resumable is an optional interface for computers that support session resumption.
 type Resumable interface {
 	Resume(sessionID string) error
+}
+
+// Timeoutable is an optional interface for computers whose backend
+// session has a configurable max lifetime that the agent may want to
+// extend mid-task. Browser Engine implements this; local Chrome and
+// providers without an API-controlled lease return ErrNotSupported.
+type Timeoutable interface {
+	ExtendTimeout(seconds int) error
 }
 
 // geminiComputerUseActions maps Gemini native Computer Use function names.

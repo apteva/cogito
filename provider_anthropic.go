@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"bufio"
@@ -25,6 +25,40 @@ func toMap(v any) (map[string]any, bool) {
 		return nil, false
 	}
 	return m, true
+}
+
+// applyMsgCacheControl tags the last text block of an anthropic message
+// with cache_control: ephemeral. Used to set a cache breakpoint at the
+// most recent turn so subsequent requests can prefix-match the entire
+// conversation up through it.
+//
+// Handles three content shapes:
+//   - string content: rewrite into a single text block carrying cache
+//   - []anthropicContentBlock: tag the last text block (or fall through
+//     to a structural rewrite if there isn't one to tag)
+//   - any other slice (e.g. []map[string]any from JSON round-tripping):
+//     no-op, the conversation tail will simply not be cached and the
+//     existing tools+system breakpoints still apply.
+func applyMsgCacheControl(m *anthropicMessage) {
+	if m == nil {
+		return
+	}
+	switch c := m.Content.(type) {
+	case string:
+		m.Content = []anthropicContentBlock{
+			{Type: "text", Text: c, CacheControl: &anthropicCacheControl{Type: "ephemeral"}},
+		}
+	case []anthropicContentBlock:
+		// Tag the last text block — doing so on a tool_use/tool_result
+		// block is invalid; if there's no text block, leave it alone.
+		for i := len(c) - 1; i >= 0; i-- {
+			if c[i].Type == "text" {
+				c[i].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+				m.Content = c
+				return
+			}
+		}
+	}
 }
 
 func sanitizeToolID(id string) string {
@@ -127,15 +161,16 @@ type anthropicMessage struct {
 }
 
 type anthropicContentBlock struct {
-	Type       string           `json:"type"`                    // "text", "image", "tool_use", "tool_result"
-	Text       string           `json:"text,omitempty"`          // type=text
-	Source     *anthropicSource `json:"source,omitempty"`        // type=image
-	ID         string           `json:"id,omitempty"`            // type=tool_use
-	Name       string           `json:"name,omitempty"`          // type=tool_use
-	Input      json.RawMessage  `json:"input,omitempty"`         // type=tool_use — use RawMessage to preserve empty {}
-	ToolUseID  string           `json:"tool_use_id,omitempty"`   // type=tool_result
-	Content    any              `json:"content,omitempty"`       // type=tool_result (string or blocks)
-	IsError    bool             `json:"is_error,omitempty"`      // type=tool_result
+	Type         string                  `json:"type"`                    // "text", "image", "tool_use", "tool_result"
+	Text         string                  `json:"text,omitempty"`          // type=text
+	Source       *anthropicSource        `json:"source,omitempty"`        // type=image
+	ID           string                  `json:"id,omitempty"`            // type=tool_use
+	Name         string                  `json:"name,omitempty"`          // type=tool_use
+	Input        json.RawMessage         `json:"input,omitempty"`         // type=tool_use — use RawMessage to preserve empty {}
+	ToolUseID    string                  `json:"tool_use_id,omitempty"`   // type=tool_result
+	Content      any                     `json:"content,omitempty"`       // type=tool_result (string or blocks)
+	IsError      bool                    `json:"is_error,omitempty"`      // type=tool_result
+	CacheControl *anthropicCacheControl  `json:"cache_control,omitempty"` // mark this block as a cache breakpoint
 }
 
 type anthropicSource struct {
@@ -348,6 +383,16 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 				anthropicTools[idx] = m
 			}
 		}
+	}
+
+	// Third cache breakpoint: the last message's terminal text block.
+	// Tools + system + (optionally) the conversation up through the
+	// most recent turn = up to 4 cache breakpoints (Anthropic's limit).
+	// Marking the last message means the next request's prefix can
+	// be served from cache up to and including this turn — only the
+	// tail (next user input) is uncached.
+	if n := len(anthropicMsgs); n > 0 {
+		applyMsgCacheControl(&anthropicMsgs[n-1])
 	}
 
 	reqBody := anthropicRequest{

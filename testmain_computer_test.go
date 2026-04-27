@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"os"
@@ -21,5 +21,10 @@ func TestMain(m *testing.M) {
 	if os.Getenv("APTEVA_SOM") == "" {
 		os.Setenv("APTEVA_SOM", "1")
 	}
+	// Open the log file so THINK / RUN / COMPUTER lines (file-only by
+	// default — see logger.go) get captured during test runs. Without
+	// this, debugging an agent that stalls mid-loop is impossible
+	// because provider.Chat enter/exit traces are silently dropped.
+	initLogger()
 	os.Exit(m.Run())
 }

@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"bytes"
@@ -41,10 +41,8 @@ func TestComputerUse_PatreonLogin(t *testing.T) {
 	if os.Getenv("RUN_PATREON_TEST") == "" {
 		t.Skip("set RUN_PATREON_TEST=1 (real Patreon login — interactive, burns tokens)")
 	}
-	apiKey := os.Getenv("FIREWORKS_API_KEY")
-	if apiKey == "" {
-		t.Skip("FIREWORKS_API_KEY not set")
-	}
+	tp := getTestProvider(t)
+	apiKey := tp.APIKey
 	email := os.Getenv("PATREON_EMAIL")
 	if email == "" {
 		t.Skip("PATREON_EMAIL not set")
@@ -52,6 +50,26 @@ func TestComputerUse_PatreonLogin(t *testing.T) {
 	password := os.Getenv("PATREON_PASSWORD")
 	if password == "" {
 		t.Skip("PATREON_PASSWORD not set")
+	}
+
+	// Patreon gates logins behind Cloudflare + account-origin
+	// fingerprinting — datacenter IPs almost always 403. Turn on the
+	// managed residential proxy for the cloud backends unless the
+	// operator explicitly opts out. No-op on TEST_BROWSER=local.
+	if os.Getenv("PATREON_USE_PROXY") != "0" {
+		t.Setenv("TEST_BROWSER_PROXY", "1")
+	}
+	// Patreon's email-code flow can take 4–10 min; the cloud
+	// backends' default lease (300s on Browser Engine, plan-default
+	// on others) often expires mid-flow. Browserbase + Steel can't
+	// extend post-create, so we set a generous lease at creation
+	// for every cloud backend. Override with PATREON_SESSION_TIMEOUT.
+	if os.Getenv("TEST_BROWSER_SESSION_TIMEOUT") == "" {
+		secs := "1200"
+		if v := os.Getenv("PATREON_SESSION_TIMEOUT"); v != "" {
+			secs = v
+		}
+		t.Setenv("TEST_BROWSER_SESSION_TIMEOUT", secs)
 	}
 
 	comp := buildComputerFromEnv(t)
@@ -97,7 +115,8 @@ func TestComputerUse_PatreonLogin(t *testing.T) {
 		fmt.Sprintf(`Password: %s`, password),
 		``,
 		`Steps:`,
-		`1) browser_session(action=open, url=https://www.patreon.com/login)`,
+		`1) browser_session(action=open, url=https://www.patreon.com/login, timeout=1200)`,
+		`   The timeout=1200 (20 min) is critical — this flow waits on an emailed code and the default session lease is short. If the session expires mid-flow you cannot recover, so always extend it on open.`,
 		`2) If a cookie/consent banner covers the page, dismiss it first (click Accept by label).`,
 		`3) computer_use(action=screenshot) — find the email input (orange badge).`,
 		`4) Click the email input (label=N), then computer_use(action=type, text="<the email above>").`,

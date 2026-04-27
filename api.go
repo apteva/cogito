@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"encoding/json"
@@ -82,6 +82,7 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 
 type threadJSON struct {
 	ID        string   `json:"id"`
+	Name      string   `json:"name,omitempty"`
 	ParentID  string   `json:"parent_id,omitempty"`
 	Depth     int      `json:"depth"`
 	Directive string   `json:"directive,omitempty"`
@@ -123,6 +124,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 		for _, t := range tm.List() {
 			out = append(out, threadJSON{
 				ID:        t.ID,
+				Name:      t.Name,
 				ParentID:  t.ParentID,
 				Depth:     t.Depth,
 				Directive: t.Directive,
@@ -615,7 +617,8 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			if body.Reset.Memory && a.thinker.memory != nil {
 				os.Remove(a.thinker.memory.path)
 				a.thinker.memory.mu.Lock()
-				a.thinker.memory.entries = nil
+				a.thinker.memory.records = nil
+				a.thinker.memory.byID = map[string]int{}
 				a.thinker.memory.mu.Unlock()
 			}
 			// Reset message context to just system prompt
@@ -788,7 +791,7 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 					MCPServer:   cfg.Name,
 				})
 			}
-			if t.memory != nil {
+			if t.memory != nil && t.memory.Enabled() {
 				go func(srvName string, srvTools []mcpToolDef) {
 					for _, tl := range srvTools {
 						fullName := srvName + "_" + tl.Name
@@ -827,31 +830,18 @@ func writeJSON(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// memoryListItem is the UI-facing projection of a MemoryEntry.
-// Embeddings are omitted (useless to the UI, ~6KB per entry), and
-// the index is attached so callers can DELETE/PUT without guessing.
-// tag is a best-effort extraction of the leading bracketed marker
-// ("[preference]", "[correction]", etc.) the remember-tool guidance
-// asks the agent to use — the UI uses it to color-group rows.
+// memoryListItem is the UI-facing projection of an active memory.
+// Embeddings are omitted (~6KB per entry, useless to the UI). Index
+// is attached so the dashboard's existing DELETE/PUT-by-index flow
+// continues to work; ID is also exposed for callers that want to
+// address by id directly.
 type memoryListItem struct {
-	Index     int       `json:"index"`
-	Text      string    `json:"text"`
-	Tag       string    `json:"tag,omitempty"`
-	Namespace string    `json:"namespace,omitempty"`
-	Session   string    `json:"session,omitempty"`
-	Time      time.Time `json:"time"`
-}
-
-func extractTag(text string) string {
-	s := strings.TrimSpace(text)
-	if len(s) < 3 || s[0] != '[' {
-		return ""
-	}
-	end := strings.IndexByte(s, ']')
-	if end <= 1 {
-		return ""
-	}
-	return s[1:end]
+	Index   int       `json:"index"`
+	ID      string    `json:"id"`
+	Text    string    `json:"text"`           // = MemoryRecord.Content (kept as `text` for backward UI compat)
+	Tags    []string  `json:"tags,omitempty"`
+	Weight  float64   `json:"weight,omitempty"`
+	Time    time.Time `json:"time"`           // = MemoryRecord.TS
 }
 
 // GET /memory — return every memory entry in store order.
@@ -864,16 +854,16 @@ func (a *APIServer) memoryList(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, []memoryListItem{})
 		return
 	}
-	entries := a.thinker.memory.List()
-	out := make([]memoryListItem, len(entries))
-	for i, e := range entries {
+	active := a.thinker.memory.Active()
+	out := make([]memoryListItem, len(active))
+	for i, r := range active {
 		out[i] = memoryListItem{
-			Index:     i,
-			Text:      e.Text,
-			Tag:       extractTag(e.Text),
-			Namespace: e.Namespace,
-			Session:   e.Session,
-			Time:      e.Time,
+			Index:  i,
+			ID:     r.ID,
+			Text:   r.Content,
+			Tags:   r.Tags,
+			Weight: r.Weight,
+			Time:   r.TS,
 		}
 	}
 	writeJSON(w, out)
@@ -897,11 +887,24 @@ func (a *APIServer) memoryItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Translate the legacy index addressing into the new id-based API.
+	// The dashboard still passes indices; we resolve to the active
+	// record at that position. Out-of-range indices silent no-op for
+	// DELETE (matches old behaviour) and 404 for PUT.
+	active := a.thinker.memory.Active()
+	if idx < 0 || idx >= len(active) {
+		if r.Method == http.MethodDelete {
+			writeJSON(w, map[string]any{"ok": true, "count": a.thinker.memory.Count()})
+			return
+		}
+		http.Error(w, "index out of range", http.StatusNotFound)
+		return
+	}
+	target := active[idx]
+
 	switch r.Method {
 	case http.MethodDelete:
-		// Delete is range-checked internally; silent no-op on bad index
-		// matches the memory_prune tool's behavior so the UX is the same.
-		a.thinker.memory.Delete(idx)
+		_ = a.thinker.memory.Drop(target.ID, "deleted via dashboard")
 		writeJSON(w, map[string]any{"ok": true, "count": a.thinker.memory.Count()})
 
 	case http.MethodPut:
@@ -917,7 +920,7 @@ func (a *APIServer) memoryItem(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "text required", http.StatusBadRequest)
 			return
 		}
-		if err := a.thinker.memory.Update(idx, text); err != nil {
+		if _, err := a.thinker.memory.Supersede(target.ID, text, target.Tags, target.Weight, "edited via dashboard"); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

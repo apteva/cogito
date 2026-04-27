@@ -87,6 +87,7 @@ IMPORTANT — tool calls and done:
 
 type ThreadInfo struct {
 	ID           string
+	Name         string // human-readable display label; empty = render id
 	ParentID     string // "main" or parent thread ID
 	Depth        int
 	Directive    string
@@ -105,6 +106,9 @@ type ThreadInfo struct {
 
 type Thread struct {
 	ID           string
+	Name         string // human-readable label, separate from ID. ID is immutable;
+	                    // Name can be edited via update without touching parent_id
+	                    // references or session storage. Empty means "use ID for display".
 	ParentID     string // "main" or parent thread ID
 	Depth        int    // 0 = child of main, 1 = grandchild, etc.
 	Directive    string // original directive before tool docs
@@ -141,6 +145,16 @@ type SpawnOpts struct {
 	MCPNames        []string // MCP server names to connect (thread gets own connections)
 	BuiltinTools    []string // provider builtin overrides (nil = inherit, empty = none)
 	DeferRun        bool     // if true, don't start Run() — call StartAll() later
+	// Paused: if true, the thread spawns in paused state. Run() loop
+	// blocks at the top of its first iteration until either an inbox
+	// event arrives (an explicit `send` from the leader) OR the
+	// thinker is unpaused via PauseAll(false). Useful for
+	//   - "configure-then-launch" patterns where the leader spawns
+	//     several workers atomically before any of them think
+	//   - cautious/learn modes that want children to wait for explicit
+	//     instruction rather than acting on the directive alone
+	//   - debugging — inspect the worker before it does anything
+	Paused bool
 }
 
 // SpawnWithMedia creates a thread and injects media parts before it starts thinking.
@@ -195,11 +209,14 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	canSpawn := depth < MaxSpawnDepth && wantsSpawn
 
-	// Check if this is a system thread (e.g. unconscious)
+	// Check if this is a system thread (e.g. unconscious) and recover the
+	// persistent display Name if one was set on a previous run.
 	isSystem := false
+	persistedName := ""
 	for _, pt := range tm.parent.config.GetThreads() {
-		if pt.ID == id && pt.System {
-			isSystem = true
+		if pt.ID == id {
+			isSystem = pt.System
+			persistedName = pt.Name
 			break
 		}
 	}
@@ -250,23 +267,22 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	// Inject safety mode from parent config. Child-thread wording is a
 	// tighter version of the main-thread prompt: the child escalates to
-	// its PARENT (not the user directly), and shares the same memory
-	// store — so [[remember]] from a child is visible to every future
-	// turn in main and siblings too.
+	// its PARENT (not the user directly).
 	mode := tm.parent.config.GetMode()
 	modeBlock := ""
 	switch mode {
 	case ModeCautious:
-		modeBlock = "\n\n[SAFETY MODE: cautious]\nRead-only tools are free. Before any state-changing tool (exec, write, delete, deploy, restart, external send), send one concise `send` to your parent with action + target + why, and wait for their next message. If unsure whether an action is state-changing, ask. Use [[remember]] with bracketed tags ([correction], [preference], [decision], [fact]) on every correction or preference — memories are shared with main + siblings."
+		modeBlock = "\n\n[SAFETY MODE: cautious]\nRead-only tools are free. Before any state-changing tool (exec, write, delete, deploy, restart, external send), send one concise `send` to your parent with action + target + why, and wait for their next message. If unsure whether an action is state-changing, ask."
 	case ModeLearn:
-		modeBlock = "\n\n[SAFETY MODE: learn]\nSoft gate — no runtime block, the discipline is on you. DEFAULT: before any action you haven't taken before this session (or that recall hasn't surfaced an approval for), `send` a one-line check to your parent — \"About to <verb> <target>. Reason: <one sentence>. OK?\" — and wait. This applies to EVERY tool — reads, file IO, exec, browser, thread spawning, channel sends — except `pace`, `[[remember]]`, and `recall`/`memory_scan` (loop control + own-state queries, never gated). Once approved on a scope, reuse freely on the same scope without re-asking. After every answer, [[remember]] with a structured tag ([preference] <tool>: <scope> — <outcome> / [correction] ... / [decision] ...) so recall surfaces it next time across main + siblings. Asking frequency MUST drop over time — if you keep asking the same thing, the memory wasn't specific enough."
+		modeBlock = "\n\n[SAFETY MODE: learn]\nSoft gate — no runtime block, the discipline is on you. DEFAULT: before any action you haven't taken before this session, `send` a one-line check to your parent — \"About to <verb> <target>. Reason: <one sentence>. OK?\" — and wait. This applies to EVERY tool — reads, file IO, exec, browser, thread spawning, channel sends — except `pace` (loop control, never gated). Once approved on a scope, reuse freely on the same scope without re-asking."
 	default: // ModeAutonomous
-		modeBlock = "\n\n[SAFETY MODE: autonomous]\nDecide yourself. For irreversible or high-blast-radius actions, inform your parent briefly before acting. Stop and adjust the moment a correction comes back. ACT, DON'T NARRATE — your parent only sees what you `send` or `done` with; prose between tool calls is not observed by anyone, so skip it. Take the next tool call, let the result guide the next. Use [[remember]] liberally on every correction / preference / decision with bracketed tags — shared with main + siblings via embedding recall."
+		modeBlock = "\n\n[SAFETY MODE: autonomous]\nDecide yourself. For irreversible or high-blast-radius actions, inform your parent briefly before acting. Stop and adjust the moment a correction comes back. ACT, DON'T NARRATE — your parent only sees what you `send` or `done` with; prose between tool calls is not observed by anyone, so skip it. Take the next tool call, let the result guide the next."
 	}
 	threadSystemPrompt := basePrompt + coreDocs + modeBlock + "\n\n[DIRECTIVE]\n" + directive
 
 	thread := &Thread{
 		ID:           id,
+		Name:         persistedName,
 		ParentID:     parentID,
 		Depth:        depth,
 		Directive:    directive,
@@ -447,7 +463,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		toolAllowlist: threadAllowlist,
 		config:        tm.parent.config,
 		mcpServers:    threadMCPServers,
-		rebuildPrompt: func(toolDocs string) string {
+		rebuildPrompt: func(_ string) string {
 			cd := ""
 			if threadRegistry != nil {
 				if poolSupportsNativeTools(tm.parent.pool) {
@@ -463,21 +479,11 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 				bp = fmt.Sprintf(baseThreadPromptTemplate, id, parentLabel, id)
 			}
 			prompt := bp + cd
-			if toolDocs != "" {
-				prompt += "\n" + toolDocs
-			}
-			// Inject active sub-threads for leaders
-			if thread.Children != nil {
-				children := thread.Children.List()
-				if len(children) > 0 {
-					prompt += "\n\n[ACTIVE SUB-THREADS]\n"
-					for _, c := range children {
-						age := time.Since(c.Started).Truncate(time.Second)
-						prompt += fmt.Sprintf("- %s (running %s, iter #%d, pace %s)\n  directive: %s\n",
-							c.ID, age, c.Iteration, c.Rate.String(), truncateStr(c.Directive, 150))
-					}
-				}
-			}
+			// Active sub-threads + RAG-retrieved toolDocs USED to render
+			// here — they busted the cache every iteration. Both now ride
+			// in the per-turn user message via buildDynamicTurnContext
+			// (same path as main thread's Run loop), keeping leader
+			// messages[0] cache-stable.
 			// Show available MCP servers so leaders know what to assign when spawning
 			if canSpawn {
 				var mcpList []string
@@ -540,9 +546,16 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		thread.initialParts = nil
 	}
 
-	// Start the thinking loop (unless deferred for batch respawn)
+	// Start the thinking loop (unless deferred for batch respawn).
+	// Paused workers start their goroutine but block at the top of
+	// Run() until an inbox event arrives or PauseAll(false) wakes them.
 	if !opts.DeferRun {
-		logMsg("SPAWN", fmt.Sprintf("starting Run() for id=%q tools=%d mcps=%d", id, len(toolSet), len(threadMCPServers)))
+		if opts.Paused {
+			thinker.paused = true
+			logMsg("SPAWN", fmt.Sprintf("starting Run() PAUSED for id=%q tools=%d mcps=%d", id, len(toolSet), len(threadMCPServers)))
+		} else {
+			logMsg("SPAWN", fmt.Sprintf("starting Run() for id=%q tools=%d mcps=%d", id, len(toolSet), len(threadMCPServers)))
+		}
 		go thinker.Run()
 	} else {
 		logMsg("SPAWN", fmt.Sprintf("deferred Run() for id=%q (batch respawn)", id))
@@ -720,6 +733,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						}
 					}
 				}
+				paused := parseTruthy(call.Args["paused"])
 				if sid == "" || directive == "" {
 					emitResult(call, fmt.Sprintf("error: spawn requires both id and directive (got id=%q, directive_len=%d)", sid, len(directive)))
 				} else {
@@ -729,6 +743,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						Depth:        thread.Depth + 1,
 						MCPNames:     mcpNames,
 						BuiltinTools: builtinTools,
+						Paused:       paused,
 					})
 					if err != nil {
 						emitResult(call, fmt.Sprintf("error: %v", err))
@@ -737,7 +752,11 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							ID: sid, ParentID: thread.ID, Depth: thread.Depth + 1,
 							Directive: directive, Tools: spawnTools, MCPNames: mcpNames,
 						})
-						emitResult(call, fmt.Sprintf("thread %s spawned (depth %d)", sid, thread.Depth+1))
+						if paused {
+							emitResult(call, fmt.Sprintf("thread %s spawned (depth %d, paused — send a message to wake)", sid, thread.Depth+1))
+						} else {
+							emitResult(call, fmt.Sprintf("thread %s spawned (depth %d)", sid, thread.Depth+1))
+						}
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -755,23 +774,37 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				toolNames = append(toolNames, call.Raw)
 			case "update":
 				sid := call.Args["id"]
+				newID := call.Args["new_id"]
+				name := call.Args["name"]
+				directive := call.Args["directive"]
+				toolsStr := call.Args["tools"]
 				if sid == "" {
 					emitResult(call, "error: update requires id")
 				} else if thread.Children == nil {
 					emitResult(call, "error: cannot update (not a leader thread)")
+				} else if newID == "" && name == "" && directive == "" && toolsStr == "" {
+					emitResult(call, "error: update requires at least one of new_id, name, directive, tools")
 				} else {
-					directive := call.Args["directive"]
-					toolsStr := call.Args["tools"]
 					var updateTools []string
 					if toolsStr != "" {
 						updateTools = strings.Split(toolsStr, ",")
 					}
-					if err := thread.Children.Update(sid, directive, updateTools); err != nil {
-						emitResult(call, fmt.Sprintf("error: %v", err))
-					} else {
-						if directive != "" {
+					applyErr := error(nil)
+					if name != "" || directive != "" || len(updateTools) > 0 {
+						applyErr = thread.Children.Update(sid, name, directive, updateTools)
+						if applyErr == nil && directive != "" {
 							thread.Children.Send(sid, fmt.Sprintf("[directive updated] %s", directive))
 						}
+					}
+					if applyErr != nil {
+						emitResult(call, fmt.Sprintf("error: %v", applyErr))
+					} else if newID != "" {
+						if err := thread.Children.Rename(sid, newID); err != nil {
+							emitResult(call, fmt.Sprintf("error: %v", err))
+						} else {
+							emitResult(call, fmt.Sprintf("thread renamed %s → %s", sid, newID))
+						}
+					} else {
 						emitResult(call, fmt.Sprintf("thread %s updated", sid))
 					}
 				}
@@ -820,30 +853,19 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
 					}
 					tm.parent.config.SaveThread(PersistentThread{
-						ID: thread.ID, ParentID: thread.ParentID, Depth: thread.Depth,
+						ID: thread.ID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
 						Directive: d, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
 					})
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
 					emitResult(call, "directive updated")
 				}
 			case "remember":
-				text := call.Args["text"]
-				if text == "" {
-					emitResult(call, "error: remember requires text")
-				} else if t.memory == nil {
-					emitResult(call, "error: memory is not configured")
-				} else {
-					// Run synchronously so the LLM learns whether the
-					// memory actually landed. The previous async pattern
-					// emitted "stored" before the embedding call, so a
-					// failed embed looked like success. Embed latency is
-					// typically <500ms; acceptable blocking.
-					if err := t.memory.StoreWithNamespace(text, thread.ID); err != nil {
-						emitResult(call, fmt.Sprintf("error: %v", err))
-					} else {
-						emitResult(call, "stored")
-					}
-				}
+				// Memory v2: sub-threads can't write either. The unconscious
+				// is the only writer and it observes sub-thread activity
+				// the same way it observes main. Surface a clear error so
+				// the LLM stops calling this if a legacy directive still
+				// instructs it to.
+				emitResult(call, "error: remember is not available — memory writes are owned by the unconscious thread")
 			default:
 				executeTool(t, call)
 				toolNames = append(toolNames, call.Raw)
@@ -931,6 +953,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 		}
 		infos = append(infos, ThreadInfo{
 			ID:        t.ID,
+			Name:      t.Name,
 			ParentID:  t.ParentID,
 			Depth:     t.Depth,
 			Directive: t.Directive,
@@ -974,7 +997,7 @@ func (tm *ThreadManager) StartAll() {
 }
 
 // Update changes a thread's directive and/or tools. Rebuilds the system prompt immediately.
-func (tm *ThreadManager) Update(id, directive string, tools []string) error {
+func (tm *ThreadManager) Update(id, name, directive string, tools []string) error {
 	tm.mu.RLock()
 	thread, exists := tm.threads[id]
 	tm.mu.RUnlock()
@@ -982,6 +1005,11 @@ func (tm *ThreadManager) Update(id, directive string, tools []string) error {
 		return fmt.Errorf("thread %q not found", id)
 	}
 
+	nameChanged := false
+	if name != "" && name != thread.Name {
+		thread.Name = name
+		nameChanged = true
+	}
 	if directive != "" {
 		thread.Directive = directive
 	}
@@ -990,8 +1018,9 @@ func (tm *ThreadManager) Update(id, directive string, tools []string) error {
 		for _, t := range tools {
 			toolSet[strings.TrimSpace(t)] = true
 		}
-		// Always include builtins
-		for _, b := range []string{"send", "done", "pace", "evolve", "remember"} {
+		// Always include builtins. (remember is intentionally absent — the
+		// tool is unregistered for now while memory is being redesigned.)
+		for _, b := range []string{"send", "done", "pace", "evolve"} {
 			toolSet[b] = true
 		}
 		thread.Tools = toolSet
@@ -1005,10 +1034,91 @@ func (tm *ThreadManager) Update(id, directive string, tools []string) error {
 
 	// Persist
 	tm.parent.config.SaveThread(PersistentThread{
-		ID: id, ParentID: thread.ParentID, Depth: thread.Depth,
+		ID: id, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
 		Directive: thread.Directive, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
 	})
 
+	// Telemetry: name-only changes fire thread.renamed (id stays the
+	// same on both sides) so the dashboard can update its label without
+	// thinking the thread got recreated.
+	if nameChanged && tm.parent.telemetry != nil {
+		tm.parent.telemetry.Emit("thread.renamed", id, ThreadRenamedData{
+			OldID: id, NewID: id, Name: thread.Name, ParentID: thread.ParentID,
+		})
+	}
+
+	return nil
+}
+
+// Rename changes a thread's immutable id. Touches every reference:
+//   - the threads map key
+//   - children's ParentID
+//   - the persistent record (delete old, save new)
+//   - the on-disk session file
+//   - emits thread.renamed telemetry so the dashboard can swap its
+//     record over to the new identity
+//
+// Returns an error if the new id is empty, equals the old, collides
+// with an existing sibling, or any of the persistence steps fail.
+func (tm *ThreadManager) Rename(oldID, newID string) error {
+	if newID == "" {
+		return fmt.Errorf("new id required")
+	}
+	if newID == oldID {
+		return nil
+	}
+	tm.mu.Lock()
+	thread, exists := tm.threads[oldID]
+	if !exists {
+		tm.mu.Unlock()
+		return fmt.Errorf("thread %q not found", oldID)
+	}
+	if _, taken := tm.threads[newID]; taken {
+		tm.mu.Unlock()
+		return fmt.Errorf("thread id %q already in use", newID)
+	}
+	delete(tm.threads, oldID)
+	thread.ID = newID
+	tm.threads[newID] = thread
+	tm.mu.Unlock()
+
+	// Rename the thinker's session file so future history loads find
+	// it under the new id. Best-effort: a brand-new thread with no
+	// entries yet has no file on disk, which is treated as success.
+	if thread.Thinker != nil && thread.Thinker.session != nil {
+		if err := thread.Thinker.session.Rename(newID); err != nil {
+			// Roll back the in-memory rename so we don't end up with a
+			// thread whose id and session disagree.
+			tm.mu.Lock()
+			thread.ID = oldID
+			delete(tm.threads, newID)
+			tm.threads[oldID] = thread
+			tm.mu.Unlock()
+			return fmt.Errorf("rename session: %w", err)
+		}
+	}
+
+	// Cascade ParentID on direct children of the renamed thread.
+	if thread.Children != nil {
+		thread.Children.mu.Lock()
+		for _, child := range thread.Children.threads {
+			child.ParentID = newID
+		}
+		thread.Children.mu.Unlock()
+	}
+
+	// Persist: drop the old record + save under the new id.
+	tm.parent.config.RemoveThread(oldID)
+	tm.parent.config.SaveThread(PersistentThread{
+		ID: newID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
+		Directive: thread.Directive, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
+	})
+
+	if tm.parent.telemetry != nil {
+		tm.parent.telemetry.Emit("thread.renamed", newID, ThreadRenamedData{
+			OldID: oldID, NewID: newID, Name: thread.Name, ParentID: thread.ParentID,
+		})
+	}
 	return nil
 }
 

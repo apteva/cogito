@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"fmt"
@@ -38,10 +38,8 @@ func TestComputerUse_LocalCookieBanner(t *testing.T) {
 	if os.Getenv("RUN_COMPUTER_TESTS") == "" {
 		t.Skip("set RUN_COMPUTER_TESTS=1")
 	}
-	apiKey := os.Getenv("FIREWORKS_API_KEY")
-	if apiKey == "" {
-		t.Skip("FIREWORKS_API_KEY not set")
-	}
+	tp := getTestProvider(t)
+	apiKey := tp.APIKey
 
 	// Local fixture site — deterministic banner + landing pages.
 	// The overlay uses fixed positioning with a high z-index so it

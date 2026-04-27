@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"fmt"
@@ -19,19 +19,22 @@ func joinOrNone(s []string) string {
 	return strings.Join(s, ",")
 }
 
-// Version fields are injected at build time via -ldflags "-X main.Xxx=...".
-// Core shares the umbrella Version with the rest of the monorepo; the
-// other fields exist so core + server can be built with the same
-// -ldflags string without the linker erroring on unknown symbols.
-// Core itself only reads Version and BuildTime; the rest are ignored.
+// Version + BuildTime are populated by cmd/apteva-core at startup with the
+// values that ldflags injected into its `package main`. Default to "dev"
+// so direct `go test` runs (which never call core.SetVersion) still work.
 var (
-	Version             = "dev"
-	BuildTime           = "dev"
-	CLIVersion          = "dev"
-	DashboardVersion    = "dev"
-	IntegrationsVersion = "dev"
-	CoreVersion         = "dev"
+	Version   = "dev"
+	BuildTime = "dev"
 )
+
+// SetVersion is called by cmd/apteva-core/main.go to forward the
+// -ldflags-injected build info from the binary's `package main` into core.
+// Keeping the actual ldflag targets in `package main` of cmd/apteva-core
+// preserves the existing Dockerfile flags ("-X main.Version=...") unchanged.
+func SetVersion(version, buildTime string) {
+	Version = version
+	BuildTime = buildTime
+}
 
 // ContentPart represents a multimodal content block (OpenAI Chat Completions format).
 type ContentPart struct {
@@ -63,6 +66,13 @@ type Message struct {
 	Parts       []ContentPart    `json:"parts,omitempty"`        // multimodal content
 	ToolCalls   []NativeToolCall `json:"tool_calls,omitempty"`   // assistant messages: structured tool calls
 	ToolResults []ToolResult     `json:"tool_results,omitempty"` // user messages: results for prior tool calls
+	// Reasoning is the model's chain-of-thought from the turn that
+	// produced this message. We replay it back to the provider on
+	// subsequent turns because Moonshot (Kimi K2.6 via OpenCode Go)
+	// requires `reasoning_content` to be present on assistant
+	// tool_call messages when thinking mode is enabled — without it
+	// every multi-turn tool flow 400s. Other providers ignore it.
+	Reasoning string `json:"reasoning,omitempty"`
 }
 
 // TextContent returns the text content of a message, whether plain Content or from Parts.
@@ -113,7 +123,9 @@ type StreamEvent struct {
 	Usage   *Usage         `json:"usage,omitempty"`
 }
 
-func main() {
+// Run is the apteva-core entrypoint. cmd/apteva-core/main.go calls this
+// after wiring -ldflags Version/BuildTime via SetVersion.
+func Run() {
 	godotenv.Load()
 	initLogger()
 

@@ -1,12 +1,10 @@
-package main
+package core
 
 import (
 	"encoding/json"
 	"os"
 	"strings"
 	"testing"
-
-	"github.com/joho/godotenv"
 )
 
 // Integration tests with real API calls.
@@ -15,18 +13,8 @@ import (
 //   All tests:            go test -v -count=1
 //   Integration only:     go test -v -run TestIntegration
 
-func getAPIKey(t *testing.T) string {
-	t.Helper()
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-	godotenv.Load() // load .env only when integration tests actually need it
-	key := os.Getenv("FIREWORKS_API_KEY")
-	if key == "" {
-		t.Skip("FIREWORKS_API_KEY not set, skipping integration test")
-	}
-	return key
-}
+// getAPIKey is defined in scenario_harness.go (production code) so it
+// can be reused by sibling test packages — keep callers here using it.
 
 // drainEvents subscribes to the bus and counts chunks in the background.
 // Returns a stop function that unsubscribes and returns chunk count.
@@ -55,9 +43,9 @@ func drainEvents(thinker *Thinker) func() int {
 
 func TestIntegration_Think(t *testing.T) {
 	t.Parallel()
-	apiKey := getAPIKey(t)
+	tp := getTestProvider(t)
 
-	thinker := NewThinker(apiKey, NewFireworksProvider(apiKey))
+	thinker := NewThinker(tp.APIKey, tp.Provider)
 	thinker.messages = append(thinker.messages, Message{
 		Role:    "user",
 		Content: "Reply with exactly one word: hello",
@@ -83,9 +71,9 @@ func TestIntegration_Think(t *testing.T) {
 
 func TestIntegration_ThinkWithToolCall(t *testing.T) {
 	t.Parallel()
-	apiKey := getAPIKey(t)
+	tp := getTestProvider(t)
 
-	thinker := NewThinker(apiKey, NewFireworksProvider(apiKey))
+	thinker := NewThinker(tp.APIKey, tp.Provider)
 	thinker.messages = append(thinker.messages, Message{
 		Role:    "user",
 		Content: `Reply with exactly this text and nothing else: [[reply message="test"]]`,
@@ -184,10 +172,19 @@ func TestIntegration_MemoryStoreAndRetrieve(t *testing.T) {
 	defer os.Remove(tmp.Name())
 	tmp.Close()
 
+	// Memory v2: use Remember/Recall surface. Embeddings come from
+	// Fireworks; recall is multi-factor (cosine × weight × decay).
 	ms := &MemoryStore{
-		apiKey:  apiKey,
-		session: "integration-test",
-		path:    tmp.Name(),
+		backend: &embeddingBackend{
+			URL:    "https://api.fireworks.ai/inference/v1/embeddings",
+			Model:  "nomic-ai/nomic-embed-text-v1.5",
+			APIKey: apiKey,
+			Header: "Bearer",
+			Dim:    768,
+			Source: "fireworks (test)",
+		},
+		path: tmp.Name(),
+		byID: map[string]int{},
 	}
 
 	memories := []string{
@@ -196,8 +193,8 @@ func TestIntegration_MemoryStoreAndRetrieve(t *testing.T) {
 		"User wants to bake a chocolate cake for a birthday",
 	}
 	for _, m := range memories {
-		if err := ms.Store(m); err != nil {
-			t.Fatalf("Store() error: %v", err)
+		if _, err := ms.Remember(m, []string{"fact"}, 0.8); err != nil {
+			t.Fatalf("Remember error: %v", err)
 		}
 	}
 
@@ -205,23 +202,34 @@ func TestIntegration_MemoryStoreAndRetrieve(t *testing.T) {
 		t.Fatalf("expected 3 memories, got %d", ms.Count())
 	}
 
-	results := ms.Retrieve("How do goroutines work in Go?", 2)
+	results := ms.Recall("How do goroutines work in Go?", 2)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
-	t.Logf("Top result for Go query: %q", results[0].Text)
-	if !strings.Contains(results[0].Text, "Go") {
-		t.Errorf("expected Go-related memory as top result, got %q", results[0].Text)
+	t.Logf("Top result for Go query: %q", results[0].Content)
+	if !strings.Contains(results[0].Content, "Go") {
+		t.Errorf("expected Go-related memory as top result, got %q", results[0].Content)
 	}
 
-	results2 := ms.Retrieve("baking recipes and ingredients", 2)
-	t.Logf("Top result for baking query: %q", results2[0].Text)
-	if !strings.Contains(results2[0].Text, "cake") {
-		t.Errorf("expected cake memory as top result, got %q", results2[0].Text)
+	results2 := ms.Recall("baking recipes and ingredients", 2)
+	t.Logf("Top result for baking query: %q", results2[0].Content)
+	if !strings.Contains(results2[0].Content, "cake") {
+		t.Errorf("expected cake memory as top result, got %q", results2[0].Content)
 	}
 
-	// Persistence round-trip
-	ms2 := &MemoryStore{apiKey: apiKey, path: tmp.Name()}
+	// Persistence round-trip.
+	ms2 := &MemoryStore{
+		backend: &embeddingBackend{
+			URL:    "https://api.fireworks.ai/inference/v1/embeddings",
+			Model:  "nomic-ai/nomic-embed-text-v1.5",
+			APIKey: apiKey,
+			Header: "Bearer",
+			Dim:    768,
+			Source: "fireworks (test)",
+		},
+		path: tmp.Name(),
+		byID: map[string]int{},
+	}
 	ms2.load()
 	if ms2.Count() != 3 {
 		t.Errorf("expected 3 after reload, got %d", ms2.Count())
@@ -234,9 +242,8 @@ func TestIntegration_MemoryStoreAndRetrieve(t *testing.T) {
 // account_ids=[33] was sent as "33" or "[33]" with broken nested objects.
 func TestIntegration_NativeToolCallArrayArgs(t *testing.T) {
 	t.Parallel()
-	apiKey := getAPIKey(t)
-
-	provider := NewFireworksProvider(apiKey)
+	tp := getTestProvider(t)
+	provider := tp.Provider
 
 	// Define a tool that requires array and object params
 	tools := []NativeTool{
@@ -328,9 +335,8 @@ func TestIntegration_NativeToolCallArrayArgs(t *testing.T) {
 // sent to the LLM, not a flattened string schema.
 func TestIntegration_NativeToolCallNestedArrayArgs(t *testing.T) {
 	t.Parallel()
-	apiKey := getAPIKey(t)
-
-	provider := NewFireworksProvider(apiKey)
+	tp := getTestProvider(t)
+	provider := tp.Provider
 
 	// Mimics the socialcast create_post schema with nested objects in arrays
 	tools := []NativeTool{

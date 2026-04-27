@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"fmt"
@@ -115,39 +115,45 @@ func (tr *ToolRegistry) registerDefaults() {
 	})
 	tr.Register(&ToolDef{
 		Name:        "evolve",
-		Description: "Rewrite your own directive to self-improve based on experience. Adjust approach, add learned rules, refine role.",
-		Syntax:      `[[evolve directive="Updated directive"]]`,
-		Rules:       `Persisted to config. Use sparingly — only when you've learned something worth remembering in your directive.`,
+		Description: "Rewrite ONLY the mission portion of your directive — the prose between the [DIRECTIVE] markers in your system prompt. Do NOT include framework rules (THINKING/EVENTS/SPAWNING/PACING/TOOL CALLS sections, the opening 'You are the main coordinating thread…' sentence, [ACTIVE THREADS], [AVAILABLE MCP SERVERS]) — those are injected by the platform and are not part of your directive.",
+		Syntax:      `[[evolve directive="Updated mission text"]]`,
+		Rules:       `Persisted to config. Use sparingly — only when you've learned something worth remembering in your mission. The text you submit fully replaces the current directive; keep it focused on goals, constraints, and learned rules. Submitting platform boilerplate is rejected with an error.`,
 		Core:        true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"directive": map[string]any{"type": "string", "description": "New directive text that replaces the current one."},
+				"directive": map[string]any{"type": "string", "description": "New mission text. JUST the mission — not the framework rules, not section headers like THINKING/EVENTS/SPAWNING."},
 			},
 			"required": []string{"directive"},
 		},
 	})
 
-	tr.Register(&ToolDef{
-		Name:        "remember",
-		Description: "Store a fact for future turns. Prefix with a tag: [preference] [correction] [decision] [fact] [user]. Write memories that match FUTURE queries (include the tool, the target, the outcome). Remember liberally; skip transient in-flight state.",
-		Syntax:      `[[remember text="[preference] exec: user OK with shell commands on their own server"]]`,
-		Core:        true,
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"text": map[string]any{"type": "string", "description": "Memory text, typically prefixed with a bracketed tag like [preference], [correction], [decision], [fact], [user]."},
+	// remember tool intentionally NOT registered for now. Memory writes
+	// are off until we redesign that subsystem — the dispatch case in
+	// thinker.go / thread.go and the MemoryStore code stay in place so
+	// re-enabling is a one-line change (uncomment the Register block).
+	/*
+		tr.Register(&ToolDef{
+			Name:        "remember",
+			Description: "Store a fact for future turns. Prefix with a tag: [preference] [correction] [decision] [fact] [user]. Write memories that match FUTURE queries (include the tool, the target, the outcome). Remember liberally; skip transient in-flight state.",
+			Syntax:      `[[remember text="[preference] exec: user OK with shell commands on their own server"]]`,
+			Core:        true,
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"text": map[string]any{"type": "string", "description": "Memory text, typically prefixed with a bracketed tag like [preference], [correction], [decision], [fact], [user]."},
+				},
+				"required": []string{"text"},
 			},
-			"required": []string{"text"},
-		},
-	})
+		})
+	*/
 
 	// Main-only tools
 	tr.Register(&ToolDef{
 		Name:        "spawn",
-		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Use media to pass audio/image/video URLs for the new thread's LLM to analyze natively.",
-		Syntax:      `spawn(id="name", directive="What this thread does", tools="web,exec", mcp="store,stripe", media="https://example.com/audio.mp3")`,
-		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated local tools (web, exec, read_file, etc). mcp: comma-separated MCP server names — thread gets its own connection and only sees those tools. provider: LLM provider name (optional). media: space-separated URLs (audio/image/video) — these are sent directly to the thread's LLM as native content for analysis. Use this when a user shares a media URL and you want a worker to analyze it.`,
+		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. By default the worker starts thinking immediately on its directive; pass paused=\"true\" to spawn it dormant — it'll wake on the first `send` you give it. Use media to pass audio/image/video URLs for the new thread's LLM to analyze natively.",
+		Syntax:      `spawn(id="name", directive="What this thread does", tools="web,exec", mcp="store,stripe", paused="true")`,
+		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated local tools (web, exec, read_file, etc). mcp: comma-separated MCP server names — thread gets its own connection and only sees those tools. provider: LLM provider name (optional). paused: "true" to spawn dormant — useful when you want to spawn several workers atomically before any think, or when you want to attach a message to the worker's first turn rather than letting it act on the directive alone. media: space-separated URLs (audio/image/video) — sent directly to the thread's LLM as native content for analysis.`,
 		Core:        true,
 		MainOnly:    true,
 		InputSchema: map[string]any{
@@ -158,6 +164,7 @@ func (tr *ToolRegistry) registerDefaults() {
 				"tools":     map[string]any{"type": "string", "description": "Comma-separated local tool names (web, exec, read_file, ...). Optional."},
 				"mcp":       map[string]any{"type": "string", "description": "Comma-separated MCP server names. Optional."},
 				"provider":  map[string]any{"type": "string", "description": "LLM provider name. Optional."},
+				"paused":    map[string]any{"type": "string", "description": "Set to \"true\" to spawn the worker in paused state; it will not think until you send it a message. Default: not paused (auto-starts on directive)."},
 				"media":     map[string]any{"type": "string", "description": "Space-separated media URLs passed to the new thread's LLM. Optional."},
 			},
 			"required": []string{"id", "directive"},
@@ -179,17 +186,19 @@ func (tr *ToolRegistry) registerDefaults() {
 	})
 	tr.Register(&ToolDef{
 		Name:        "update",
-		Description: "Update a running thread's directive and/or tools. The thread's system prompt is rebuilt immediately.",
-		Syntax:      `[[update id="name" directive="New directive" tools="tool1,tool2"]]`,
-		Rules:       `Provide directive, tools, or both. The thread is notified of directive changes. Tools replace the full set (builtins are always included).`,
+		Description: "Update a running thread's id, display name, directive, and/or tools. Renaming the id cascades through children's parent_id and the on-disk session file.",
+		Syntax:      `[[update id="thread-id" new_id="renamed" name="Friendly Label" directive="New directive" tools="tool1,tool2"]]`,
+		Rules:       `Provide at least one of new_id, name, directive, or tools. The thread is notified of directive changes. Tools replace the full set (builtins are always included). new_id renames the immutable id (children + session storage follow); name is just a display label.`,
 		Core:        true,
 		MainOnly:    true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"id":        map[string]any{"type": "string", "description": "Target thread id."},
-				"directive": map[string]any{"type": "string", "description": "Replacement directive. Provide this, tools, or both."},
-				"tools":     map[string]any{"type": "string", "description": "Comma-separated tool names replacing the current set. Provide this, directive, or both."},
+				"new_id":    map[string]any{"type": "string", "description": "Replacement id. Cascades through children's parent_id and the on-disk session file. Must be unique among siblings."},
+				"name":      map[string]any{"type": "string", "description": "Human-readable label for display. Independent of id."},
+				"directive": map[string]any{"type": "string", "description": "Replacement directive."},
+				"tools":     map[string]any{"type": "string", "description": "Comma-separated tool names replacing the current set."},
 			},
 			"required": []string{"id"},
 		},

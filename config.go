@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"encoding/json"
@@ -10,12 +10,13 @@ const configFile = "config.json"
 
 type PersistentThread struct {
 	ID        string   `json:"id"`
-	ParentID  string   `json:"parent_id,omitempty"` // empty = child of main
+	Name      string   `json:"name,omitempty"`       // human-readable label; empty = display as ID
+	ParentID  string   `json:"parent_id,omitempty"`  // empty = child of main
 	Depth     int      `json:"depth,omitempty"`      // 0 = main's direct child
 	System    bool     `json:"system,omitempty"`     // system thread (can't be killed by LLM)
 	Directive string   `json:"directive"`
 	Tools     []string `json:"tools"`
-	MCPNames  []string `json:"mcp_names,omitempty"` // MCP servers to connect on respawn
+	MCPNames  []string `json:"mcp_names,omitempty"`  // MCP servers to connect on respawn
 }
 
 // RunMode controls the agent's safety behavior via system prompt guidance.

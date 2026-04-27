@@ -1,6 +1,7 @@
-package main
+package core
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -15,6 +16,19 @@ import (
 //
 // Cloud backends skip the test when their credentials are missing so
 // CI without those secrets stays green.
+//
+// Two opt-in flags extend the default config uniformly across all
+// cloud backends (ignored on "local"):
+//
+//	TEST_BROWSER_PROXY=1       → managed residential proxy
+//	TEST_BROWSER_SOLVE_CAPTCHA=1 (default on) → managed CAPTCHA solver
+//	TEST_BROWSER_PROXY_COUNTRY → country hint (browser-engine only)
+//
+// Each cloud backend maps these onto its vendor-specific field:
+// Browserbase.Proxies=true, Steel.UseProxy=true,
+// BrowserEngine.ProxyEnabled=true. Without a unified flag any test
+// that needs proxy must know the three field names — flipping them
+// here keeps caller sites simple.
 func buildComputerFromEnv(t *testing.T) computer.Computer {
 	t.Helper()
 	backend := strings.ToLower(os.Getenv("TEST_BROWSER"))
@@ -23,6 +37,18 @@ func buildComputerFromEnv(t *testing.T) computer.Computer {
 	}
 
 	const w, h = 1600, 900
+	useProxy := os.Getenv("TEST_BROWSER_PROXY") == "1"
+	// CAPTCHA solver defaults on — disable with TEST_BROWSER_SOLVE_CAPTCHA=0.
+	solveCaptcha := os.Getenv("TEST_BROWSER_SOLVE_CAPTCHA") != "0"
+	proxyCountry := os.Getenv("TEST_BROWSER_PROXY_COUNTRY")
+	// Session lifetime in seconds, applied at creation across every
+	// cloud backend. Browserbase + Steel cannot extend post-create
+	// via API (verified against their SDKs), so multi-step flows
+	// must request a generous lease here. 0 = each provider's default.
+	sessionTimeout := 0
+	if v := os.Getenv("TEST_BROWSER_SESSION_TIMEOUT"); v != "" {
+		fmt.Sscanf(v, "%d", &sessionTimeout)
+	}
 
 	switch backend {
 	case "local":
@@ -37,14 +63,19 @@ func buildComputerFromEnv(t *testing.T) computer.Computer {
 		if k == "" || p == "" {
 			t.Skip("TEST_BROWSER=browserbase requires BROWSERBASE_API_KEY + BROWSERBASE_PROJECT_ID")
 		}
-		c, err := aptcomputer.New(aptcomputer.Config{
+		cfg := aptcomputer.Config{
 			Type:          "browserbase",
 			APIKey:        k,
 			ProjectID:     p,
 			Width:         w,
 			Height:        h,
-			SolveCaptchas: true,
-		})
+			SolveCaptchas: solveCaptcha,
+			Timeout:       sessionTimeout,
+		}
+		if useProxy {
+			cfg.Proxies = true // Browserbase managed residential proxy
+		}
+		c, err := aptcomputer.New(cfg)
 		if err != nil {
 			t.Fatalf("create browserbase: %v", err)
 		}
@@ -62,7 +93,9 @@ func buildComputerFromEnv(t *testing.T) computer.Computer {
 			APIKey:       k,
 			Width:        w,
 			Height:       h,
-			SolveCaptcha: true,
+			SolveCaptcha: solveCaptcha,
+			UseProxy:     useProxy,
+			Timeout:      sessionTimeout, // factory converts seconds → ms for Steel
 		})
 		if err != nil {
 			t.Fatalf("create steel: %v", err)
@@ -83,14 +116,22 @@ func buildComputerFromEnv(t *testing.T) computer.Computer {
 		if baseURL == "" {
 			baseURL = os.Getenv("NEXT_PUBLIC_BROWSER_API_URL")
 		}
+		// Legacy env var BROWSER_PROXY_ENABLED still supported for
+		// backwards compatibility with earlier test scripts.
+		proxyEnabled := useProxy || os.Getenv("BROWSER_PROXY_ENABLED") == "1"
+		country := proxyCountry
+		if country == "" {
+			country = os.Getenv("BROWSER_PROXY_COUNTRY")
+		}
 		c, err := aptcomputer.New(aptcomputer.Config{
 			Type:         "browser-engine",
 			APIKey:       k,
 			URL:          baseURL,
+			Timeout:      sessionTimeout,
 			Width:        w,
 			Height:       h,
-			ProxyEnabled: os.Getenv("BROWSER_PROXY_ENABLED") == "1",
-			ProxyCountry: os.Getenv("BROWSER_PROXY_COUNTRY"),
+			ProxyEnabled: proxyEnabled,
+			ProxyCountry: country,
 		})
 		if err != nil {
 			t.Fatalf("create browser-engine: %v", err)

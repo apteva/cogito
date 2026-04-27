@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"bufio"
@@ -29,7 +29,13 @@ func (p *OpenAICompatProvider) Name() string                            { return
 func (p *OpenAICompatProvider) Models() map[ModelTier]string            { return p.models }
 func (p *OpenAICompatProvider) CostPer1M() (float64, float64, float64) { return p.inputCost, p.cachedCost, p.outputCost }
 func (p *OpenAICompatProvider) SupportsNativeTools() bool {
-	return p.name == "openai" || p.name == "fireworks"
+	// All OpenAI-compatible Chat Completions endpoints accept the
+	// `tools` field. Ollama is the lone exception in practice — tool
+	// support is gated per-model and most local models don't honor it
+	// reliably, so we keep our prompt-level fallback there. Anything
+	// else (OpenAI, Fireworks, OpenCode Go, NVIDIA NIM, Together,
+	// Groq, …) gets native tool calls.
+	return p.name != "ollama"
 }
 
 func (p *OpenAICompatProvider) AvailableBuiltinTools() []BuiltinTool {
@@ -150,7 +156,24 @@ func toOpenAIMessages(messages []Message) []any {
 			continue
 		}
 
-		// Assistant message with tool calls
+		// Assistant message with tool calls.
+		//
+		// `content` is ALWAYS included, even as empty string. The
+		// OpenAI spec allows omitting it when tool_calls is present,
+		// and OpenAI/Fireworks accept that — but Moonshot Kimi K2.6
+		// (which OpenCode Go proxies for the kimi-k2.6 slug) rejects
+		// the message with HTTP 400 unless `content` is on the wire.
+		// Empty string is interop-safe across every backend we've
+		// tested (OpenAI, Fireworks, Moonshot, NVIDIA NIM, OpenRouter,
+		// Together, Groq); `null` is not (older NIM builds reject it).
+		//
+		// `reasoning_content` is included when the message carries
+		// reasoning captured from the prior turn. Moonshot with
+		// thinking enabled requires it on assistant tool_call
+		// messages — without it the next request 400s with
+		// "thinking is enabled but reasoning_content is missing in
+		// assistant tool call message". Other backends ignore the
+		// field (it's a known reasoning-model extension).
 		if len(m.ToolCalls) > 0 {
 			toolCalls := make([]map[string]any, len(m.ToolCalls))
 			for i, tc := range m.ToolCalls {
@@ -166,16 +189,30 @@ func toOpenAIMessages(messages []Message) []any {
 			}
 			msg := map[string]any{
 				"role":       "assistant",
+				"content":    m.Content, // always present; "" when only tool_calls
 				"tool_calls": toolCalls,
 			}
-			if m.Content != "" {
-				msg["content"] = m.Content
+			if m.Reasoning != "" {
+				msg["reasoning_content"] = m.Reasoning
 			}
 			out = append(out, msg)
 			continue
 		}
 
-		// Regular message
+		// Regular message.
+		//
+		// Skip assistant turns that have nothing to say AND no tool
+		// calls AND no parts. Those are dead-air entries (e.g. left
+		// behind when an upstream Chat() errored after the message was
+		// already appended) and Moonshot rejects them with HTTP 400
+		// "Invalid request: the message at position N with role
+		// 'assistant' must not be empty" — which then poisons every
+		// subsequent iteration. User and system messages are kept even
+		// when empty (rare but legitimate signals like "[admin]"
+		// directives).
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 && !m.HasParts() {
+			continue
+		}
 		if m.HasParts() {
 			out = append(out, openaiMessage{Role: m.Role, Content: convertAudioURLParts(m.Parts)})
 		} else {
@@ -277,6 +314,14 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 	defer resp.Body.Close()
 
 	var full strings.Builder
+	// Accumulate reasoning chunks too. We forward each one through
+	// onThinking for live UI rendering, but also capture the full
+	// transcript so the caller can write it back onto the assistant
+	// Message it appends — Moonshot via OpenCode Go requires the
+	// `reasoning_content` field on the next-turn assistant tool_call
+	// message, otherwise it 400s with "thinking is enabled but
+	// reasoning_content is missing".
+	var fullReasoning strings.Builder
 	var usage TokenUsage
 	// Track streamed tool calls by index
 	pendingTools := make(map[int]*struct {
@@ -308,6 +353,7 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 				Delta struct {
 					Content          string                `json:"content"`
 					ReasoningContent string                `json:"reasoning_content,omitempty"`
+					Reasoning        string                `json:"reasoning,omitempty"`
 					ToolCalls        []openaiToolCallDelta `json:"tool_calls,omitempty"`
 				} `json:"delta"`
 			} `json:"choices"`
@@ -318,12 +364,22 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 		}
 		if len(event.Choices) > 0 {
 			delta := event.Choices[0].Delta
-			// Fireworks/DeepSeek-style reasoning models emit chain-of-thought
-			// in `reasoning_content` on the delta, separate from `content`.
-			// Streamed via onThinking (not onChunk) so the UI can distinguish
-			// reasoning from output. NOT appended to `full`.
-			if delta.ReasoningContent != "" && onThinking != nil {
-				onThinking(delta.ReasoningContent)
+			// Reasoning chain-of-thought arrives under different field
+			// names depending on the gateway:
+			//   reasoning_content — Fireworks, DeepSeek, OpenAI o-series
+			//   reasoning         — OpenRouter-style proxies (OpenCode Go)
+			// Both go through onThinking (not onChunk) so the UI can
+			// distinguish reasoning from output, and neither is appended
+			// to `full` (the visible answer).
+			reasoning := delta.ReasoningContent
+			if reasoning == "" {
+				reasoning = delta.Reasoning
+			}
+			if reasoning != "" {
+				fullReasoning.WriteString(reasoning)
+				if onThinking != nil {
+					onThinking(reasoning)
+				}
 			}
 			if delta.Content != "" {
 				full.WriteString(delta.Content)
@@ -428,6 +484,7 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 
 	return ChatResponse{
 		Text:      full.String(),
+		Reasoning: fullReasoning.String(),
 		ToolCalls: toolCalls,
 		Usage:     usage,
 	}, nil
@@ -449,6 +506,38 @@ func NewFireworksProvider(apiKey string) LLMProvider {
 		inputCost:  0.60,
 		cachedCost: 0.10,
 		outputCost: 3.00,
+	}
+}
+
+// NewOpenCodeGoProvider — flat-rate subscription gateway from
+// opencode.ai/go that fronts the same Kimi K2.6 we use via Fireworks
+// plus Qwen / GLM / MiMo variants under one OpenAI-compatible endpoint.
+//
+// Per-token costs are placeholders (0/0/0) because OpenCode Go bills
+// per subscription, not per call — the server's model_fetch.go pricing
+// table reports the same so the dashboard's per-call $ figure stays
+// blank rather than misleadingly nonzero.
+//
+// Defaults: kimi-k2.6 across all three tiers. With a flat-rate plan
+// the per-iteration cost incentive that justified Qwen on small/medium
+// for token-priced providers doesn't apply, so we let the agent run
+// the strongest model end-to-end. Users who want to stretch the
+// monthly cap with cheaper tiers can override per-instance in the
+// dashboard provider settings.
+func NewOpenCodeGoProvider(apiKey string) LLMProvider {
+	return &OpenAICompatProvider{
+		name:       "opencode-go",
+		apiKey:     apiKey,
+		url:        "https://opencode.ai/zen/go/v1/chat/completions",
+		authHeader: "Bearer",
+		models: map[ModelTier]string{
+			ModelLarge:  "kimi-k2.6",
+			ModelMedium: "kimi-k2.6",
+			ModelSmall:  "kimi-k2.6",
+		},
+		inputCost:  0,
+		cachedCost: 0,
+		outputCost: 0,
 	}
 }
 

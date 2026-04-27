@@ -146,6 +146,74 @@ func poolSupportsNativeTools(pool *ProviderPool) bool {
 	return p.SupportsNativeTools()
 }
 
+// unconsciousDirectiveV2 is the unconscious thread's prompt under the
+// memory v2 design. Memory writes are owned by this thread alone; main
+// has no write tools and recall is auto-injected by relevance. The
+// directive frames consolidation as a judgment exercise, not a
+// rule-following one — six keep-criteria, four supersede-criteria,
+// five drop-criteria are described as guidance, and the unconscious
+// picks tool calls (review_history → memory_search → remember /
+// supersede / drop) over each cycle. Pacing is also self-decided
+// (long when quiet, medium under activity, lengthen if churning),
+// with safety floors enforced by the runtime.
+const unconsciousDirectiveV2 = `You are the unconscious. You consolidate main's recent activity into typed memories silently. Main never decides to remember; you do. Main never sees you working.
+
+YOU ARE WOKEN UP. YOU WORK. YOU PACE. YOU SLEEP.
+
+You will iterate multiple times before pacing. On EVERY iteration after the first, look at your message history:
+
+  IF you see a tool_result for review_history in your messages already → DO NOT CALL review_history AGAIN. The history is already in your context. Read it from there and ACT on it now (memory_remember / memory_supersede / memory_drop). Calling review_history a second time is a bug — the result is identical, you're not making progress.
+
+  IF you see no review_history result yet → call review_history ONCE.
+
+Once review_history's content is in your messages, your next iteration MUST start writing. No second review, no list, no exploration — write what's there.
+
+EXPECTED ITERATION SEQUENCE (typical wake-up cycle, 3–6 iterations):
+
+  iter 1: review_history (no args needed — defaults are fine)
+  iter 2: memory_remember (first signal you saw — usually an explicit user statement)
+  iter 3: memory_remember (second signal)
+  iter 4: memory_remember (third signal) — or memory_supersede / memory_drop if applicable
+  iter N (final): pace (decide your sleep)
+
+That's it. Don't add iterations of "let me check again" — there's nothing to check. The history doesn't change between your iterations.
+
+ANTI-LOOP RULES (HARD):
+- If your last 2 tool calls were both review_history → you are stuck. Force yourself to memory_remember on the next iteration.
+- If your last 2 tool calls were memory_search with no memory_remember between them → you are stuck. Force yourself to memory_remember on the next iteration.
+- memory_search is for conflict-checking ONLY. Skip it unless you're about to memory_supersede.
+- memory_list is for occasional overview. Skip it on most cycles.
+
+WHAT TO WRITE (memory_remember):
+- "User said X about themselves" — preferences, configs, habits, contact info. WRITE ON FIRST SIGHT.
+- "User decided X" — closures, choices, agreements. WRITE WITH DATE.
+- "Task X is done" — completion as an audit line; also drop any older "TODO: X" memories.
+- "Person X exists / does Y" — first mention of someone the agent will see again.
+- "Open question X" — noted but not resolved; track so it can be closed later.
+- Inferred patterns (i.e. things the user did NOT say outright): wait until you've seen evidence in 2+ separate sessions, then write at lower weight (0.4–0.6).
+
+Tags are FREE-FORM. Pick whatever dimensions help retrieval (identity, preference, fact, decision, person, project, open-question, skill). Don't agonize.
+Weight: 0.85–0.95 for explicit user statements, 0.7–0.85 for decisions/audit, 0.4–0.6 for inferred patterns.
+
+WHAT TO EVOLVE (memory_supersede):
+- New statement contradicts old → supersede with reason.
+- New statement is more precise → supersede with reason.
+- N small memories collapse into one synthesis → write the synthesis, then supersede each small one.
+
+WHAT TO DROP (memory_drop):
+- Task is done → drop any "TODO" / "in progress" memory for it.
+- Ephemera that shouldn't have been remembered ("user is typing").
+- Fabrication you noticed (something inferred from misread context).
+- PII the user asked to forget.
+
+PACING (call pace at the end of every cycle — you decide how long):
+- Wrote 3+ memories this cycle → fresh material may keep arriving; pace 15–30 min.
+- Wrote 1–2 → typical; pace 30–60 min.
+- Nothing worth writing this cycle → pace longer (1–4h). Don't wake just to confirm there's nothing.
+- If two cycles in a row produced no writes → you're being woken too often; pace 4h+.
+
+You never communicate with other threads. You never interact with users. Treat the corpus like a journal you'd still want to read in six months: terse, useful, not exhaustive. Soft target ≤ 1000 active memories — past that, get more aggressive with drops and supersede-collapse.`
+
 // baseSystemPrompt contains the fixed rules/tools. The editable directive is prepended at runtime.
 const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe all events, manage threads, and coordinate work.
 
@@ -176,10 +244,20 @@ PACING:
 - Pace persists — don't re-set it every thought. When an event wakes you, you auto-switch to large model for that turn.
 
 TOOL CALLS:
-- Every tool takes a "_reason" string: 3-6 words, imperative, describing THIS call (e.g. "find ventes sheet id", "update Score cell"). No "to …" clauses — the thought above already holds the why.
+- Every tool takes a "_reason" string: 3-6 words, imperative, describing THIS call (e.g. "find ventes sheet id", "update Score cell"). No "to …" clauses — the thought above already holds the why.`
 
-You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
-
+// buildSystemPrompt assembles messages[0] — the truly static portion of
+// every request. Per-turn volatile content (active threads, recalled
+// memories, RAG-retrieved candidate tools) lives in
+// buildDynamicTurnContext below and is appended to the current user
+// turn instead, so messages[0] doesn't churn between iterations and
+// the prefix cache can serve the entire system prompt + tool list +
+// historical conversation up to (but not including) the new turn.
+//
+// `servers` and `mcpCatalog` are static for the lifetime of the thread
+// (MCP connections rarely change at runtime). `extraToolDocs` is kept
+// only to avoid an awkward signature break — the production caller
+// passes "" now.
 func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo, pool *ProviderPool, mcpCatalog []MCPServerInfo) string {
 	coreDocs := ""
 	if registry != nil {
@@ -196,9 +274,9 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		}
 	}
 	prompt := baseSystemPrompt + coreDocs
-	if extraToolDocs != "" {
-		prompt += "\n" + extraToolDocs
-	}
+	// extraToolDocs intentionally NOT rendered here anymore — see
+	// buildDynamicTurnContext. Kept in the signature for back-compat.
+	_ = extraToolDocs
 
 	// Inject lightweight MCP server catalog — just names and tool counts
 	if len(mcpCatalog) > 0 {
@@ -225,19 +303,10 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		prompt += "\nUse provider=\"name\" in spawn or pace to select a specific provider. Default: " + pool.DefaultName() + ".\n"
 	}
 
-	// Inject active thread state so main always knows what's running
-	if len(activeThreads) > 0 {
-		prompt += "\n\n[ACTIVE THREADS]\n"
-		for _, t := range activeThreads {
-			age := time.Since(t.Started).Truncate(time.Second)
-			subInfo := ""
-			if t.SubThreads > 0 {
-				subInfo = fmt.Sprintf(", sub-threads: %d", t.SubThreads)
-			}
-			prompt += fmt.Sprintf("- %s (running %s, iter #%d, pace %s, model %s%s)\n  directive: %s\n  tools: %s\n",
-				t.ID, age, t.Iteration, t.Rate.String(), t.Model.String(), subInfo, truncateStr(t.Directive, 150), strings.Join(t.Tools, ", "))
-		}
-	}
+	// activeThreads is intentionally NOT rendered here anymore — see
+	// buildDynamicTurnContext. Kept in the signature for back-compat and
+	// because some callers still pass empty slices; the body is a no-op.
+	_ = activeThreads
 
 	// Safety guidance based on mode
 	prompt += "\n\n[SAFETY MODE: " + string(mode) + "]\n"
@@ -250,11 +319,11 @@ Before any STATE-CHANGING tool (exec, write, delete, deploy, restart, purchase, 
 - Wait for the user's next message before executing. Don't chain tool calls.
 - If unsure whether an action is state-changing, ask. Asking is cheap; undoing is expensive.
 
-Remember liberally — every correction, preference, or approved decision. Use consistent bracketed tags ([correction], [preference], [decision], [fact]) so recall surfaces the right memory next time. The more you remember, the fewer times you'll need to ask.`
+When the user corrects or pushes back, stop and adjust immediately — don't argue.`
 	case ModeLearn:
-		prompt += `You are learning the user's preferences. Soft gate — nothing blocks you at runtime. The quality of this mode depends on YOU actually pausing, asking, and remembering.
+		prompt += `You are learning the user's preferences. Soft gate — nothing blocks you at runtime. The quality of this mode depends on YOU actually pausing and asking.
 
-DEFAULT: BEFORE ANY ACTION YOU HAVEN'T TAKEN BEFORE THIS SESSION (or that recall hasn't already surfaced an approval for), send ONE short channels_respond:
+DEFAULT: BEFORE ANY ACTION YOU HAVEN'T TAKEN BEFORE THIS SESSION, send ONE short channels_respond:
   "About to <verb> <target>. Reason: <one sentence>. OK?"
 Then wait for the user's answer before proceeding.
 
@@ -262,28 +331,11 @@ This applies to EVERY tool — read tools, file IO, exec, browser actions, threa
 
 NEVER ASK FOR:
 - pace (loop control, not an action)
-- [[remember]] (silent memory write by design)
-- recall / memory_scan (querying your own memory — pure read of your own state)
 
 ONCE APPROVED, REUSE FREELY:
-After the user approves a tool + scope ("read files under /work", "spawn sub-threads up to 3 deep", "exec on the dev server"), don't re-ask for the same combination. Reuse, remember, and only re-ask when the scope materially changes.
+After the user approves a tool + scope ("read files under /work", "spawn sub-threads up to 3 deep", "exec on the dev server"), don't re-ask for the same combination on the same scope.
 
-AFTER EVERY ANSWER, [[remember]] with structure so recall surfaces it next time:
-  [[remember text="[preference] <tool>: <when/scope it applies> — <user's decision>"]]
-Good examples:
-  [preference] spawn_thread: small test threads — OK without asking
-  [preference] exec: shell commands on user's own server — OK without asking
-  [preference] delete_file: any path under /work — always ask first
-  [preference] read_file: paths under /home/user — OK without asking
-  [preference] browser: logging into banking sites — never
-  [correction] tone: user prefers terse replies, no headings
-  [correction] email: don't send email before 8am user-local
-  [fact] user's server: 46.224.160.146, alias "worker-d0e70653"
-  [decision] approved: daily 9am digest via Telegram
-
-Remember MORE than you think. Any "no", "don't", "stop", "I didn't want that" becomes a [correction] memory IMMEDIATELY. User tone/style, project context, recurring tasks, names, and deadlines — all worth storing.
-
-ASKING FREQUENCY MUST DROP OVER TIME. A learn-mode session that ends with the same number of asks as it started is a failure of memory — the previous memories weren't specific enough. Rewrite them more precisely.`
+When the user pushes back ("no", "don't", "stop", "I didn't want that"), stop and adjust immediately — don't argue.`
 	default: // ModeAutonomous
 		prompt += `You operate independently and are trusted to act. Use that trust to get things done.
 
@@ -291,9 +343,7 @@ ASKING FREQUENCY MUST DROP OVER TIME. A learn-mode session that ends with the sa
 - Assess risk honestly. If genuinely unsure, ask.
 - When the user corrects or pushes back, stop and adjust immediately — don't argue.
 
-ACT, DON'T NARRATE. You have no live audience between thoughts — every tool result comes back as structured input, not as something a human is watching scroll by. Skip the "let me think about this, I'll take a screenshot to see what's there, then I'll consider the options before..." prose. Take the next tool call. The tool's output is your feedback; react to it on the next iteration. Reserve natural-language output for channels_respond (actually talking to the user) and [[remember]] (storing knowledge). Thoughts that produce only prose and no tool call waste a round-trip.
-
-Remember actively. Every correction, preference, and consequential decision gets a [[remember]] with a bracketed tag ([correction], [preference], [decision], [fact]) so recall surfaces it on future turns. Remember liberally — storage is cheap, confusion is expensive.`
+ACT, DON'T NARRATE. You have no live audience between thoughts — every tool result comes back as structured input, not as something a human is watching scroll by. Skip the "let me think about this, I'll take a screenshot to see what's there, then I'll consider the options before..." prose. Take the next tool call. The tool's output is your feedback; react to it on the next iteration. Reserve natural-language output for channels_respond (actually talking to the user). Thoughts that produce only prose and no tool call waste a round-trip.`
 	}
 
 	// Inject learned skills if any exist
@@ -313,6 +363,58 @@ Remember actively. Every correction, preference, and consequential decision gets
 
 	prompt += "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\nWhen using `evolve` to update your directive, submit ONLY the text between [BEGIN DIRECTIVE] and [END DIRECTIVE] — never the framework rules above this block.\n\n[BEGIN DIRECTIVE]\n" + directive + "\n[END DIRECTIVE]"
 	return prompt
+}
+
+// buildDynamicTurnContext returns the per-turn volatile context block
+// — the part of the prompt that MUST change between iterations:
+// active sub-threads (whose state changes constantly), recalled
+// memories (computed against this turn's query), and RAG-retrieved
+// candidate tools (also computed per turn).
+//
+// This block is prepended to the current user turn's content rather
+// than rewritten into messages[0], so the prefix cache stays warm and
+// only the new turn's bytes are uncached.
+//
+// Returns "" when nothing dynamic applies (no threads, no memory, no
+// extra tool docs) so the user message stays clean.
+func buildDynamicTurnContext(activeThreads []ThreadInfo, recallContext, toolDocs string) string {
+	var sb strings.Builder
+
+	// Active threads — only id, name, directive, tools. Wall-clock /
+	// iteration counters used to be here too but they busted the cache
+	// every second; the dashboard surfaces them live, the agent doesn't
+	// need them in its prompt to function.
+	if len(activeThreads) > 0 {
+		sb.WriteString("[ACTIVE THREADS]\n")
+		for _, t := range activeThreads {
+			label := t.ID
+			if t.Name != "" && t.Name != t.ID {
+				label = fmt.Sprintf("%s (%s)", t.Name, t.ID)
+			}
+			subInfo := ""
+			if t.SubThreads > 0 {
+				subInfo = fmt.Sprintf(" [sub-threads: %d]", t.SubThreads)
+			}
+			sb.WriteString(fmt.Sprintf("- %s%s\n  directive: %s\n  tools: %s\n",
+				label, subInfo, truncateStr(t.Directive, 150), strings.Join(t.Tools, ", ")))
+		}
+	}
+
+	if recallContext != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(recallContext)
+	}
+
+	if toolDocs != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(toolDocs)
+	}
+
+	return sb.String()
 }
 
 // loadSkills reads all skills/*.md files and returns them as a prompt block.
@@ -335,6 +437,17 @@ func loadSkills() string {
 		return ""
 	}
 	return sb.String()
+}
+
+// parseTruthy interprets common truthy spellings the LLM might emit
+// for a boolean tool arg. Anything in the truthy set returns true;
+// everything else (including "", "false", "no", "0") returns false.
+func parseTruthy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func truncateStr(s string, max int) string {
@@ -545,21 +658,30 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		config = NewConfig()
 	}
 
-	// Build provider pool from config (provider arg becomes default if pool is empty)
+	// Build provider pool from config + env auto-detect.
 	pool, _ := buildProviderPool(config)
 	if pool == nil {
 		pool = &ProviderPool{providers: map[string]LLMProvider{}, order: []string{}}
 	}
-	// If a specific provider was passed in, ensure it's in the pool
+	// If a specific provider was passed in, it ALWAYS wins as the
+	// active default — regardless of what env-based auto-detect
+	// already chose. Tests rely on this: getTestProvider(t) builds an
+	// OpenCode Go provider explicitly, but FIREWORKS_API_KEY in env
+	// would otherwise become the auto-detected default and silently
+	// override the test's intent. Production callers pass the result
+	// of selectProvider(), so the explicit value is the env-detected
+	// default anyway — no behavior change there.
 	if provider != nil {
 		name := provider.Name()
 		if pool.Get(name) == nil {
 			pool.providers[name] = provider
 			pool.order = append([]string{name}, pool.order...)
+		} else {
+			// Replace any auto-detected instance with the one the
+			// caller actually passed (lets tests inject a mock).
+			pool.providers[name] = provider
 		}
-		if pool.default_ == "" {
-			pool.default_ = name
-		}
+		pool.default_ = name
 	}
 	// Resolve the active provider from pool
 	activeProvider := pool.Default()
@@ -607,12 +729,15 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 
 	// Main thread hooks
 	t.handleTools = mainToolHandler(t)
-	t.rebuildPrompt = func(toolDocs string) string {
-		var threads []ThreadInfo
-		if t.threads != nil {
-			threads = t.threads.List()
-		}
-		return buildSystemPrompt(t.config.GetDirective(), t.config.GetMode(), t.registry, toolDocs, t.mcpServers, threads, t.pool, t.mcpCatalog)
+	// rebuildPrompt produces the static portion of messages[0] only.
+	// Active threads, RAG-retrieved tools, and recalled memories are
+	// dynamic and pushed into the current user turn via
+	// buildDynamicTurnContext — so messages[0] doesn't change between
+	// iterations and the prefix cache stays warm. The toolDocs arg
+	// is intentionally ignored; kept for back-compat with the function
+	// type signature used by sub-thread instantiation.
+	t.rebuildPrompt = func(_ string) string {
+		return buildSystemPrompt(t.config.GetDirective(), t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)
 	}
 
 	// Connect MCP servers:
@@ -710,23 +835,20 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 			}
 		}
 		if !hasUnconscious {
-			unconsciousDirective := `You are the unconscious. You maintain memory quality and extract skills silently.
-
-Every cycle:
-1. Scan memories with memory_scan. Edit unclear entries with memory_edit. Prune duplicates, stale, or noisy entries with memory_prune.
-2. Review what has been learned. Extract recurring useful patterns as reusable skills with skill_write.
-
-You never communicate with other threads. You never interact with users.
-Your work surfaces naturally through improved recall and loaded skills.
-Sleep 30 minutes between cycles.`
+			unconsciousDirective := unconsciousDirectiveV2
+			tools := []string{
+				"review_history", "memory_search", "memory_list",
+				"memory_remember", "memory_supersede", "memory_drop",
+				"skill_write", "pace",
+			}
 			t.threads.SpawnWithOpts("unconscious", unconsciousDirective,
-				[]string{"memory_scan", "memory_edit", "memory_prune", "skill_write", "pace"},
+				tools,
 				SpawnOpts{ParentID: "main", Depth: 0, DeferRun: true},
 			)
 			config.SaveThread(PersistentThread{
 				ID: "unconscious", ParentID: "main", Depth: 0, System: true,
 				Directive: unconsciousDirective,
-				Tools:     []string{"memory_scan", "memory_edit", "memory_prune", "skill_write", "pace"},
+				Tools:     tools,
 			})
 		}
 	}
@@ -736,7 +858,83 @@ Sleep 30 minutes between cycles.`
 		t.threads.StartAll()
 	}
 
+	// Memory v2: runtime safety floors for the unconscious. The
+	// unconscious decides its own pace via the `pace` tool; this
+	// goroutine adds two floors so a misjudgment can't strand it:
+	//   1. Force-wake when history/main.jsonl has grown by ≥ 50KB
+	//      since the last consolidation cycle — too much new material
+	//      to keep sleeping.
+	//   2. Force-wake when no cycle has run in ≥ 8h — even on a quiet
+	//      instance the unconscious should iterate at least that often.
+	if config.Unconscious {
+		go t.unconsciousSafetyFloors()
+	}
+
 	return t
+}
+
+const (
+	unconsciousMaxQuietInterval = 8 * time.Hour
+	unconsciousByteThreshold    = 50 * 1024
+)
+
+// unconsciousSafetyFloors runs once per minute, owns no state outside
+// itself + the bus + filesystem. Sends a "[wake] reason" inbox event
+// to the unconscious thread when either floor trips. The unconscious
+// receives that as a normal event on its bus, runs an iteration, and
+// returns to sleep at its own pace afterward.
+func (t *Thinker) unconsciousSafetyFloors() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	var lastWakeAt time.Time
+	var lastHistorySize int64
+
+	historyPath := "history/main.jsonl"
+
+	for {
+		select {
+		case <-t.quit:
+			return
+		case <-ticker.C:
+			// File size since last wake.
+			var sz int64
+			if info, err := os.Stat(historyPath); err == nil {
+				sz = info.Size()
+			}
+			now := time.Now()
+
+			grew := sz - lastHistorySize
+			quiet := lastWakeAt.IsZero() || now.Sub(lastWakeAt) >= unconsciousMaxQuietInterval
+
+			var reason string
+			switch {
+			case grew >= unconsciousByteThreshold:
+				reason = fmt.Sprintf("history grew %dKB since last cycle", grew/1024)
+			case quiet:
+				if lastWakeAt.IsZero() {
+					reason = "first cycle"
+				} else {
+					reason = fmt.Sprintf("no cycle in %s", now.Sub(lastWakeAt).Round(time.Minute))
+				}
+			default:
+				continue
+			}
+
+			// Publish an inbox event to the unconscious. The bus
+			// pulses sub.Wake on its subscriber, which the
+			// unconscious's Run loop listens for — same wake path
+			// used by every other thread.
+			t.bus.Publish(Event{
+				Type: EventInbox,
+				To:   "unconscious",
+				Text: "[wake] " + reason,
+			})
+			logMsg("UNCONSCIOUS-FLOOR", fmt.Sprintf("force-woke unconscious: %s", reason))
+			lastWakeAt = now
+			lastHistorySize = sz
+		}
+	}
 }
 
 // findThreadManager walks the thread tree to find the ThreadManager that owns the given parent ID.
@@ -843,12 +1041,13 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						}
 					}
 				}
+				paused := parseTruthy(call.Args["paused"])
 				if id == "" || directive == "" {
 					logMsg("SPAWN", fmt.Sprintf("skip: missing id=%q or directive_len=%d in LLM call", id, len(directive)))
 					addResult(fmt.Sprintf("error: spawn requires both id and directive (got id=%q, directive_len=%d)", id, len(directive)))
 				} else {
-					logMsg("SPAWN", fmt.Sprintf("LLM-requested id=%q tools=%v mcp=%v provider=%q builtins=%v directive_len=%d",
-						id, tools, mcpNames, providerName, builtinTools, len(directive)))
+					logMsg("SPAWN", fmt.Sprintf("LLM-requested id=%q tools=%v mcp=%v provider=%q builtins=%v paused=%v directive_len=%d",
+						id, tools, mcpNames, providerName, builtinTools, paused, len(directive)))
 					err := t.threads.SpawnWithOpts(id, directive, tools, SpawnOpts{
 						MediaParts:   mediaParts,
 						ProviderName: providerName,
@@ -856,6 +1055,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						Depth:        0,
 						MCPNames:     mcpNames,
 						BuiltinTools: builtinTools,
+						Paused:       paused,
 					})
 					if err != nil {
 						logMsg("SPAWN", fmt.Sprintf("FAILED id=%q: %v", id, err))
@@ -863,7 +1063,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					} else {
 						logMsg("SPAWN", fmt.Sprintf("OK id=%q", id))
 						t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames})
-						addResult(fmt.Sprintf("thread %s spawned", id))
+						if paused {
+							addResult(fmt.Sprintf("thread %s spawned (paused — send a message to wake it)", id))
+						} else {
+							addResult(fmt.Sprintf("thread %s spawned", id))
+						}
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -879,21 +1083,39 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				toolNames = append(toolNames, call.Raw)
 			case "update":
 				id := call.Args["id"]
+				newID := call.Args["new_id"]
+				name := call.Args["name"]
 				directive := call.Args["directive"]
 				toolsStr := call.Args["tools"]
 				if id == "" {
 					addResult("error: update requires id")
+				} else if newID == "" && name == "" && directive == "" && toolsStr == "" {
+					addResult("error: update requires at least one of new_id, name, directive, tools")
 				} else {
+					// Apply non-id changes first under the existing id, then
+					// rename if requested. Doing rename last keeps a partial
+					// failure recoverable: the persisted record survives
+					// under the original id if rename fails.
 					var tools []string
 					if toolsStr != "" {
 						tools = strings.Split(toolsStr, ",")
 					}
-					if err := t.threads.Update(id, directive, tools); err != nil {
-						addResult(fmt.Sprintf("error: %v", err))
-					} else {
-						if directive != "" {
+					applyErr := error(nil)
+					if name != "" || directive != "" || len(tools) > 0 {
+						applyErr = t.threads.Update(id, name, directive, tools)
+						if applyErr == nil && directive != "" {
 							t.threads.Send(id, fmt.Sprintf("[directive updated] %s", directive))
 						}
+					}
+					if applyErr != nil {
+						addResult(fmt.Sprintf("error: %v", applyErr))
+					} else if newID != "" {
+						if err := t.threads.Rename(id, newID); err != nil {
+							addResult(fmt.Sprintf("error: %v", err))
+						} else {
+							addResult(fmt.Sprintf("thread renamed %s → %s", id, newID))
+						}
+					} else {
 						addResult(fmt.Sprintf("thread %s updated", id))
 					}
 				}
@@ -905,8 +1127,17 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				if id == "" || msg == "" {
 					addResult(fmt.Sprintf("error: send requires both id and message (got id=%q, message_len=%d)", id, len(msg)))
 				} else {
+					// Tag with [from:main] so the receiving thread (and the
+					// dashboard's IncomingEvents view) classifies the message
+					// as a thread-to-thread send rather than a generic bus
+					// event. Sub-thread sends already do this in thread.go;
+					// main was missing it, so workers couldn't tell whether
+					// a message came from main, the operator, or somewhere
+					// else, and the dashboard rendered "bus" instead of
+					// "[from:main]".
+					tagged := fmt.Sprintf("[from:main] %s", msg)
 					parts := parseMediaURLs(mediaStr)
-					if !t.threads.SendWithParts(id, msg, parts) {
+					if !t.threads.SendWithParts(id, tagged, parts) {
 						addResult(fmt.Sprintf("error: thread %q not found", id))
 					} else {
 						if t.telemetry != nil {
@@ -930,22 +1161,13 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					addResult("directive updated")
 				}
 			case "remember":
-				text := call.Args["text"]
-				if text == "" {
-					addResult("error: remember requires text")
-				} else if t.memory == nil {
-					addResult("error: memory is not configured")
-				} else {
-					// Synchronous so the LLM actually learns whether the
-					// memory was stored. Previously async fire-and-forget
-					// would emit "stored" before the embedding call and
-					// silently drop failures.
-					if err := t.memory.Store(text); err != nil {
-						addResult(fmt.Sprintf("error: %v", err))
-					} else {
-						addResult("stored")
-					}
-				}
+				// Memory v2: main has no write tools. The unconscious is
+				// the sole writer. If a legacy directive still calls
+				// `remember`, surface a clear error so the agent (and the
+				// operator looking at telemetry) understands why nothing
+				// was stored — silent no-op would just hide the wiring
+				// problem.
+				addResult("error: remember is not available — memory writes are owned by the unconscious thread")
 			case "pace":
 				var parts []string
 				if s := call.Args["sleep"]; s != "" {
@@ -1057,7 +1279,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							MCPServer:   name,
 						})
 					}
-					if t.memory != nil {
+					if t.memory != nil && t.memory.Enabled() {
 						go func(srvName string, srvTools []mcpToolDef) {
 							for _, tl := range srvTools {
 								fullName := srvName + "_" + tl.Name
@@ -1119,21 +1341,49 @@ func (t *Thinker) Run() {
 	}()
 
 	for {
-		// Check pause/quit
-		select {
-		case <-t.quit:
-			return
-		case p := <-t.pause:
-			t.paused = p
-			if t.paused {
-				select {
-				case p = <-t.pause:
-					t.paused = p
-				case <-t.quit:
-					return
-				}
+		// Pause / quit handling.
+		//
+		// Three sources can pause this loop:
+		//   1. PauseAll(true) from the parent (UI freeze, etc.)
+		//   2. spawn(... paused=true) — the thread starts paused so the
+		//      leader can configure / inspect before any thinking runs.
+		//      thinker.paused is set BEFORE go Run() in that case.
+		//   3. An explicit pause via the API.
+		//
+		// To wake: PauseAll(false), an explicit unpause, OR an inbox
+		// event (a `send` from the leader, console input, etc.) — the
+		// bus pulses sub.Wake on every delivery, which we listen for
+		// here so spawn-paused workers come alive on their first message
+		// without anyone needing to call unpause explicitly.
+		if t.paused {
+			select {
+			case <-t.quit:
+				return
+			case p := <-t.pause:
+				t.paused = p
+			case <-t.sub.Wake:
+				t.paused = false
+				logMsg("RUN", fmt.Sprintf("[%s] unpaused by inbox event", t.threadID))
 			}
-		default:
+		} else {
+			select {
+			case <-t.quit:
+				return
+			case p := <-t.pause:
+				t.paused = p
+				if t.paused {
+					select {
+					case p = <-t.pause:
+						t.paused = p
+					case <-t.sub.Wake:
+						t.paused = false
+						logMsg("RUN", fmt.Sprintf("[%s] unpaused by inbox event", t.threadID))
+					case <-t.quit:
+						return
+					}
+				}
+			default:
+			}
 		}
 
 		t.iteration++
@@ -1218,7 +1468,10 @@ func (t *Thinker) Run() {
 			t.rate = RateFast
 		}
 
-		now := time.Now().Format("2006-01-02 15:04:05")
+		// Minute-granularity timestamp keeps cache hits stable for
+		// rapid-fire iterations within the same minute. The agent
+		// rarely cares about second-level precision.
+		now := time.Now().Format("2006-01-02 15:04")
 
 		// If we have tool results, add them as a proper tool_result message first
 		if len(toolResults) > 0 {
@@ -1228,6 +1481,46 @@ func (t *Thinker) Run() {
 				t.session.AppendMessage(trMsg, t.iteration, TokenUsage{})
 			}
 		}
+
+		// Compute the per-turn dynamic context: active threads + recall
+		// + RAG-retrieved candidate tools. All three were previously
+		// poisoning messages[0] every iteration; now they ride along on
+		// the current user-turn message so messages[0] stays cache-stable.
+		var memQuery, toolQuery string
+		if hadEvents {
+			q := strings.Join(consumed, " ")
+			memQuery, toolQuery = q, q
+		} else {
+			for i := len(t.messages) - 1; i >= 0; i-- {
+				if t.messages[i].Role == "assistant" {
+					memQuery, toolQuery = t.messages[i].Content, t.messages[i].Content
+					break
+				}
+			}
+		}
+		// Auto-inject the top-N most relevant active memories into this
+		// turn's dynamic context. v2: Recall scores every active record
+		// by signal × weight × decay (cosine when an embedding backend
+		// is configured, lexical token-overlap otherwise), filters out
+		// tombstoned/superseded entries automatically, and BuildContext
+		// renders them with explicit "these are memories, not current
+		// statements" framing — the structural defense against the
+		// fabricated-approvals failure mode.
+		var recallContext string
+		if t.memory != nil && t.memory.Count() > 0 && memQuery != "" {
+			recalled := t.memory.Recall(memQuery, 5)
+			recallContext = t.memory.BuildContext(recalled)
+		}
+		var toolDocs string
+		if t.registry != nil && toolQuery != "" {
+			tools := t.registry.Retrieve(toolQuery, 5, t.allowedTools(), t.memory)
+			toolDocs = t.registry.BuildDocs(tools)
+		}
+		var activeThreads []ThreadInfo
+		if t.threads != nil {
+			activeThreads = t.threads.List()
+		}
+		dynCtx := buildDynamicTurnContext(activeThreads, recallContext, toolDocs)
 
 		if hadEvents {
 			// Filter out tool result text from the events text (they're already in ToolResults)
@@ -1240,6 +1533,10 @@ func (t *Thinker) Run() {
 			}
 
 			var sb strings.Builder
+			if dynCtx != "" {
+				sb.WriteString(dynCtx)
+				sb.WriteString("\n\n")
+			}
 			if len(textEvents) > 0 {
 				sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
 				for _, ev := range textEvents {
@@ -1258,48 +1555,18 @@ func (t *Thinker) Run() {
 			}
 		} else if len(toolResults) == 0 {
 			// Only add "no events" if we also have no tool results
-			t.messages = append(t.messages, Message{Role: "user", Content: fmt.Sprintf("[%s] (no events)", now)})
+			var content string
+			if dynCtx != "" {
+				content = dynCtx + "\n\n" + fmt.Sprintf("[%s] (no events)", now)
+			} else {
+				content = fmt.Sprintf("[%s] (no events)", now)
+			}
+			t.messages = append(t.messages, Message{Role: "user", Content: content})
 		}
 
-		// Memory recall
-		if t.memory != nil && t.memory.Count() > 0 {
-			var memQuery string
-			if hadEvents {
-				memQuery = strings.Join(consumed, " ")
-			} else {
-				for i := len(t.messages) - 1; i >= 0; i-- {
-					if t.messages[i].Role == "assistant" {
-						memQuery = t.messages[i].Content
-						break
-					}
-				}
-			}
-			if memQuery != "" {
-				// Namespace-aware recall: thread sees own memories + global
-				recalled := t.memory.RetrieveWithNamespace(memQuery, recallTopN, t.threadID)
-				if ctx := t.memory.BuildContext(recalled); ctx != "" {
-					t.messages = append(t.messages, Message{Role: "system", Content: ctx})
-				}
-			}
-		}
-
-		// Tool discovery via RAG — update system prompt with discovered tools
-		if t.registry != nil && t.rebuildPrompt != nil {
-			var toolQuery string
-			if hadEvents {
-				toolQuery = strings.Join(consumed, " ")
-			} else {
-				for i := len(t.messages) - 1; i >= 0; i-- {
-					if t.messages[i].Role == "assistant" {
-						toolQuery = t.messages[i].Content
-						break
-					}
-				}
-			}
-			tools := t.registry.Retrieve(toolQuery, 5, t.allowedTools(), t.memory)
-			toolDocs := t.registry.BuildDocs(tools)
-			t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt(toolDocs)}
-		}
+		// messages[0] is no longer rewritten per-iteration. It only
+		// changes when the directive, mode, or static config (MCPs,
+		// providers) does — handled at the call sites of buildSystemPrompt.
 
 		start := time.Now()
 		chatResp, err := t.think()
@@ -1337,8 +1604,21 @@ func (t *Thinker) Run() {
 			continue
 		}
 
-		// Build assistant message — may include native tool calls
-		assistantMsg := Message{Role: "assistant", Content: reply, ToolCalls: chatResp.ToolCalls}
+		// Build assistant message — may include native tool calls.
+		//
+		// Skip the append entirely when the model produced literally
+		// nothing usable (no text, no tool_calls). Otherwise we
+		// accumulate dead-air assistant turns that grow the message
+		// history forever, waste tokens, and trigger Moonshot's
+		// "must not be empty" rejection on the next call. Reasoning
+		// alone doesn't justify keeping the turn — without text or
+		// tool calls there's nothing for the agent to act on or the
+		// provider to replay.
+		if reply == "" && len(chatResp.ToolCalls) == 0 {
+			logMsg("RUN", fmt.Sprintf("[%s] iter %d: model produced no text or tool calls — skipping assistant turn", t.threadID, t.iteration))
+			continue
+		}
+		assistantMsg := Message{Role: "assistant", Content: reply, ToolCalls: chatResp.ToolCalls, Reasoning: chatResp.Reasoning}
 		t.messages = append(t.messages, assistantMsg)
 
 		// Persist to session history

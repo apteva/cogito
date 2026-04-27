@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"encoding/json"
@@ -680,11 +680,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "d":
-			// Delete in memory/thread panels
+			// Delete in memory/thread panels (TUI). Memory v2: drop by id
+			// — translate the on-screen position (newest-first) into the
+			// active record at that index.
 			if m.panel == panelMemory {
-				if m.memoryCount > 0 && m.memoryCursor < m.memoryCount {
-					realIndex := m.thinker.memory.Count() - 1 - m.memoryCursor
-					m.thinker.memory.Delete(realIndex)
+				active := m.thinker.memory.Active()
+				if len(active) > 0 && m.memoryCursor < len(active) {
+					realIndex := len(active) - 1 - m.memoryCursor
+					if realIndex >= 0 && realIndex < len(active) {
+						_ = m.thinker.memory.Drop(active[realIndex].ID, "deleted via TUI")
+					}
 					m.memoryCount = m.thinker.memory.Count()
 					if m.memoryCursor >= m.memoryCount && m.memoryCursor > 0 {
 						m.memoryCursor--
@@ -1067,7 +1072,16 @@ func (m model) renderMemoryPanel(width, height int) string {
 		listHeight = 1
 	}
 
-	entries := m.thinker.memory.Recent(m.memoryCount)
+	// Memory v2: render the active records, newest first. The TUI's
+	// "Recent" view is just the tail of the active set in display
+	// order. ID-prefix replaces the old session-id strip below the
+	// text — same purpose (something stable to refer to entries by).
+	allActive := m.thinker.memory.Active()
+	tail := m.memoryCount
+	if tail > len(allActive) {
+		tail = len(allActive)
+	}
+	entries := allActive[len(allActive)-tail:]
 	var lines []string
 	if len(entries) == 0 {
 		lines = append(lines, statsStyle.Render("no memories yet"))
@@ -1075,12 +1089,16 @@ func (m model) renderMemoryPanel(width, height int) string {
 		for idx := len(entries) - 1; idx >= 0; idx-- {
 			e := entries[idx]
 			displayIdx := len(entries) - 1 - idx
-			age := formatAge(time.Since(e.Time))
-			text := truncate(e.Text, innerWidth-6)
+			age := formatAge(time.Since(e.TS))
+			text := truncate(e.Content, innerWidth-6)
+			idShort := e.ID
+			if len(idShort) > 8 {
+				idShort = idShort[:8]
+			}
 
 			if displayIdx == m.memoryCursor {
 				lines = append(lines, memorySelectedStyle.Render(fmt.Sprintf(" %s ", text)))
-				lines = append(lines, memoryAgeStyle.Render(fmt.Sprintf("  %s ago │ %s", age, e.Session[:min(8, len(e.Session))])))
+				lines = append(lines, memoryAgeStyle.Render(fmt.Sprintf("  %s ago │ %s", age, idShort)))
 			} else {
 				lines = append(lines, memoryTextStyle.Render("  "+text))
 				lines = append(lines, memoryAgeStyle.Render(fmt.Sprintf("  %s ago", age)))

@@ -1,16 +1,13 @@
-package main
+package core
 
 import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/joho/godotenv"
 )
 
 // TestIntegration_BlobPipeline exercises the end-to-end blob-handle flow
@@ -32,14 +29,7 @@ import (
 // Skipped in short mode or when FIREWORKS_API_KEY is unset. Uses the
 // same conventions as the other Integration_ tests in this package.
 func TestIntegration_BlobPipeline(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-	godotenv.Load()
-	apiKey := os.Getenv("FIREWORKS_API_KEY")
-	if apiKey == "" {
-		t.Skip("FIREWORKS_API_KEY not set, skipping")
-	}
+	tp := getTestProvider(t)
 
 	// ---- Fake MCP server state ----
 	const audioPayload = "this-is-fake-mp3-bytes-for-the-test"
@@ -81,7 +71,7 @@ func TestIntegration_BlobPipeline(t *testing.T) {
 		},
 	}
 
-	provider := NewFireworksProvider(apiKey)
+	provider := tp.Provider
 	model := provider.Models()[ModelLarge]
 
 	messages := []Message{
@@ -116,7 +106,7 @@ func TestIntegration_BlobPipeline(t *testing.T) {
 
 		// Append the assistant turn (text + tool calls) as-is.
 		messages = append(messages, Message{
-			Role: "assistant", Content: resp.Text, ToolCalls: resp.ToolCalls,
+			Role: "assistant", Content: resp.Text, Reasoning: resp.Reasoning, ToolCalls: resp.ToolCalls,
 		})
 
 		// Dispatch each tool call through the mcpProxyHandler.

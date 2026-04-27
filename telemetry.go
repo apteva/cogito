@@ -397,6 +397,17 @@ type ThreadDoneData struct {
 	Result   string `json:"result,omitempty"`
 }
 
+// ThreadRenamedData fires when update changes a thread's display name
+// or its immutable id. The dashboard uses old_id to swap its record
+// for the new identity (id changes are rare but legal). When only Name
+// changed, OldID == NewID.
+type ThreadRenamedData struct {
+	OldID    string `json:"old_id"`
+	NewID    string `json:"new_id"`
+	Name     string `json:"name,omitempty"`
+	ParentID string `json:"parent_id,omitempty"`
+}
+
 type ThreadMessageData struct {
 	From    string `json:"from"`
 	To      string `json:"to"`
@@ -476,6 +487,36 @@ func ModelContextWindow(modelID string) int {
 		{"minimax-m2p7", 196_608},
 		{"minimax-m2p5", 196_608},
 		{"minimax-m2", 196_608},
+
+		// --- OpenCode Go ---
+		// Same Kimi K2.x base models as Fireworks but the gateway
+		// surfaces them under non-prefixed ids ("kimi-k2.6" with a
+		// dot, vs. Fireworks's "kimi-k2p6"). Match-by-substring is
+		// case-sensitive and exact-prefix, so both forms need their
+		// own entry. Order: longest first so "kimi-k2.6" wins over
+		// the bare "kimi-k2" fallback.
+		{"kimi-k2.6", 256_000},
+		{"kimi-k2.5", 256_000},
+		// MiniMax on OpenCode Go uses dotted ids too (m2.5 / m2.7).
+		{"minimax-m2.7", 196_608},
+		{"minimax-m2.5", 196_608},
+		// Qwen3 Plus tier on OpenCode Go — Qwen3 Plus is documented
+		// at 128K context window (alibabacloud / qwen docs).
+		{"qwen3.6-plus", 128_000},
+		{"qwen3.5-plus", 128_000},
+		// GLM-5.x (Zhipu) — published 128K context window.
+		{"glm-5.1", 128_000},
+		{"glm-5", 128_000},
+		// MiMo V2 / V2.5 — published 256K context.
+		{"mimo-v2.5-pro", 256_000},
+		{"mimo-v2.5", 256_000},
+		{"mimo-v2-pro", 256_000},
+		{"mimo-v2-omni", 256_000},
+		// DeepSeek V4 — published 128K context (Anthropic-style endpoint
+		// — listed here so the UI's % indicator works regardless of which
+		// provider path the request takes).
+		{"deepseek-v4-pro", 128_000},
+		{"deepseek-v4-flash", 128_000},
 
 		// --- OpenAI ---
 		{"gpt-4.1", 1_000_000},

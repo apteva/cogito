@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"strings"
@@ -14,7 +14,8 @@ import (
 // This uses real LLM calls and tests the complete agent loop.
 func TestIntegration_MultiThreadCoordination(t *testing.T) {
 	t.Parallel()
-	apiKey := getAPIKey(t)
+	tp := getTestProvider(t)
+	apiKey := tp.APIKey
 
 	directive := `You coordinate worker threads. When you receive a console event asking to "run tasks", spawn exactly 3 threads:
 - id="task-a" directive="Say the word 'alpha' then immediately call [[done message="alpha complete"]]"
@@ -24,12 +25,7 @@ func TestIntegration_MultiThreadCoordination(t *testing.T) {
 Each thread has tools="done". After spawning all 3, set pace to sleep and wait for their results.
 When all 3 threads report done, say "ALL TASKS COMPLETE" in your thought.`
 
-	provider, err := selectProvider(NewConfig())
-	if err != nil {
-		t.Skip("no provider available")
-	}
-
-	thinker := NewThinker(apiKey, provider)
+	thinker := NewThinker(apiKey, tp.Provider)
 	thinker.config = &Config{Directive: directive}
 	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", nil, nil, nil, nil)}
 

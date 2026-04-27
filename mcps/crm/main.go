@@ -142,14 +142,25 @@ func handleToolCall(id int64, name string, args map[string]string) {
 				return
 			}
 		}
+		status := args["status"]
+		if status == "" {
+			status = "new"
+		}
 		contact := Contact{
-			ID:        fmt.Sprintf("c-%03d", nextID),
-			Name:      cName,
-			Email:     email,
-			Company:   args["company"],
-			Website:   args["website"],
-			Status:    "new",
-			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			ID:            fmt.Sprintf("c-%03d", nextID),
+			Name:          cName,
+			Email:         email,
+			Company:       args["company"],
+			Website:       args["website"],
+			Industry:      args["industry"],
+			EmployeeCount: args["employee_count"],
+			Location:      args["location"],
+			Description:   args["description"],
+			Status:        status,
+			CreatedAt:     time.Now().UTC().Format(time.RFC3339),
+		}
+		if contact.Industry != "" || contact.Location != "" || contact.Description != "" {
+			contact.EnrichedAt = contact.CreatedAt
 		}
 		nextID++
 		contacts = append(contacts, contact)
@@ -293,14 +304,19 @@ func main() {
 				"tools": []map[string]any{
 					{
 						"name":        "create_contact",
-						"description": "Create a new contact in the CRM. Returns the created contact with its ID.",
+						"description": "Create a new contact in the CRM. Accepts all enrichment fields directly — pass them on create rather than create-then-update. Returns the created contact with its ID.",
 						"inputSchema": map[string]any{
 							"type": "object",
 							"properties": map[string]any{
-								"name":    map[string]string{"type": "string", "description": "Contact full name"},
-								"email":   map[string]string{"type": "string", "description": "Email address"},
-								"company": map[string]string{"type": "string", "description": "Company name"},
-								"website": map[string]string{"type": "string", "description": "Company website URL"},
+								"name":           map[string]string{"type": "string", "description": "Contact full name"},
+								"email":          map[string]string{"type": "string", "description": "Email address"},
+								"company":        map[string]string{"type": "string", "description": "Company name"},
+								"website":        map[string]string{"type": "string", "description": "Company website URL"},
+								"industry":       map[string]string{"type": "string", "description": "Industry"},
+								"employee_count": map[string]string{"type": "string", "description": "Employee count band, e.g. '5-10'"},
+								"location":       map[string]string{"type": "string", "description": "Location, e.g. 'Lyon, France'"},
+								"description":    map[string]string{"type": "string", "description": "Short company description"},
+								"status":         map[string]string{"type": "string", "description": "Contact stage, e.g. 'new', 'enriched', 'contacted'"},
 							},
 							"required": []string{"name", "email"},
 						},

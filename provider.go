@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"errors"
@@ -179,6 +179,7 @@ type ServerToolResult struct {
 // ChatResponse is the structured return from Chat().
 type ChatResponse struct {
 	Text          string             // streamed text content
+	Reasoning     string             // accumulated chain-of-thought (Fireworks reasoning_content / OpenRouter reasoning); empty when the provider didn't emit any
 	ToolCalls     []NativeToolCall   // structured tool calls WE need to execute
 	ServerResults []ServerToolResult // tools the PROVIDER already executed
 	Usage         TokenUsage
@@ -230,6 +231,10 @@ func createProviderByName(name string) LLMProvider {
 		if key := os.Getenv("FIREWORKS_API_KEY"); key != "" {
 			return NewFireworksProvider(key)
 		}
+	case "opencode-go":
+		if key := os.Getenv("OPENCODE_GO_API_KEY"); key != "" {
+			return NewOpenCodeGoProvider(key)
+		}
 	case "openai":
 		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
 			return NewOpenAINativeProvider(key)
@@ -243,9 +248,16 @@ func createProviderByName(name string) LLMProvider {
 			return NewGoogleProvider(key)
 		}
 	case "ollama":
+		// Require explicit OLLAMA_HOST. Previously we silently defaulted
+		// to http://localhost:11434, which meant every install with no
+		// LLM credentials at all got a "phantom" Ollama provider that
+		// ALWAYS failed at request time (no Ollama running). When Ollama
+		// was first in the auto-detect list, the result was an llama3.1
+		// 404 every iteration before falling back to whichever real
+		// provider was actually configured. Opt-in only.
 		host := os.Getenv("OLLAMA_HOST")
 		if host == "" {
-			host = "http://localhost:11434"
+			return nil
 		}
 		return NewOllamaProvider(host)
 	case "nvidia":
@@ -436,9 +448,17 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 		pool.default_ = explicit
 	}
 
-	// 3. Auto-detect from API keys if nothing configured
+	// 3. Auto-detect from API keys if nothing configured.
+	//
+	// Order matters: the first provider whose key is set becomes the
+	// default. opencode-go is preferred over token-billed providers
+	// because it's a flat-rate subscription — if the user configured
+	// it, they want it used (otherwise the per-token providers below
+	// will silently win and burn budget). Ollama is last because it
+	// requires OLLAMA_HOST set explicitly and only returns non-nil
+	// when the user has it running.
 	if len(pool.providers) == 0 {
-		for _, name := range []string{"fireworks", "openai", "anthropic", "google", "ollama"} {
+		for _, name := range []string{"opencode-go", "fireworks", "anthropic", "google", "openai", "nvidia", "ollama"} {
 			if p := createProviderByName(name); p != nil {
 				pool.providers[name] = p
 				pool.order = append(pool.order, name)
@@ -489,6 +509,9 @@ func availableProviders() []LLMProvider {
 	var providers []LLMProvider
 	if key := os.Getenv("FIREWORKS_API_KEY"); key != "" {
 		providers = append(providers, NewFireworksProvider(key))
+	}
+	if key := os.Getenv("OPENCODE_GO_API_KEY"); key != "" {
+		providers = append(providers, NewOpenCodeGoProvider(key))
 	}
 	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
 		providers = append(providers, NewOpenAIProvider(key))

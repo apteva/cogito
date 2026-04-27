@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"bufio"
@@ -330,6 +330,27 @@ func (s *Session) Delete() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	os.Remove(s.path)
+}
+
+// Rename moves the on-disk history file when a thread's id changes.
+// Best-effort: a missing source file (the thread had no entries yet)
+// is treated as success so the caller can rename the in-memory record
+// without worrying about whether disk state existed.
+func (s *Session) Rename(newThreadID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dir := filepath.Dir(s.path)
+	newPath := filepath.Join(dir, newThreadID+".jsonl")
+	if newPath == s.path {
+		return nil
+	}
+	if _, err := os.Stat(s.path); err == nil {
+		if err := os.Rename(s.path, newPath); err != nil {
+			return err
+		}
+	}
+	s.path = newPath
+	return nil
 }
 
 // Count returns the approximate number of entries.
