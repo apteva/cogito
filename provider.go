@@ -268,6 +268,14 @@ func createProviderByName(name string) LLMProvider {
 		if key := os.Getenv("NVIDIA_API_KEY"); key != "" {
 			return NewNvidiaProvider(key)
 		}
+	case "venice":
+		// Venice AI — privacy-focused OpenAI-compatible gateway with a
+		// large rotating model catalog (Llama, Qwen, GLM, Mistral,
+		// plus Claude/Grok/Gemini reseller variants). See
+		// provider_openai.go:NewVeniceProvider.
+		if key := os.Getenv("VENICE_API_KEY"); key != "" {
+			return NewVeniceProvider(key)
+		}
 	}
 	return nil
 }
@@ -458,7 +466,7 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 	// requires OLLAMA_HOST set explicitly and only returns non-nil
 	// when the user has it running.
 	if len(pool.providers) == 0 {
-		for _, name := range []string{"opencode-go", "fireworks", "anthropic", "google", "openai", "nvidia", "ollama"} {
+		for _, name := range []string{"opencode-go", "fireworks", "anthropic", "google", "openai", "venice", "nvidia", "ollama"} {
 			if p := createProviderByName(name); p != nil {
 				pool.providers[name] = p
 				pool.order = append(pool.order, name)

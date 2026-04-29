@@ -52,11 +52,12 @@ func TestComputerUse_PatreonLogin(t *testing.T) {
 		t.Skip("PATREON_PASSWORD not set")
 	}
 
-	// Patreon gates logins behind Cloudflare + account-origin
-	// fingerprinting — datacenter IPs almost always 403. Turn on the
-	// managed residential proxy for the cloud backends unless the
-	// operator explicitly opts out. No-op on TEST_BROWSER=local.
-	if os.Getenv("PATREON_USE_PROXY") != "0" {
+	// Proxy is the agent's decision now — it sees the capability in
+	// the browser_session tool description and gets a Patreon-specific
+	// hint in the directive below. The harness no longer pre-flips
+	// TEST_BROWSER_PROXY; this run is a proper test of agent-owned
+	// policy. Operators can still force it on with PATREON_USE_PROXY=1.
+	if os.Getenv("PATREON_USE_PROXY") == "1" {
 		t.Setenv("TEST_BROWSER_PROXY", "1")
 	}
 	// Patreon's email-code flow can take 4–10 min; the cloud
@@ -115,8 +116,9 @@ func TestComputerUse_PatreonLogin(t *testing.T) {
 		fmt.Sprintf(`Password: %s`, password),
 		``,
 		`Steps:`,
-		`1) browser_session(action=open, url=https://www.patreon.com/login, timeout=1200)`,
+		`1) browser_session(action=open, url=https://www.patreon.com/login, timeout=1200, proxy=true)`,
 		`   The timeout=1200 (20 min) is critical — this flow waits on an emailed code and the default session lease is short. If the session expires mid-flow you cannot recover, so always extend it on open.`,
+		`   proxy=true is critical — Patreon fingerprints datacenter IPs and serves a Cloudflare "verify you are human" challenge that you cannot bypass. The residential proxy avoids this gate.`,
 		`2) If a cookie/consent banner covers the page, dismiss it first (click Accept by label).`,
 		`3) computer_use(action=screenshot) — find the email input (orange badge).`,
 		`4) Click the email input (label=N), then computer_use(action=type, text="<the email above>").`,

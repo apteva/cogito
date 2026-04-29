@@ -473,33 +473,29 @@ func ModelContextWindow(modelID string) int {
 		{"claude-3-sonnet", 200_000},
 		{"claude-3-haiku", 200_000},
 
-		// --- Fireworks ---
-		// Kimi K2 family on Fireworks: 256K input context from K2.5
-		// onwards. Longer/more-specific variants come first so the
-		// generic "kimi-k2" fallback doesn't shadow them. Add new
-		// point-releases (k2p7, etc.) here as Fireworks ships them.
+		// --- Fireworks + OpenCode Go (Kimi / MiniMax) ---
+		// Both providers expose the same Kimi K2.x and MiniMax M2.x
+		// base models, just under different id forms: Fireworks uses
+		// "kimi-k2p6" / "minimax-m2p7", OpenCode Go uses dotted ids
+		// like "kimi-k2.6" / "minimax-m2.7". Match-by-substring means
+		// dotted variants MUST come before the bare "kimi-k2" /
+		// "minimax-m2" fallbacks — otherwise the bare entry shadows
+		// them and we return the wrong (older, smaller) context size.
+		// Kimi K2 — 256K from K2.5 onwards; bare K2 was 128K.
+		{"kimi-k2.6", 256_000},
+		{"kimi-k2.5", 256_000},
 		{"kimi-k2p7", 256_000},
 		{"kimi-k2p6", 256_000},
 		{"kimi-k2p5", 256_000},
 		{"kimi-k2", 128_000},
-		// MiniMax on Fireworks — 196,608 (192K) tokens per the provider's
-		// published spec (fireworks.ai/models/fireworks/minimax-m2p7).
+		// MiniMax M2 — 196,608 (192K) tokens per provider docs.
+		{"minimax-m2.7", 196_608},
+		{"minimax-m2.5", 196_608},
 		{"minimax-m2p7", 196_608},
 		{"minimax-m2p5", 196_608},
 		{"minimax-m2", 196_608},
 
-		// --- OpenCode Go ---
-		// Same Kimi K2.x base models as Fireworks but the gateway
-		// surfaces them under non-prefixed ids ("kimi-k2.6" with a
-		// dot, vs. Fireworks's "kimi-k2p6"). Match-by-substring is
-		// case-sensitive and exact-prefix, so both forms need their
-		// own entry. Order: longest first so "kimi-k2.6" wins over
-		// the bare "kimi-k2" fallback.
-		{"kimi-k2.6", 256_000},
-		{"kimi-k2.5", 256_000},
-		// MiniMax on OpenCode Go uses dotted ids too (m2.5 / m2.7).
-		{"minimax-m2.7", 196_608},
-		{"minimax-m2.5", 196_608},
+		// --- OpenCode Go (other model families) ---
 		// Qwen3 Plus tier on OpenCode Go — Qwen3 Plus is documented
 		// at 128K context window (alibabacloud / qwen docs).
 		{"qwen3.6-plus", 128_000},
@@ -517,6 +513,29 @@ func ModelContextWindow(modelID string) int {
 		// provider path the request takes).
 		{"deepseek-v4-pro", 128_000},
 		{"deepseek-v4-flash", 128_000},
+
+		// --- Venice (https://api.venice.ai/api/v1/models) ---
+		// Venice resells a rotating catalog under non-prefixed ids. The
+		// authoritative context length comes from the live /models
+		// response (see server/model_fetch.go:fetchVeniceModels) and is
+		// what the picker shows. The static entries below are kept for
+		// telemetry's % indicator on the headline house models so the
+		// chart works when a request reports a model id we recognize
+		// without having to round-trip a fetch.
+		{"qwen3-coder-480b", 256_000},
+		{"qwen3-6-27b", 256_000},
+		{"qwen3-6-plus", 1_000_000},
+		{"qwen3-5-9b", 256_000},
+		{"qwen3-next-80b", 256_000},
+		{"qwen3-vl-235b", 256_000},
+		{"mistral-small-3-2", 256_000},
+		{"mistral-small-2603", 256_000},
+		{"venice-uncensored-1-2", 128_000},
+		{"venice-uncensored-role-play", 128_000},
+		{"venice-uncensored", 32_000},
+		{"grok-41-fast", 1_000_000},
+		{"grok-4-20", 2_000_000},
+		{"hermes-3-llama-3.1-405b", 128_000},
 
 		// --- OpenAI ---
 		{"gpt-4.1", 1_000_000},

@@ -159,42 +159,51 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 	return messages, compactedSummaries
 }
 
-// sanitizeToolPairs fixes mismatched tool_use/tool_result pairs that cause
-// Anthropic API errors. Handles both directions:
-// - tool_result without matching tool_use → remove the tool_result
-// - tool_use without matching tool_result → remove the tool_use from the assistant message
-// pendingIDs are tool call IDs with async results still in flight — never strip those.
+// sanitizeToolPairs fixes mismatched tool_use/tool_result pairs that
+// cause referential-integrity errors on strict providers (Moonshot via
+// opencode-go, Anthropic). Every tool_result.CallID must point to an
+// assistant tool_calls[].id earlier in the same payload, and every
+// assistant tool_call must be followed by a tool result.
+//
+// Handles both directions:
+//   - tool_result without matching tool_use → drop the tool_result.
+//   - tool_use without matching tool_result → drop the tool_use from
+//     the assistant message.
+//
+// pendingIDs are tool call IDs with async results still in flight —
+// never strip those (the iteration barrier injects placeholders for
+// them so the wire payload still pairs cleanly).
+//
+// Note: a previous version preserved image-bearing tool_results even
+// when orphaned, on the theory that screenshots had to survive. That
+// produced wire payloads with unpaired tool_call_ids that Moonshot
+// 400'd on. Old screenshots are already evicted to text placeholders
+// after the 3-image cap (see thinker.go), so dropping orphan-with-
+// image entirely is safe and matches the protocol.
 func sanitizeToolPairs(messages []Message, pendingIDs ...map[string]bool) []Message {
 	pending := map[string]bool{}
 	if len(pendingIDs) > 0 && pendingIDs[0] != nil {
 		pending = pendingIDs[0]
 	}
-	// Collect all tool_use IDs and tool_result IDs
 	toolUseIDs := make(map[string]bool)
 	toolResultIDs := make(map[string]bool)
-	// Also track which tool_results have images (must be preserved)
-	imageResultIDs := make(map[string]bool)
 	for _, m := range messages {
 		for _, tc := range m.ToolCalls {
 			toolUseIDs[tc.ID] = true
 		}
 		for _, tr := range m.ToolResults {
 			toolResultIDs[tr.CallID] = true
-			if tr.Image != nil {
-				imageResultIDs[tr.CallID] = true
-			}
 		}
 	}
 
 	var result []Message
 	removed := 0
 	for _, m := range messages {
-		// Remove orphaned tool_results (no matching tool_use)
-		// BUT keep results with images — computer screenshots must survive
+		// Drop orphaned tool_results (no matching tool_use anywhere).
 		if len(m.ToolResults) > 0 {
 			var valid []ToolResult
 			for _, tr := range m.ToolResults {
-				if toolUseIDs[tr.CallID] || tr.Image != nil {
+				if toolUseIDs[tr.CallID] {
 					valid = append(valid, tr)
 				}
 			}
@@ -205,12 +214,11 @@ func sanitizeToolPairs(messages []Message, pendingIDs ...map[string]bool) []Mess
 			m.ToolResults = valid
 		}
 
-		// Remove orphaned tool_uses (no matching tool_result)
-		// BUT keep: tool calls with image results, and tool calls still pending
+		// Drop orphaned tool_uses (no matching tool_result + not pending).
 		if len(m.ToolCalls) > 0 && m.Role == "assistant" {
 			var valid []NativeToolCall
 			for _, tc := range m.ToolCalls {
-				if toolResultIDs[tc.ID] || imageResultIDs[tc.ID] || pending[tc.ID] {
+				if toolResultIDs[tc.ID] || pending[tc.ID] {
 					valid = append(valid, tc)
 				}
 			}

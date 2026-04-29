@@ -185,6 +185,12 @@ func TestModelContextWindow(t *testing.T) {
 		// runs against, so this row is the canary.
 		{"accounts/fireworks/routers/kimi-k2p5-turbo", 256_000},
 		{"accounts/fireworks/models/kimi-k2-instruct", 128_000},
+		// OpenCode Go uses dotted ids; bare "kimi-k2" must NOT
+		// shadow the dotted entries (was the bug).
+		{"kimi-k2.6", 256_000},
+		{"kimi-k2.5", 256_000},
+		{"minimax-m2.7", 196_608},
+		{"minimax-m2.5", 196_608},
 		// Anthropic — both default and 1M-context variants.
 		{"claude-opus-4-7", 200_000},
 		{"claude-opus-4-7[1m]", 1_000_000},

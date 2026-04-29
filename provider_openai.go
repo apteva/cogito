@@ -590,6 +590,29 @@ func NewNvidiaProvider(apiKey string) LLMProvider {
 	}
 }
 
+// NewVeniceProvider — privacy-focused inference gateway at venice.ai.
+// OpenAI-compatible /chat/completions endpoint, large rotating catalog
+// (Llama, Qwen, GLM, Mistral, plus Claude/Grok/Gemini reseller variants).
+// Pricing varies per model and is set per-account in their dashboard, so
+// per-token costs are left at zero here — the model picker / picker
+// dropdown is the source of truth for what's available right now.
+func NewVeniceProvider(apiKey string) LLMProvider {
+	return &OpenAICompatProvider{
+		name:       "venice",
+		apiKey:     apiKey,
+		url:        "https://api.venice.ai/api/v1/chat/completions",
+		authHeader: "Bearer",
+		models: map[ModelTier]string{
+			ModelLarge:  "qwen3-coder-480b-a35b-instruct",
+			ModelMedium: "qwen3-6-27b",
+			ModelSmall:  "mistral-small-3-2-24b-instruct",
+		},
+		inputCost:  0,
+		cachedCost: 0,
+		outputCost: 0,
+	}
+}
+
 func NewOllamaProvider(host string) LLMProvider {
 	url := strings.TrimRight(host, "/") + "/v1/chat/completions"
 	return &OpenAICompatProvider{

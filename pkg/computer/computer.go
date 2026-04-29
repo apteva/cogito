@@ -92,6 +92,19 @@ type OpenOptions struct {
 	// for SessionID attaches (the timeout was set at original create).
 	// Zero leaves the provider's server-side default in place.
 	Timeout int
+
+	// Proxy, when non-nil, decides whether the new session routes
+	// egress through the backend's managed residential proxy. nil
+	// leaves the harness/backend default; &true forces on; &false
+	// forces off. Honored by browser-engine, browserbase, steel;
+	// ignored by local. Set by the agent via the browser_session
+	// open tool — the agent owns the policy decision.
+	Proxy *bool
+
+	// ProxyCountry is an ISO-2 country code for the residential
+	// proxy exit (e.g. "US"). Honored by browser-engine; ignored by
+	// browserbase + steel (they need a custom proxy list for that).
+	ProxyCountry string
 }
 
 // SessionOpener is implemented by Computers that own session lifecycle.

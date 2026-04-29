@@ -154,6 +154,14 @@ func GetSessionToolDef() ToolDefinition {
 					"type":        "string",
 					"description": "Session id to attach to (for open / resume). Browserbase + Browser Engine only. Mutually exclusive with context_id.",
 				},
+				"proxy": map[string]any{
+					"type":        "string",
+					"description": "\"true\" to route the session through a managed residential proxy. Use for sites that fingerprint datacenter IPs (Cloudflare-gated logins, banks, social). Adds latency and cost; default is off. Honored by browser-engine, browserbase, steel; ignored by local.",
+				},
+				"proxy_country": map[string]any{
+					"type":        "string",
+					"description": "ISO-2 country code for the proxy exit (e.g. \"US\", \"GB\"). Only honored when proxy=true on browser-engine.",
+				},
 			},
 			"required": []string{"action"},
 		},
@@ -305,11 +313,25 @@ func HandleSessionAction(comp Computer, args map[string]string) (text string, sc
 		}
 
 		opts := OpenOptions{
-			URL:       url,
-			ContextID: contextID,
-			Persist:   persist,
-			SessionID: sessionID,
-			Timeout:   timeout,
+			URL:          url,
+			ContextID:    contextID,
+			Persist:      persist,
+			SessionID:    sessionID,
+			Timeout:      timeout,
+			ProxyCountry: strings.TrimSpace(strings.Trim(args["proxy_country"], `"`)),
+		}
+		if raw := strings.TrimSpace(args["proxy"]); raw != "" {
+			lower := strings.ToLower(strings.Trim(raw, `"`))
+			switch lower {
+			case "true", "1", "on", "yes":
+				v := true
+				opts.Proxy = &v
+			case "false", "0", "off", "no":
+				v := false
+				opts.Proxy = &v
+			default:
+				return "", nil, fmt.Errorf("proxy must be true/false (got %q)", raw)
+			}
 		}
 
 		so, ok := comp.(SessionOpener)
