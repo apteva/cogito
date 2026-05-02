@@ -213,7 +213,46 @@ func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMess
 		resultPreview = resultPreview[:200] + "..."
 	}
 	logMsg("MCP-HTTP", fmt.Sprintf("ok id=%d result=%s", id, resultPreview))
+
+	// For tools/list, also dump the full description of every tool —
+	// the truncated preview above hides whether dynamic blocks (like
+	// the channels MCP's AVAILABLE COMPONENTS section) actually
+	// reached the agent. Costs one extra log line per tool per
+	// connect but makes that question answerable from the log
+	// alone.
+	if method == "tools/list" {
+		var listed struct {
+			Tools []struct {
+				Name        string         `json:"name"`
+				Description string         `json:"description"`
+				InputSchema map[string]any `json:"inputSchema"`
+			} `json:"tools"`
+		}
+		if err := json.Unmarshal(rpcResp.Result, &listed); err == nil {
+			for _, t := range listed.Tools {
+				descPreview := t.Description
+				if len(descPreview) > 2000 {
+					descPreview = descPreview[:2000] + "..."
+				}
+				logMsg("MCP-HTTP", fmt.Sprintf("  tool name=%q description=%q schema_props=%v",
+					t.Name, descPreview, schemaPropKeys(t.InputSchema)))
+			}
+		}
+	}
 	return rpcResp.Result, headers, nil
+}
+
+// schemaPropKeys extracts the property keys from an MCP tool's
+// inputSchema for the dump log — quick way to verify a new arg
+// (like respond's components) actually shows up in the schema the
+// agent receives.
+func schemaPropKeys(schema map[string]any) []string {
+	props, _ := schema["properties"].(map[string]any)
+	keys := make([]string, 0, len(props))
+	for k := range props {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func (s *MCPHTTPServer) call(method string, params any) (json.RawMessage, error) {
