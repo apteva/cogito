@@ -18,3 +18,14 @@ mcps/chat/mcp-chat
 mcps/inventory/mcp-inventory
 apteva-core
 apteva-core.log
+# Cross-component binaries copied here by the dev build flow.
+apteva-server
+cli
+# Runtime conversation history + memory snapshots are per-machine
+# state, never source. The .bak suffix covers periodic backups
+# core writes during compaction.
+history/
+history.bak.*/
+memory.jsonl.*
+# Generic log catch-all so test runs don't leak transcripts.
+*.log

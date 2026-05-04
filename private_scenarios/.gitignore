@@ -1,0 +1,8 @@
+# Everything here is private by default. Track the README and the
+# .example template so a new developer can see the intended shape;
+# anything else (real test files, baseline JSON, client data) stays
+# local.
+*
+!.gitignore
+!README.md
+!*.example

@@ -1,0 +1,83 @@
+//go:build testkit
+
+// Smoke test for the testkit harness. No MCPs, no credentials, no
+// real services. It:
+//   1. Auto-spawns a local apteva-server with an ephemeral data dir
+//      (if one isn't already running at APTEVA_SERVER_URL).
+//   2. Creates a default instance and wires an API key.
+//   3. Sets a trivial directive, injects one event, waits for the
+//      agent to complete at least one iteration, and prints the cost.
+//
+// If this PASSes you know the harness is fully operational end-to-end.
+// Copy it as a starting point for real tests:
+//
+//	cp ping_test.go.example my_workflow_test.go
+//
+// then edit the directive and add phases.
+
+package private_scenarios
+
+import (
+	"os"
+	"testing"
+	"time"
+
+	"github.com/apteva/core/testkit"
+)
+
+func TestPing(t *testing.T) {
+	if os.Getenv("RUN_TESTKIT_TESTS") == "" {
+		t.Skip("set RUN_TESTKIT_TESTS=1")
+	}
+	// testkit.New auto-starts a server if APTEVA_SERVER_URL isn't live.
+	// With the default config it picks a random port, mints a fresh
+	// API key, and creates a throwaway instance. t.Cleanup tears it
+	// all down when the test finishes.
+	s := testkit.New(t)
+
+	// Give the agent a minimal directive. We're not exercising tools
+	// or MCPs here — just verifying that main receives the event,
+	// thinks, and returns a cost-accountable iteration.
+	s.SetDirective(`You are a test agent. Whenever you see a [console] event, acknowledge it briefly in your thought and then pace to a long sleep. Do nothing else.`)
+
+	s.Run("event wakes main and it iterates", func(p *testkit.Phase) {
+		p.Inject("[console] testkit ping")
+
+		// Wait for the iteration counter to advance past zero. Core's
+		// first iteration after the directive is seeded runs immediately
+		// on boot, so we poll until we see at least 1 complete loop
+		// after the inject.
+		start := s.Status().Iteration
+		p.WaitUntil(45*time.Second, "iteration count to increase", func() bool {
+			return s.Status().Iteration > start
+		})
+
+		p.Verify("status sane", func() {
+			st := s.Status()
+			if st.Paused {
+				t.Errorf("agent paused unexpectedly: %+v", st)
+			}
+			if st.Iteration <= start {
+				t.Errorf("no iteration progress: start=%d now=%d", start, st.Iteration)
+			}
+		})
+	})
+
+	r := s.Report()
+	t.Logf("─────────────────────────────────────")
+	t.Logf("  iterations : %d", r.Iterations)
+	t.Logf("  tokens in  : %d", r.TokensIn)
+	t.Logf("  tokens out : %d", r.TokensOut)
+	t.Logf("  tool calls : %d", r.ToolCalls)
+	t.Logf("  errors     : %d", r.Errors)
+	t.Logf("  cost       : $%.4f", r.Cost)
+	t.Logf("  duration   : %.1fs", r.DurationSec)
+	t.Logf("─────────────────────────────────────")
+
+	if r.Errors > 0 {
+		t.Errorf("agent reported %d errors", r.Errors)
+	}
+	if r.Iterations < 1 {
+		t.Errorf("expected at least 1 LLM call, got %d", r.Iterations)
+	}
+}

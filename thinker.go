@@ -2396,13 +2396,31 @@ func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 		})
 	}
 
+	// Also stash the screenshot bytes in the BlobStore and surface
+	// the handle in the result text. The Image field stays attached
+	// so vision input is unchanged — this is purely additive: gives
+	// the agent a way to forward these exact bytes to another tool
+	// (e.g. files_upload via storage MCP) without re-encoding from
+	// the vision channel (which it can't do anyway).
+	content := fmt.Sprintf("Success: %s action completed. A screenshot of the current screen is attached as an image. Examine it to see the result.", actionLabel)
+	if t.blobs != nil && len(screenshot) > 0 {
+		mime := "image/jpeg"
+		if len(screenshot) >= 8 &&
+			screenshot[0] == 0x89 && screenshot[1] == 0x50 &&
+			screenshot[2] == 0x4E && screenshot[3] == 0x47 {
+			mime = "image/png"
+		}
+		ref := t.blobs.Put(mime, screenshot)
+		content += fmt.Sprintf(" To forward these exact bytes to another tool, pass the file handle %s as that tool's bytes argument.", ref)
+	}
+
 	// Inject as tool result with screenshot image
 	t.bus.Publish(Event{
 		Type: EventInbox, To: t.threadID,
 		Text: fmt.Sprintf("[tool:computer_use] success: %s completed, screenshot attached (%d bytes, %dms)", actionLabel, len(screenshot), duration.Milliseconds()),
 		ToolResult: &ToolResult{
 			CallID:  ntc.ID,
-			Content: fmt.Sprintf("Success: %s action completed. A screenshot of the current screen is attached as an image. Examine it to see the result.", actionLabel),
+			Content: content,
 			Image:   screenshot,
 		},
 	})

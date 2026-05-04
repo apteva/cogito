@@ -1,0 +1,147 @@
+//go:build testkit
+
+// Pushover notification smoke test — proper isolated test.
+//
+// Flow:
+//   1. Spawn/reuse a server. Create a brand-new instance named
+//      testkit-pushover-<hex>, attach the Pushover MCP, start it.
+//   2. Set a directive telling the agent to fire a single
+//      pushover_send_notification when it sees a [console] event.
+//   3. Inject the event.
+//   4. Poll telemetry until we see a tool.call for the pushover
+//      tool. Fail the test if none arrives within the timeout.
+//   5. Log tokens + cost.
+//   6. t.Cleanup deletes the instance.
+//
+// Prereq: the Pushover MCP server must exist in the user's project.
+// Set it up once via Dashboard → Settings → MCP Servers (Local MCP)
+// with the Pushover credentials. The test looks it up by the exact
+// name you gave it — adjust the constant below to match.
+//
+// Copy this file:
+//   cp pushover_test.go.example pushover_test.go
+// then run:
+//   RUN_TESTKIT_TESTS=1 go test -tags testkit -run TestPushover -v -count=1
+
+package private_scenarios
+
+import (
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/apteva/core/testkit"
+)
+
+// Name of the MCP server row registered in the dashboard. Every tool
+// the MCP exposes is registered on the agent's registry with this
+// prefix (e.g. pushover_send_notification, pushover_send_priority_alert).
+// The test asserts on the prefix — the agent decides which specific
+// tool fits the task on its own, which is what we actually want to
+// validate.
+const pushoverMCPName = "pushover"
+
+func TestPushover(t *testing.T) {
+	if os.Getenv("RUN_TESTKIT_TESTS") == "" {
+		t.Skip("set RUN_TESTKIT_TESTS=1")
+	}
+
+	s := testkit.New(t, testkit.Config{
+		CreateInstance: true,
+		InstanceName:   "testkit-pushover",
+		// Intentionally natural language. The whole point is to
+		// validate the agent picks the right tool from the schemas
+		// it sees. Naming the tool in the directive would turn this
+		// into a trivial re-spelling test.
+		Directive: `You are a test agent. When you receive a [console] event, send a Pushover notification to the user summarising what happened. One notification per event, then pace to a long sleep. Do nothing else.`,
+		// Catalog-only — Pushover's tools are NOT on main's native
+		// schema, so main has to spawn a worker with mcp="pushover"
+		// to call them. This exercises the hub-and-spoke shape real
+		// agents run under; it also catches regressions in the
+		// spawn → MCP wiring path that main-access mode skips.
+		AttachMCPs: []string{pushoverMCPName},
+		// System MCPs off — they add noise and we don't need the
+		// management gateway or channels bridge for this test.
+		IncludeAptevaServer: false,
+		IncludeChannels:     false,
+	})
+
+	s.Run("main spawns a worker that sends pushover", func(p *testkit.Phase) {
+		p.Inject("[console] pushover smoke test — please notify")
+
+		// Wait for any thread (sub-thread spawned by main) to fire a
+		// pushover_* tool. Prefix match keeps the directive natural
+		// — the agent picks whichever Pushover endpoint fits.
+		p.WaitUntil(90*time.Second, "a pushover_* tool call from any thread", func() bool {
+			return s.HasToolCallWithPrefix(pushoverMCPName + "_")
+		})
+
+		p.Verify("a sub-thread was spawned (not main) to call pushover", func() {
+			spawned := s.SpawnedThreads()
+			if len(spawned) == 0 {
+				t.Errorf("expected main to spawn a worker for pushover; saw zero thread.spawn events")
+			} else {
+				t.Logf("  spawned threads: %v", spawned)
+			}
+
+			// Find the pushover_* tool call and confirm it fired from
+			// a thread other than main. If main fired it directly,
+			// our catalog-only attach didn't land correctly OR the
+			// agent short-circuited via some unexpected path.
+			calls := s.ToolCallsByThread()
+			var caller string
+			var toolName string
+			for tid, names := range calls {
+				for _, n := range names {
+					if strings.HasPrefix(n, pushoverMCPName+"_") {
+						caller = tid
+						toolName = n
+						break
+					}
+				}
+				if caller != "" {
+					break
+				}
+			}
+			if caller == "main" {
+				t.Errorf("pushover fired from main — expected a sub-thread (catalog-only mode was bypassed)")
+			}
+			if caller == "" {
+				t.Errorf("no pushover_* call recorded in any thread")
+				return
+			}
+			t.Logf("  worker %q chose: %s", caller, toolName)
+
+			// Args from the call — by the time we get here the call
+			// has already fired, but we still look it up to make
+			// sure the tool received meaningful content.
+			for _, e := range s.Events("tool.call", 100) {
+				n, _ := e.Data["name"].(string)
+				if !strings.HasPrefix(n, pushoverMCPName+"_") {
+					continue
+				}
+				args, _ := e.Data["args"].(map[string]interface{})
+				t.Logf("  args: %+v", args)
+				if len(args) == 0 {
+					t.Errorf("%s called with empty args — expected at least a message", n)
+				}
+				break
+			}
+		})
+	})
+
+	r := s.Report()
+	t.Logf("─────────────────────────────────────")
+	t.Logf("  iterations : %d", r.Iterations)
+	t.Logf("  tokens in  : %d  out: %d", r.TokensIn, r.TokensOut)
+	t.Logf("  tool calls : %d", r.ToolCalls)
+	t.Logf("  errors     : %d", r.Errors)
+	t.Logf("  cost       : $%.4f", r.Cost)
+	t.Logf("  duration   : %.1fs", r.DurationSec)
+	t.Logf("─────────────────────────────────────")
+
+	if r.Errors > 0 {
+		t.Errorf("agent reported %d errors — check server logs", r.Errors)
+	}
+}
