@@ -1,5 +1,14 @@
 .env
-core
+# Anchored to the repo root so we only ignore the BUILT BINARY at
+# ./apteva-core (and the historical name ./core), not any directory
+# named "apteva-core" elsewhere in the tree — `cmd/apteva-core/` is
+# the source main package and MUST stay tracked. The unanchored
+# previous patterns silently excluded `cmd/apteva-core/`, breaking
+# the CI release build with "directory not found".
+/core
+/apteva-core
+/apteva-server
+/cli
 backplane
 thinking
 mcp-pushover-server
@@ -10,17 +19,13 @@ workspace/
 debug.log
 stdout.log
 core.log
+apteva-core.log
 *.exe
 mcps/*/mcp-*
 mcps/media/media
 mcps/storage/storage
 mcps/chat/mcp-chat
 mcps/inventory/mcp-inventory
-apteva-core
-apteva-core.log
-# Cross-component binaries copied here by the dev build flow.
-apteva-server
-cli
 # Runtime conversation history + memory snapshots are per-machine
 # state, never source. The .bak suffix covers periodic backups
 # core writes during compaction.
