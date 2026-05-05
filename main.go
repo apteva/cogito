@@ -165,7 +165,14 @@ func Run() {
 	if apiPort == "" {
 		apiPort = "3210"
 	}
-	go startAPI(thinker, ":"+apiPort)
+	// Always bind loopback. The core API has agent-mutation endpoints
+	// (events, config writes) auth'd by APTEVA_API_KEY env, which is
+	// fine against same-machine processes but not safe against network
+	// attackers — the only legitimate caller is the parent
+	// apteva-server's reverse proxy. Operators wanting external core
+	// access should reach it through the server's /instances/<id>/*
+	// proxy, which has its own auth layer.
+	go startAPI(thinker, "127.0.0.1:"+apiPort)
 
 	// Initialize computer use environment in background
 	if cfg.Computer != nil && cfg.Computer.Type != "" {
